@@ -1,0 +1,12 @@
+/home/dq/project-holocron/src/Holocron.Common/bin/Release/net8.0/Holocron.Common.deps.json
+/home/dq/project-holocron/src/Holocron.Common/bin/Release/net8.0/Holocron.Common.dll
+/home/dq/project-holocron/src/Holocron.Common/bin/Release/net8.0/Holocron.Common.pdb
+/home/dq/project-holocron/src/Holocron.Common/obj/Release/net8.0/Holocron.Common.csproj.AssemblyReference.cache
+/home/dq/project-holocron/src/Holocron.Common/obj/Release/net8.0/Holocron.Common.GeneratedMSBuildEditorConfig.editorconfig
+/home/dq/project-holocron/src/Holocron.Common/obj/Release/net8.0/Holocron.Common.AssemblyInfoInputs.cache
+/home/dq/project-holocron/src/Holocron.Common/obj/Release/net8.0/Holocron.Common.AssemblyInfo.cs
+/home/dq/project-holocron/src/Holocron.Common/obj/Release/net8.0/Holocron.Common.csproj.CoreCompileInputs.cache
+/home/dq/project-holocron/src/Holocron.Common/obj/Release/net8.0/Holocron.Common.dll
+/home/dq/project-holocron/src/Holocron.Common/obj/Release/net8.0/refint/Holocron.Common.dll
+/home/dq/project-holocron/src/Holocron.Common/obj/Release/net8.0/Holocron.Common.pdb
+/home/dq/project-holocron/src/Holocron.Common/obj/Release/net8.0/ref/Holocron.Common.dll

@@ -1,0 +1,134 @@
+{
+  "format": 1,
+  "restore": {
+    "/home/dq/project-holocron/src/Holocron.Launcher/Holocron.Launcher.csproj": {}
+  },
+  "projects": {
+    "/home/dq/project-holocron/src/Holocron.Common/Holocron.Common.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "/home/dq/project-holocron/src/Holocron.Common/Holocron.Common.csproj",
+        "projectName": "Holocron.Common",
+        "projectPath": "/home/dq/project-holocron/src/Holocron.Common/Holocron.Common.csproj",
+        "packagesPath": "/home/dq/.nuget/packages/",
+        "outputPath": "/home/dq/project-holocron/src/Holocron.Common/obj/",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "/home/dq/.nuget/NuGet/NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net8.0"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net8.0": {
+            "targetAlias": "net8.0",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        }
+      },
+      "frameworks": {
+        "net8.0": {
+          "targetAlias": "net8.0",
+          "dependencies": {
+            "ZstdSharp.Port": {
+              "target": "Package",
+              "version": "[0.8.8, )"
+            }
+          },
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            }
+          },
+          "runtimeIdentifierGraphPath": "/home/dq/.dotnet/sdk/8.0.424/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    },
+    "/home/dq/project-holocron/src/Holocron.Launcher/Holocron.Launcher.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "/home/dq/project-holocron/src/Holocron.Launcher/Holocron.Launcher.csproj",
+        "projectName": "Holocron.Launcher",
+        "projectPath": "/home/dq/project-holocron/src/Holocron.Launcher/Holocron.Launcher.csproj",
+        "packagesPath": "/home/dq/.nuget/packages/",
+        "outputPath": "/home/dq/project-holocron/src/Holocron.Launcher/obj/",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "/home/dq/.nuget/NuGet/NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net8.0"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net8.0": {
+            "targetAlias": "net8.0",
+            "projectReferences": {
+              "/home/dq/project-holocron/src/Holocron.Common/Holocron.Common.csproj": {
+                "projectPath": "/home/dq/project-holocron/src/Holocron.Common/Holocron.Common.csproj"
+              }
+            }
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        }
+      },
+      "frameworks": {
+        "net8.0": {
+          "targetAlias": "net8.0",
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            }
+          },
+          "runtimeIdentifierGraphPath": "/home/dq/.dotnet/sdk/8.0.424/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    }
+  }
+}

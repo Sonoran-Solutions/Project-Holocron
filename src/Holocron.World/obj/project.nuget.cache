@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "dgSpecHash": "vI7XF329voU=",
+  "success": true,
+  "projectFilePath": "/home/dq/project-holocron/src/Holocron.World/Holocron.World.csproj",
+  "expectedPackageFiles": [
+    "/home/dq/.nuget/packages/zstdsharp.port/0.8.8/zstdsharp.port.0.8.8.nupkg.sha512"
+  ],
+  "logs": []
+}

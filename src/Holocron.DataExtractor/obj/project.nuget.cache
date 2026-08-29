@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "dgSpecHash": "+P2OPi3ZW3M=",
+  "success": true,
+  "projectFilePath": "/home/dq/project-holocron/src/Holocron.DataExtractor/Holocron.DataExtractor.csproj",
+  "expectedPackageFiles": [
+    "/home/dq/.nuget/packages/zstdsharp.port/0.8.8/zstdsharp.port.0.8.8.nupkg.sha512"
+  ],
+  "logs": []
+}

@@ -1,0 +1,73 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{36E5FFA8-4EE9-4856-BCC3-7F82B120E724}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Holocron.Common", "src\Holocron.Common\Holocron.Common.csproj", "{A820395F-C1F2-4C10-9FD8-D1EBD41C156F}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Holocron.Auth", "src\Holocron.Auth\Holocron.Auth.csproj", "{9D006635-6AA7-4CF8-8F16-FC4368F99EDA}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Holocron.World", "src\Holocron.World\Holocron.World.csproj", "{D7A6C8AE-BE40-4872-9699-8E1F57A9F291}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Holocron.DataExtractor", "src\Holocron.DataExtractor\Holocron.DataExtractor.csproj", "{B09440DA-CA2A-4D9B-900D-0C7471AFFC53}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Holocron.Launcher", "src\Holocron.Launcher\Holocron.Launcher.csproj", "{32B11010-3650-44C7-B2AF-C1095CA34A6A}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tools", "tools", "{AE434EB0-FF07-4725-81CF-48D31DB709A8}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Holocron.PacketProxy", "tools\Holocron.PacketProxy\Holocron.PacketProxy.csproj", "{CDDB276D-AEA6-410C-BDCE-32FBD7565554}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{0D4D3AD3-A4E8-4463-A925-9059DD1FB4D6}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Holocron.Tests", "tests\Holocron.Tests\Holocron.Tests.csproj", "{C38C1BB6-C765-40B9-A97F-783B68417D7D}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{A820395F-C1F2-4C10-9FD8-D1EBD41C156F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A820395F-C1F2-4C10-9FD8-D1EBD41C156F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A820395F-C1F2-4C10-9FD8-D1EBD41C156F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A820395F-C1F2-4C10-9FD8-D1EBD41C156F}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9D006635-6AA7-4CF8-8F16-FC4368F99EDA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9D006635-6AA7-4CF8-8F16-FC4368F99EDA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9D006635-6AA7-4CF8-8F16-FC4368F99EDA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9D006635-6AA7-4CF8-8F16-FC4368F99EDA}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D7A6C8AE-BE40-4872-9699-8E1F57A9F291}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D7A6C8AE-BE40-4872-9699-8E1F57A9F291}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D7A6C8AE-BE40-4872-9699-8E1F57A9F291}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D7A6C8AE-BE40-4872-9699-8E1F57A9F291}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B09440DA-CA2A-4D9B-900D-0C7471AFFC53}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B09440DA-CA2A-4D9B-900D-0C7471AFFC53}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B09440DA-CA2A-4D9B-900D-0C7471AFFC53}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B09440DA-CA2A-4D9B-900D-0C7471AFFC53}.Release|Any CPU.Build.0 = Release|Any CPU
+		{32B11010-3650-44C7-B2AF-C1095CA34A6A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{32B11010-3650-44C7-B2AF-C1095CA34A6A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{32B11010-3650-44C7-B2AF-C1095CA34A6A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{32B11010-3650-44C7-B2AF-C1095CA34A6A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{CDDB276D-AEA6-410C-BDCE-32FBD7565554}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{CDDB276D-AEA6-410C-BDCE-32FBD7565554}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{CDDB276D-AEA6-410C-BDCE-32FBD7565554}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{CDDB276D-AEA6-410C-BDCE-32FBD7565554}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C38C1BB6-C765-40B9-A97F-783B68417D7D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C38C1BB6-C765-40B9-A97F-783B68417D7D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C38C1BB6-C765-40B9-A97F-783B68417D7D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C38C1BB6-C765-40B9-A97F-783B68417D7D}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{A820395F-C1F2-4C10-9FD8-D1EBD41C156F} = {36E5FFA8-4EE9-4856-BCC3-7F82B120E724}
+		{9D006635-6AA7-4CF8-8F16-FC4368F99EDA} = {36E5FFA8-4EE9-4856-BCC3-7F82B120E724}
+		{D7A6C8AE-BE40-4872-9699-8E1F57A9F291} = {36E5FFA8-4EE9-4856-BCC3-7F82B120E724}
+		{B09440DA-CA2A-4D9B-900D-0C7471AFFC53} = {36E5FFA8-4EE9-4856-BCC3-7F82B120E724}
+		{32B11010-3650-44C7-B2AF-C1095CA34A6A} = {36E5FFA8-4EE9-4856-BCC3-7F82B120E724}
+		{CDDB276D-AEA6-410C-BDCE-32FBD7565554} = {AE434EB0-FF07-4725-81CF-48D31DB709A8}
+		{C38C1BB6-C765-40B9-A97F-783B68417D7D} = {0D4D3AD3-A4E8-4463-A925-9059DD1FB4D6}
+	EndGlobalSection
+EndGlobal

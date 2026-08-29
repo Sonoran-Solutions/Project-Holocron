@@ -1,0 +1,32 @@
+CREATE DATABASE IF NOT EXISTS `holocron_world`;
+USE `holocron_world`;
+
+CREATE TABLE IF NOT EXISTS `creature_templates` (
+  `entry` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `name` VARCHAR(128) NOT NULL,
+  `subname` VARCHAR(128) DEFAULT NULL,
+  `min_level` TINYINT UNSIGNED NOT NULL DEFAULT 1,
+  `max_level` TINYINT UNSIGNED NOT NULL DEFAULT 1,
+  `faction` INT UNSIGNED NOT NULL DEFAULT 0,
+  `health` INT UNSIGNED NOT NULL DEFAULT 100,
+  `mana` INT UNSIGNED NOT NULL DEFAULT 100,
+  `damage_min` FLOAT NOT NULL DEFAULT 5,
+  `damage_max` FLOAT NOT NULL DEFAULT 10,
+  `speed_walk` FLOAT NOT NULL DEFAULT 2.5,
+  `speed_run` FLOAT NOT NULL DEFAULT 7.0,
+  PRIMARY KEY (`entry`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS `creature_spawns` (
+  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `creature_entry` INT UNSIGNED NOT NULL,
+  `map_id` BIGINT UNSIGNED NOT NULL,
+  `pos_x` FLOAT NOT NULL,
+  `pos_y` FLOAT NOT NULL,
+  `pos_z` FLOAT NOT NULL,
+  `orientation` FLOAT NOT NULL,
+  `spawntimesecs` INT UNSIGNED NOT NULL DEFAULT 60,
+  `patrol_id` INT UNSIGNED DEFAULT 0,
+  PRIMARY KEY (`id`),
+  KEY `idx_map` (`map_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

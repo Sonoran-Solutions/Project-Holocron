@@ -1,0 +1,16 @@
+services:
+  holocron-db:
+    image: mariadb:10.11
+    container_name: holocron-db
+    restart: unless-stopped
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: holocron_secret
+      MYSQL_DATABASE: holocron_auth
+    volumes:
+      - ./sql:/docker-entrypoint-initdb.d
+      - holocron-db-data:/var/lib/mysql
+
+volumes:
+  holocron-db-data:
