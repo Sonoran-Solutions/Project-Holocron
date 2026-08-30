@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("Holocron.Common")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+bafc63a6849720bcb85fb14349c4dfef3cad1967")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+8a49324ab30220a8b9bfcaf1f9003358c3796f8a")]
 [assembly: System.Reflection.AssemblyProductAttribute("Holocron.Common")]
 [assembly: System.Reflection.AssemblyTitleAttribute("Holocron.Common")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
