@@ -100,3 +100,8 @@
 /home/dq/project-holocron/tests/Holocron.Tests/obj/Release/net8.0/Holocron.Tests.pdb
 /home/dq/project-holocron/tests/Holocron.Tests/obj/Release/net8.0/Holocron.Tests.genruntimeconfig.cache
 /home/dq/project-holocron/tests/Holocron.Tests/obj/Release/net8.0/ref/Holocron.Tests.dll
+/home/dq/project-holocron/tests/Holocron.Tests/bin/Release/net8.0/Holocron.World.deps.json
+/home/dq/project-holocron/tests/Holocron.Tests/bin/Release/net8.0/Holocron.World.runtimeconfig.json
+/home/dq/project-holocron/tests/Holocron.Tests/bin/Release/net8.0/Holocron.World
+/home/dq/project-holocron/tests/Holocron.Tests/bin/Release/net8.0/Holocron.World.dll
+/home/dq/project-holocron/tests/Holocron.Tests/bin/Release/net8.0/Holocron.World.pdb

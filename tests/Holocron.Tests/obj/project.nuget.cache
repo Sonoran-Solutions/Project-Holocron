@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "dgSpecHash": "yANvmqszlFA=",
+  "dgSpecHash": "aAGDFnUa2LQ=",
   "success": true,
   "projectFilePath": "/home/dq/project-holocron/tests/Holocron.Tests/Holocron.Tests.csproj",
   "expectedPackageFiles": [
@@ -95,5 +95,12 @@
     "/home/dq/.nuget/packages/xunit.runner.visualstudio/2.5.3/xunit.runner.visualstudio.2.5.3.nupkg.sha512",
     "/home/dq/.nuget/packages/zstdsharp.port/0.8.8/zstdsharp.port.0.8.8.nupkg.sha512"
   ],
-  "logs": []
+  "logs": [
+    {
+      "code": "NU1900",
+      "level": "Warning",
+      "warningLevel": 1,
+      "message": "Error occurred while getting package vulnerability data: Unable to load the service index for source https://api.nuget.org/v3/index.json."
+    }
+  ]
 }

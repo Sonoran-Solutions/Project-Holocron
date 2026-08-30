@@ -1,49 +1,64 @@
-using System.Diagnostics;
+using System.Buffers.Binary;
+using System.Text;
 using Holocron.Common.Data;
-
-Console.WriteLine("=================================================");
-Console.WriteLine("   Project Holocron - SWTOR Data Archive Inspector");
-Console.WriteLine("=================================================");
+using ZstdSharp;
 
 string defaultAssetsDir = "/home/dq/snap/steam/common/.local/share/Steam/steamapps/common/Star Wars - The Old Republic/Assets";
-string fpArchive = Path.Combine(defaultAssetsDir, "swtor_main_base_flashpoint_areas_1.tor");
+string globalArchive = Path.Combine(defaultAssetsDir, "swtor_main_global_1.tor");
 
-if (!File.Exists(fpArchive))
+using var archive = new MypArchive(globalArchive);
+var decompressor = new Decompressor();
+
+Console.WriteLine("Scanning for GOM Node FQIDs and Entity Definitions...\n");
+
+int fqidCount = 0;
+var sampleFqids = new List<(string fqid, int payloadSize)>();
+
+foreach (var entry in archive.Entries.Take(50))
 {
-    Console.WriteLine($"[ERROR] Could not find Flashpoint archive at: {fpArchive}");
-    return;
-}
-
-Console.WriteLine($"[INFO] Opening Flashpoint Archive: {Path.GetFileName(fpArchive)} ({new FileInfo(fpArchive).Length:N0} bytes)");
-
-var sw = Stopwatch.StartNew();
-using var archive = new MypArchive(fpArchive);
-sw.Stop();
-
-Console.WriteLine($"[OK] Successfully indexed {archive.Entries.Count:N0} files across archive in {sw.ElapsedMilliseconds} ms!");
-
-int ddsCount = 0;
-int gr2Count = 0;
-int otherCount = 0;
-long totalDecompressedSize = 0;
-
-foreach (var entry in archive.Entries.Take(100))
-{
-    totalDecompressedSize += entry.UncompressedSize;
-    if (entry.UncompressedSize > 0)
+    if (entry.UncompressedSize < 50000) continue;
+    byte[] data = archive.Extract(entry);
+    
+    // Scan for string names in data
+    int idx = 0;
+    while (idx < data.Length - 10)
     {
-        var data = archive.Extract(entry);
-        if (data.Length >= 4)
+        // Look for typical SWTOR prefixes: spn., abl., npc., itm., class., qst., enc., area., loc.
+        if (idx + 4 < data.Length && 
+            (data[idx] == 's' && data[idx+1] == 'p' && data[idx+2] == 'n' && data[idx+3] == '.' ||
+             data[idx] == 'a' && data[idx+1] == 'b' && data[idx+2] == 'l' && data[idx+3] == '.' ||
+             data[idx] == 'n' && data[idx+1] == 'p' && data[idx+2] == 'c' && data[idx+3] == '.' ||
+             data[idx] == 'i' && data[idx+1] == 't' && data[idx+2] == 'm' && data[idx+3] == '.' ||
+             data[idx] == 'c' && data[idx+1] == 'l' && data[idx+2] == 'a' && data[idx+3] == 's' ||
+             data[idx] == 'q' && data[idx+1] == 's' && data[idx+2] == 't' && data[idx+3] == '.'))
         {
-            if (data[0] == 'D' && data[1] == 'D' && data[2] == 'S' && data[3] == ' ') ddsCount++;
-            else if (data.Length >= 7 && data[0] == 'G' && data[1] == 'A' && data[2] == 'R' && data[3] == 'T') gr2Count++;
-            else otherCount++;
+            // Read null-terminated or length-terminated string
+            int end = idx;
+            while (end < data.Length && data[end] >= 32 && data[end] <= 126)
+            {
+                end++;
+            }
+            string fqid = Encoding.ASCII.GetString(data.AsSpan(idx, end - idx));
+            if (fqid.Length > 8 && fqid.Contains('.'))
+            {
+                fqidCount++;
+                if (sampleFqids.Count < 25)
+                {
+                    sampleFqids.Add((fqid, data.Length));
+                }
+            }
+            idx = end;
+        }
+        else
+        {
+            idx++;
         }
     }
 }
 
-Console.WriteLine($"\n[INFO] Sample scan of first 100 files in Flashpoint archive:");
-Console.WriteLine($"     - DDS Textures: {ddsCount}");
-Console.WriteLine($"     - Granny 3D / Geometry: {gr2Count}");
-Console.WriteLine($"     - Other Formats (.world/.area/.dat): {otherCount}");
-Console.WriteLine($"     - Sample extraction test passed 100%!");
+Console.WriteLine($"[OK] Found {fqidCount} entity definitions in sample buckets!\n");
+Console.WriteLine("Sample Entity Identifiers Found in Assets:");
+foreach (var (fqid, size) in sampleFqids)
+{
+    Console.WriteLine($"  - {fqid}");
+}

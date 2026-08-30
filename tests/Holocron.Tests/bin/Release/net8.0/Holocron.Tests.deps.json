@@ -9,6 +9,7 @@
       "Holocron.Tests/1.0.0": {
         "dependencies": {
           "Holocron.Common": "1.0.0",
+          "Holocron.World": "1.0.0",
           "Microsoft.NET.Test.Sdk": "17.8.0",
           "coverlet.collector": "6.0.0",
           "xunit": "2.5.3",
@@ -1039,6 +1040,17 @@
             "fileVersion": "1.0.0.0"
           }
         }
+      },
+      "Holocron.World/1.0.0": {
+        "dependencies": {
+          "Holocron.Common": "1.0.0"
+        },
+        "runtime": {
+          "Holocron.World.dll": {
+            "assemblyVersion": "1.0.0",
+            "fileVersion": "1.0.0.0"
+          }
+        }
       }
     }
   },
@@ -1679,6 +1691,11 @@
       "hashPath": "zstdsharp.port.0.8.8.nupkg.sha512"
     },
     "Holocron.Common/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "Holocron.World/1.0.0": {
       "type": "project",
       "serviceable": false,
       "sha512": ""
