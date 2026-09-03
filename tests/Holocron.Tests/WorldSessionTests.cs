@@ -43,7 +43,7 @@ public class WorldSessionTests
 
         Assert.Equal(SessionState.InWorld, session.State);
         Assert.NotNull(session.ActiveCharacter);
-        Assert.Equal("HeroOfTython", session.ActiveCharacter.Name);
+        Assert.Equal("Master Vaelin", session.ActiveCharacter.Name);
         Assert.Equal("tython_main", session.CurrentAreaFqid);
         Assert.Contains(Opcode.SMSG_CHARACTER_SELECTED, session.SentPacketOpcodes);
         Assert.Contains(Opcode.SMSG_TRAVEL_PENDING, session.SentPacketOpcodes);

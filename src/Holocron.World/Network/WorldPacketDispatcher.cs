@@ -1,4 +1,5 @@
 using Holocron.Common.Protocol;
+using Holocron.World.Characters;
 
 namespace Holocron.World.Network;
 
@@ -8,6 +9,9 @@ namespace Holocron.World.Network;
 public sealed class WorldPacketDispatcher
 {
     private readonly Dictionary<Opcode, Func<WorldSession, PacketReader, Task>> _handlers = new();
+    private readonly CharacterSaveManager _saveManager = new();
+
+    public CharacterSaveManager SaveManager => _saveManager;
 
     public WorldPacketDispatcher()
     {
@@ -50,32 +54,38 @@ public sealed class WorldPacketDispatcher
 
         Register(Opcode.CMSG_CHARACTER_LIST, async (session, reader) =>
         {
-            // Default sample starting character for Project Holocron
-            var defaultChar = new CharacterSummary
+            // Present full roster of pre-made high-level test saves
+            var summaries = _saveManager.Characters.Select(c => new CharacterSummary
             {
-                Id = 10001,
-                Name = "HeroOfTython",
-                ClassId = 1, // Jedi Knight
-                Level = 1,
-                AreaFqid = "tython_main"
-            };
+                Id = c.Guid,
+                Name = c.Name,
+                ClassId = c.ClassId,
+                Level = c.Level,
+                AreaFqid = c.AreaFqid,
+                Position = c.SpawnPosition
+            }).ToList();
 
-            await session.SendCharacterListAsync(new[] { defaultChar });
+            Console.WriteLine($"[WORLD] Serving {summaries.Count} pre-made Level 80 characters to client");
+            await session.SendCharacterListAsync(summaries);
         });
 
         Register(Opcode.CMSG_CHARACTER_SELECT, async (session, reader) =>
         {
-            ulong charId = reader.RemainingBytes >= 8 ? reader.ReadUInt64() : 10001;
-            var selectedChar = new CharacterSummary
+            ulong charId = reader.RemainingBytes >= 8 ? reader.ReadUInt64() : 80001;
+            var character = _saveManager.GetCharacterByGuid(charId) ?? _saveManager.Characters.First();
+
+            var selectedSummary = new CharacterSummary
             {
-                Id = charId,
-                Name = "HeroOfTython",
-                ClassId = 1,
-                Level = 1,
-                AreaFqid = "tython_main"
+                Id = character.Guid,
+                Name = character.Name,
+                ClassId = character.ClassId,
+                Level = character.Level,
+                AreaFqid = character.AreaFqid,
+                Position = character.SpawnPosition
             };
 
-            await session.SelectCharacterAsync(selectedChar);
+            Console.WriteLine($"[WORLD] Selected character: {character.Name} (Lvl {character.Level} {character.AdvancedClassName}) -> Zoning to {character.AreaName} [{character.AreaFqid}]");
+            await session.SelectCharacterAsync(selectedSummary);
         });
     }
 }
