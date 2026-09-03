@@ -14,7 +14,7 @@ public sealed class Aura
     public float DurationRemaining { get; set; }
     public float TickInterval { get; init; } = 1.0f;
     public float TickTimer { get; set; }
-    public float ValuePerTick { get; init; }
+    public float ValuePerTick { get; set; }
 
     public bool IsExpired => DurationRemaining <= 0;
 }

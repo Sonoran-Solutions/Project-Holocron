@@ -53,6 +53,15 @@ public enum Opcode : uint
     SMSG_TRAVEL_STATUS                  = 0x31,
     SMSG_SEND_TO_AREA                   = 0x32,
     SMSG_AWARENESS_RANGE                = 0x33,
+    SMSG_SPAWN_OBJECT                   = 0x34,
+    SMSG_DESTROY_OBJECT                 = 0x35,
+    SMSG_MOVEMENT_UPDATE                = 0x36,
+    CMSG_MOVEMENT_UPDATE                = 0x37,
+
+    // Combat & Abilities
+    CMSG_CAST_ABILITY                   = 0x38,
+    SMSG_CAST_RESULT                    = 0x39,
+    SMSG_COMBAT_EVENT                   = 0x3A,
 
     // Chat
     CMSG_CHAT_MESSAGE                   = 0x40,
