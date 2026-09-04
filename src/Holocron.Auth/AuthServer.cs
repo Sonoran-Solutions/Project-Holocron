@@ -10,6 +10,22 @@ namespace Holocron.Auth;
 
 public sealed class AuthServer
 {
+    // Layout: 1-byte opcode, 4-byte LE packet length, 1-byte XOR checksum,
+    // followed by transport type, content version, and a per-connection nonce.
+    private static byte[] CreateInitialGreeting()
+    {
+        byte[] greeting =
+        [
+            0x03, 0x16, 0x00, 0x00, 0x00, 0x15,
+            0x12, 0x00, 0x00, 0x00,
+            0x08, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        ];
+
+        RandomNumberGenerator.Fill(greeting.AsSpan(14, 8));
+        return greeting;
+    }
+
     private readonly int _port;
     private readonly string _worldHost;
     private readonly int _worldPort;
@@ -59,18 +75,12 @@ public sealed class AuthServer
 
         try
         {
-            // Step 1: Send SMSG_HANDSHAKE (28-byte raw handshake with magic)
-            byte[] handshake = new byte[28];
-            BinaryPrimitives.WriteUInt32LittleEndian(handshake.AsSpan(0, 4), (uint)Opcode.SMSG_HANDSHAKE);
-            BinaryPrimitives.WriteUInt32LittleEndian(handshake.AsSpan(4, 4), 0); // Type
-            BinaryPrimitives.WriteUInt16LittleEndian(handshake.AsSpan(8, 2), 0x08); // ContentVersion
-            BinaryPrimitives.WriteUInt16LittleEndian(handshake.AsSpan(10, 2), 0x00); // TransportVersion
-            BinaryPrimitives.WriteUInt64LittleEndian(handshake.AsSpan(12, 8), 0x14AA63E353DBF459UL); // HeroEngine handshake magic
-            BinaryPrimitives.WriteUInt64LittleEndian(handshake.AsSpan(20, 8), 0);
-
-            await stream.WriteAsync(handshake, ct);
+            // Step 1: Send the framed login transport greeting. This is not a
+            // normal application packet and must not use PacketWriter's header.
+            byte[] greeting = CreateInitialGreeting();
+            await stream.WriteAsync(greeting, ct);
             await stream.FlushAsync(ct);
-            Console.WriteLine($"[AUTH] Sent SMSG_HANDSHAKE to {endpoint}");
+            Console.WriteLine($"[AUTH] Sent login transport greeting ({greeting.Length} bytes) to {endpoint}");
 
             // Step 2: Read CMSG_HANDSHAKE
             byte[] buffer = new byte[4096];
@@ -79,17 +89,17 @@ public sealed class AuthServer
 
             Console.WriteLine($"[AUTH] Received CMSG_HANDSHAKE ({read} bytes) from {endpoint}");
 
+            SwtorLoginSessionKeys sessionKeys = SwtorLoginKeyExchange.Decode(buffer.AsSpan(0, read));
+            var sendCipher = new Salsa20(sessionKeys.ServerToClientKey, sessionKeys.ServerToClientIv);
+            var recvCipher = new Salsa20(sessionKeys.ClientToServerKey, sessionKeys.ClientToServerIv);
+            CryptographicOperations.ZeroMemory(sessionKeys.ServerToClientKey);
+            CryptographicOperations.ZeroMemory(sessionKeys.ClientToServerKey);
+            CryptographicOperations.ZeroMemory(sessionKeys.ServerToClientIv);
+            CryptographicOperations.ZeroMemory(sessionKeys.ClientToServerIv);
+            Console.WriteLine($"[AUTH] RSA key exchange validated; Salsa20 session established for {endpoint}");
+
             // Generate ephemeral session ServerId token
             string serverIdToken = Guid.NewGuid().ToString("N")[..16];
-
-            // Setup Salsa20 stream ciphers (for local test, use deterministic or negotiated keys)
-            byte[] salsaKey = new byte[32];
-            byte[] salsaIv = new byte[8];
-            RandomNumberGenerator.Fill(salsaKey);
-            RandomNumberGenerator.Fill(salsaIv);
-
-            var sendCipher = new Salsa20(salsaKey, salsaIv);
-            var recvCipher = new Salsa20(salsaKey, salsaIv);
 
             // Serve session loop
             while (!ct.IsCancellationRequested)

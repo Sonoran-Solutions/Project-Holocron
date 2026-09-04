@@ -78,9 +78,6 @@ public sealed class WorldSession
     public async Task SendHandshakeAsync(CancellationToken ct = default)
     {
         var handshake = new PacketWriter(Opcode.SMSG_HANDSHAKE)
-            .WriteUInt32(0)
-            .WriteUInt16(0x08)
-            .WriteUInt16(0x00)
             .WriteUInt64(0x14AA63E353DBF459UL);
 
         await SendPacketAsync(handshake, ct);

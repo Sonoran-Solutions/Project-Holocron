@@ -21,6 +21,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\Holocron.Auth\Holocron.Auth.csproj" />
     <ProjectReference Include="..\..\src\Holocron.Common\Holocron.Common.csproj" />
     <ProjectReference Include="..\..\src\Holocron.World\Holocron.World.csproj" />
   </ItemGroup>

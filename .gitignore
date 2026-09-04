@@ -7,3 +7,6 @@ obj/
 data/extracted/
 data/navmesh/
 research/
+scratch/
+*.log
+

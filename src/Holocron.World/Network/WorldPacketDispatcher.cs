@@ -52,6 +52,26 @@ public sealed class WorldPacketDispatcher
             await session.SendClientConfigurationAsync();
         });
 
+        Register(Opcode.CMSG_REQUEST_INTRODUCE_CONNECTION, async (session, reader) =>
+        {
+            Console.WriteLine("[WORLD] Received CMSG_REQUEST_INTRODUCE_CONNECTION, directing client to 127.0.0.1:20061");
+            var reply = new PacketWriter(Opcode.SMSG_REQUEST_INTRODUCE_CONNECTION)
+                .WriteString("127.0.0.1:20061")
+                .WriteString("HolocronServerId");
+            await session.SendPacketAsync(reply);
+        });
+
+        Register(Opcode.MSG_REQUEST_SIGNATURE, async (session, reader) =>
+        {
+            Console.WriteLine("[WORLD] Received MSG_REQUEST_SIGNATURE, replying with MSG_SIGNATURE");
+            var reply = new PacketWriter(Opcode.MSG_SIGNATURE)
+                .WriteUInt16(0x04)
+                .WriteString("Project Holocron")
+                .WriteString("afc1bb5a")
+                .WriteString("loginserver");
+            await session.SendPacketAsync(reply);
+        });
+
         Register(Opcode.CMSG_CHARACTER_LIST, async (session, reader) =>
         {
             // Present full roster of pre-made high-level test saves

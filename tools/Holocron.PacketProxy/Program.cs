@@ -1,8 +1,5 @@
-using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
-using Holocron.Common.Crypto;
-using Holocron.Common.Protocol;
 
 Console.WriteLine("=================================================");
 Console.WriteLine("   Project Holocron - SWTOR Network Packet Proxy");
@@ -67,20 +64,10 @@ static async Task ForwardAndLogAsync(int sessionId, string direction, NetworkStr
         int bytesRead = await input.ReadAsync(buffer, 0, buffer.Length);
         if (bytesRead == 0) break;
 
-        // Log packet preview
+        // Deliberately log metadata only. Login frames can contain encrypted
+        // account/session material and must never be dumped to the console.
         string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
         Console.WriteLine($"[{timestamp}] [S#{sessionId}] [{direction}] {bytesRead} bytes");
-
-        if (bytesRead >= 12)
-        {
-            uint opcodeRaw = BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(0, 4));
-            var opcode = Enum.IsDefined(typeof(Opcode), opcodeRaw) ? ((Opcode)opcodeRaw).ToString() : $"0x{opcodeRaw:X8}";
-            Console.WriteLine($"      Opcode: {opcode} | Hex: {BitConverter.ToString(buffer, 0, Math.Min(32, bytesRead))}");
-        }
-        else
-        {
-            Console.WriteLine($"      Hex: {BitConverter.ToString(buffer, 0, bytesRead)}");
-        }
 
         await output.WriteAsync(buffer, 0, bytesRead);
         await output.FlushAsync();

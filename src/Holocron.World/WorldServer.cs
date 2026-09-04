@@ -8,33 +8,60 @@ namespace Holocron.World;
 
 public sealed class WorldServer
 {
-    private readonly int _port;
+    private static readonly byte[] InitialWorldGreeting =
+    [
+        0x03, 0x0E, 0x00, 0x00, 0x00, 0x0D,
+        0x12, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    ];
+
+    private readonly int[] _ports;
     private readonly WorldPacketDispatcher _dispatcher = new();
-    private TcpListener? _listener;
+    private readonly List<TcpListener> _listeners = new();
     private bool _running;
 
-    public WorldServer(int port = 20061)
+    public WorldServer(params int[] ports)
     {
-        _port = port;
+        _ports = (ports != null && ports.Length > 0) ? ports : new[] { 20061, 9007 };
     }
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        _listener = new TcpListener(IPAddress.Any, _port);
-        _listener.Start();
         _running = true;
+        var acceptTasks = new List<Task>();
 
-        Console.WriteLine($"[WORLD] ========================================================");
-        Console.WriteLine($"[WORLD] Project Holocron: World Shard Server Online on port {_port}");
-        Console.WriteLine($"[WORLD] Pre-loaded {_dispatcher.SaveManager.Characters.Count} Level 80 characters ready for instant testing");
-        Console.WriteLine($"[WORLD] ========================================================");
-
-        while (_running && !cancellationToken.IsCancellationRequested)
+        foreach (var port in _ports)
         {
             try
             {
-                var socket = await _listener.AcceptSocketAsync(cancellationToken);
-                _ = HandleSessionAsync(socket, cancellationToken);
+                var listener = new TcpListener(IPAddress.Any, port);
+                listener.Start();
+                _listeners.Add(listener);
+                Console.WriteLine($"[WORLD] Listening on 0.0.0.0:{port}");
+                acceptTasks.Add(AcceptLoopAsync(listener, port, cancellationToken));
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[WORLD] Warning: Could not bind to port {port}: {ex.Message}");
+            }
+        }
+
+        Console.WriteLine($"[WORLD] ========================================================");
+        Console.WriteLine($"[WORLD] Project Holocron: Server Online on ports: {string.Join(", ", _ports)}");
+        Console.WriteLine($"[WORLD] Pre-loaded {_dispatcher.SaveManager.Characters.Count} Level 80 characters ready for instant testing");
+        Console.WriteLine($"[WORLD] ========================================================");
+
+        await Task.WhenAll(acceptTasks);
+    }
+
+    private async Task AcceptLoopAsync(TcpListener listener, int port, CancellationToken ct)
+    {
+        while (_running && !ct.IsCancellationRequested)
+        {
+            try
+            {
+                var socket = await listener.AcceptSocketAsync(ct);
+                _ = HandleSessionAsync(socket, port, ct);
             }
             catch (OperationCanceledException)
             {
@@ -42,38 +69,36 @@ public sealed class WorldServer
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[WORLD] Accept error: {ex.Message}");
+                Console.WriteLine($"[WORLD] Accept error on port {port}: {ex.Message}");
             }
         }
+
+        Console.WriteLine($"[WORLD] AcceptLoopAsync terminated on port {port}. Running={_running}, Cancelled={ct.IsCancellationRequested}");
     }
 
-    private async Task HandleSessionAsync(Socket socket, CancellationToken ct)
+    private async Task HandleSessionAsync(Socket socket, int listenPort, CancellationToken ct)
     {
         string endpoint = socket.RemoteEndPoint?.ToString() ?? "Unknown";
-        Console.WriteLine($"[WORLD] Client connected from {endpoint}");
+        Console.WriteLine($"[WORLD] Client connected from {endpoint} on port {listenPort}");
 
         using var stream = new NetworkStream(socket, ownsSocket: true);
         var session = new WorldSession(stream);
 
         try
         {
-            // Step 1: Send initial HeroEngine SMSG_HANDSHAKE
-            await session.SendHandshakeAsync(ct);
-
             byte[] buffer = new byte[8192];
-            int read = await stream.ReadAsync(buffer, ct);
-            if (read <= 0) return;
 
-            Console.WriteLine($"[WORLD] Received {read} bytes initial handshake response from {endpoint}");
+            await stream.WriteAsync(InitialWorldGreeting, ct);
+            await stream.FlushAsync(ct);
+            Console.WriteLine($"[WORLD] Sent world transport greeting ({InitialWorldGreeting.Length} bytes) to {endpoint} on port {listenPort}");
 
-            // Step 2: Configure Client
-            await session.SendClientConfigurationAsync(ct);
-
-            // Step 3: Event Loop
+            // Event Loop
             while (!ct.IsCancellationRequested)
             {
-                read = await stream.ReadAsync(buffer, ct);
+                int read = await stream.ReadAsync(buffer, ct);
                 if (read <= 0) break;
+
+                Console.WriteLine($"[WORLD] [{endpoint}] Received {read} bytes on port {listenPort}");
 
                 byte[] packetData = new byte[read];
                 Array.Copy(buffer, packetData, read);
