@@ -15,7 +15,18 @@ public sealed class AuthServerTests
         Task serverTask = server.StartAsync(cancellation.Token);
 
         using var client = new TcpClient();
-        await client.ConnectAsync(IPAddress.Loopback, port, cancellation.Token);
+        for (int i = 0; i < 50; i++)
+        {
+            try
+            {
+                await client.ConnectAsync(IPAddress.Loopback, port, cancellation.Token);
+                break;
+            }
+            catch (SocketException) when (i < 49)
+            {
+                await Task.Delay(50, cancellation.Token);
+            }
+        }
 
         byte[] actual = new byte[22];
         await client.GetStream().ReadExactlyAsync(actual, cancellation.Token);
