@@ -26,23 +26,40 @@ export STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_BASE"
 export WINEDEBUG="-all"
 export WINEPREFIX="$COMPAT_DATA/pfx"
 
-# HeroEngine bootstrap arguments for swtor.exe
-ARGS=(
-    "shardaddress=@${SERVER_HOST}:${SERVER_PORT}:1"
-    "server=${SERVER_HOST}"
-    "port=${SERVER_PORT}"
-    "instance=1"
-    "username=dq"
-    "password=holocron"
-    "token=local"
-    "environment=dev"
-    "platform=pc"
-    "lang=en-us"
-    "torsets=1"
-    "skipgamemovies=true"
-)
+# Write out holocron.icb dynamically with current host and port
+cat << ICB_EOF > "$SWTOR_DIR/holocron.icb"
+set server ${SERVER_HOST}
+set port ${SERVER_PORT}
+set instance 1
+set username dq
+set password holocron
+set token local
+set environment dev
+set platform pc
+set lang en-us
+set torsets 1
+set skipgamemovies true
 
-echo "[LAUNCHER] Starting swtor.exe with Proton..."
+set shardaddress @\${server}:\${port}:\${instance}
+
+server install RemoteRenderer
+server start RemoteRenderer://test1@local::IpcConsole:1
+
+server install HeroEngine
+server start HeroEngine://test1@null::IpcConsole:1 username=\${username} password=\${password} token=\\"\${token}\\" environment=\${environment} platform=\${platform} shardaddress=\${shardaddress} lang=\${lang} torsets=\${torsets} skipgamemovies=\${skipgamemovies}
+
+autotick
+
+server stop RemoteRenderer://test1@local::IpcConsole:1
+server uninstall RemoteRenderer
+
+server stop HeroEngine://test1@null::IpcConsole:1
+server uninstall HeroEngine
+
+exit
+ICB_EOF
+
+echo "[LAUNCHER] Starting swtor.exe with Holocron bootstrap..."
 cd "$SWTOR_DIR"
 
-exec "$PROTON_DIR/proton" run "$SWTOR_EXE" "${ARGS[@]}"
+exec "$PROTON_DIR/proton" run "$SWTOR_EXE" @holocron.icb
