@@ -173,7 +173,7 @@ project-holocron/
 
 ### Building
 ```bash
-git clone https://github.com/devils-17/Project-Holocron.git
+git clone https://github.com/Sonoran-Solutions/Project-Holocron.git
 cd Project-Holocron
 
 # Restore and build the solution in Release mode
