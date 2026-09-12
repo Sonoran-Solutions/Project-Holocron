@@ -52,11 +52,16 @@ public class LoginExchangeTests
             Assert.Equal("Test Client", (string?)root.Attribute("title"));
             Assert.Equal("true", (string?)root.Attribute("useSyncClock"));
             Assert.Equal("debug", (string?)root.Attribute("loglevel"));
+            Assert.Equal("username=local-test;WorldName=he1012;SHARD_PUBLIC_NAME=he1012;", (string?)root.Attribute("additionalClientConfigs"));
             var rule = Assert.Single(root.Element("access-rights")!.Elements("client"));
             Assert.Equal("Automaton.exe", (string?)rule.Attribute("name"));
             var subnet = Assert.Single(rule.Elements("network"));
             Assert.Equal("BWA", (string?)subnet.Attribute("name"));
             Assert.Equal("10.2.0.0/15", (string?)subnet.Attribute("address"));
+
+            byte[] launch = (await TransportFrame.ReadAsync(encrypted, cancellation.Token))!;
+            Assert.Equal(0x10, launch[0]);
+            Assert.Equal("4DD0F290A7E600E8", Convert.ToHexString(launch.AsSpan(6, 8)));
 
             uint before = unchecked((uint)(DateTime.UtcNow.ToFileTimeUtc() / 10000));
             byte[] sequence = Convert.FromHexString("0807060504030201");
@@ -69,10 +74,6 @@ public class LoginExchangeTests
             // Modular subtraction handles the low-32-bit clock wrapping. Allow
             // scheduling and millisecond quantization without accepting epoch zero.
             Assert.InRange(unchecked((int)(clock - before)), -1000, 10000);
-
-            byte[] launch = (await TransportFrame.ReadAsync(encrypted, cancellation.Token))!;
-            Assert.Equal(0x10, launch[0]);
-            Assert.Equal("4DD0F290A7E600E8", Convert.ToHexString(launch.AsSpan(6, 8)));
         }
         finally
         {

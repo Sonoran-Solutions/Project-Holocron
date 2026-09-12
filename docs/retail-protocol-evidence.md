@@ -1615,3 +1615,107 @@ coverage, not a claim of retail XML or launch acceptance.
 zero skipped, after the audit changes. `git diff --check` passes. The restored
 resolver instruction is `C7 06 00 04 00 00`. Type-2 retail retesting is still
 conditional on reaching a type-1 request; the candidate run did not reach it.
+
+## Comprehensive static disassembly audit: ConnectionObject, ServerProxy, and ReplyGameLaunch (September 12)
+
+### Root Cause of 283ms Termination & Error 1003
+
+Static disassembly of `swtor.exe` (SHA-256: `ad541a74...`) has definitively localized the failure of the nonempty D4 candidate (`0xD4BA5CCD`) that led to client termination after 283ms and visible error 1003 (`LOGIN_ERROR_FAILED_CONNECT_TO_LOGIN_SERVER`) in `Client_20260911T210632_308.log`.
+
+1. **Unchecked Null Pointer Dereference in `OmegaClientApp::HandleInitialized` (`0x140121360`):**
+   - At `0x140121af5` - `0x140121b10`, `HandleInitialized` looks up the root attribute `"additionalClientConfigs"`.
+   - `0x14011e860` parses this semicolon-delimited string (`key=value;...`) into the application configuration map at `[OmegaClientApp + 0xF0]`.
+   - At `0x140121b40`, the function loads wide string `L"username"` (`0x14156cbc8`).
+   - At `0x140121bf0`, it invokes `0x14011e5d0` (`std::map::find(L"username")`):
+     - If the key is found, `0x14011e5d0` returns a pointer to the value string buffer in `RAX`.
+     - If the key is absent, `0x14011e5d0` executes `0x14011e65b: xor eax, eax` and returns `NULL` (`0x0`).
+   - At `0x140121bf5`, `mov rbx, rax` stores the result in `RBX`.
+   - At `0x140121c2e` - `0x140121c39`, the code computes the string length:
+     ```x86asm
+     140121c2e: mov    rax, 0xffffffffffffffff
+     140121c35: lea    rax, [rax+0x1]
+     140121c39: cmp    WORD PTR [rbx+rax*2], 0x0
+     140121c3e: jne    0x140121c35
+     ```
+   - **Crucially, there is no null check on `RBX`.** If `additionalClientConfigs` does not contain `username=...;`, `RBX` is `0x0`. Instruction `0x140121c39` unconditionally dereferences address zero, triggering an immediate `0xC0000005` Access Violation (SIGSEGV / crash) in the retail executable!
+   - Because of this crash:
+     - `HandleInitialize completed.` at `0x140121ce1` is never logged.
+     - The initialized flag at `0x140121c7b` (`mov BYTE PTR [0x141bab4fa], 1`) is never set.
+     - `ConnectionObject::slot0` is never called.
+     - The socket closes prematurely on crash (EOF).
+
+2. **Error 1003 Attribution in `omega::ServerProxy::OnDisconnect` (`0x140427170`):**
+   - At `0x14042718e`, `ServerProxy::OnDisconnect` inspects `[ServerProxy + 0x78]`.
+   - `[ServerProxy + 0x78]` is the retained launch request context set during `ServerProxy::Login` (`0x140428183`).
+   - It is **only cleared** when `ReplyGameLaunch` (`0x90F2D04D`) is successfully received and dispatched (at `0x140427264` and `0x140427516`).
+   - If the connection disconnects while `[ServerProxy + 0x78]` is non-zero (whether due to a client crash, timeout, or server close), `0x1404271d6` loads error code `0x3eb` (1003 decimal) into `[rsp+0x40]` and calls `[rax+0x98]`.
+   - This invokes `OmegaClientApp::HandleLaunchFailure(1003)` at `0x140121fd0`, which formats and outputs:
+     `HandleLaunchFailure with error type 1003 : LOGIN_ERROR_FAILED_CONNECT_TO_LOGIN_SERVER`.
+
+### ConnectionObject Lifecycle State Machine
+
+Static analysis of `0x140134d70` (`ConnectionObject::setState`), `0x140135d20` (`slot 0`), `0x140135df0` (`slot 1`), `0x140135eb0` (`slot 2`), and `0x140136400` (`slot 4 / setError`) maps the complete lifecycle:
+
+| State ID | State Constant | Entry Trigger / Condition |
+| --- | --- | --- |
+| 1 | `CS_WAITING_FOR_INIT` | `ConnectionObject` construction |
+| 2 | `CS_LOGGING_IN` | `ConnectionObject::beginConnection` (`0x140134d70` call at `0x1401350a8`) |
+| 3 | `CS_APP_INITIALIZED` | `ConnectionObject::slot0` (`0x140135d20`) when global initialized flag `0x141bab4fa == 1` |
+| 4 | `CS_CONNECTING_REPOSITORY` | Advanced by `slot0` immediately after state 3 if desired state >= 5; calls `ConnectRepository` (`0x140124380`) |
+| 5 | `CS_REPOSITORY_CONNECTED` | `ConnectionObject::slot1` (`0x140135df0`); in client mode (`[App+0x118] & 2 == 0`), `0x1401243aa` skips repository connect and directly calls `slot1` |
+| 6 | `CS_CONNECTING_COMPILERS` | Advanced by `slot1` if desired state > 5; calls `ConnectCompilers` (`0x140124aa0`) |
+| 7 | `CS_COMPILERS_CONNECTED` | `ConnectionObject::slot2` (`0x140135eb0`); in client mode (`[App+0x118] & 4 == 0`), `0x140124acf` skips compiler connect and directly calls `slot2` |
+| 8 | `CS_CONNECTING_SHARD` | Advanced by `slot2` if desired state > 7; initiates connection to shard address supplied by `0x90F2D04D` |
+| 9 | `CS_SHARD_CONNECTED` | Shard connection handshake completed |
+| 10 | `CS_SHARD_DISCONNECTING` | Shard disconnection initiated |
+| 11 | `CS_FAILED` | Error condition reached via `ConnectionObject::slot4` (`setError`) |
+
+### omega::ServerProxy Class Hierarchy and Vtable Layout
+
+Extracted directly from RTTI Complete Object Locators in `.rdata`:
+
+- **Base 0: `omega::ServerProxy`** (mdisp = `0x0`, COL `0x141702188`, vtable `0x1414b65e0`):
+  - Slot 0 (`+0x00`): `0x140426e80` — Virtual destructor
+  - Slot 6 (`+0x30`): `0x14045a1c0` — `HandleMessage` dispatcher:
+    - `0x14045a71d`: checks message ID `0xD4BA5CCD` -> calls `LoginRequestIFace::slot0` (`0x1404279d0`)
+    - `0x14045a216`: checks message ID `0x90F2D04D` -> calls `AuthorizationReplyIFace::slot0` (`0x140427220`)
+  - Slot 7 (`+0x38`): `0x140459bb0` — Route dispatcher (checks `*` route `0x14156e2d0`)
+  - Slot 8 (`+0x40`): `0x140427170` — `OnDisconnect` (checks `[ServerProxy + 0x78]` -> `HandleLaunchFailure(1003)`)
+
+- **Base 4: `LoginRequestIFace`** (mdisp = `0x18`, COL `0x141702138`, vtable `0x1414b65d0`):
+  - Slot 0 (`+0x00`): `0x1404279d0` — Handles D4 (`0xD4BA5CCD`):
+    - Decodes status code (u32) and XML configuration string.
+    - Parses XML via `0x14040d4d0`.
+    - Installs Frame and inspects `loglevel`, `logconfig`, `useSyncClock`, `addresses`, `ports` via `0x140446c90`.
+    - If `useSyncClock` is true, initializes clock service (`0x140467bd0`).
+    - Calls `OmegaClientApp::HandleInitialized` (`0x140121360`, `OmegaClientApp::slot1`).
+
+- **Base 5: `AuthorizationReplyIFace`** (mdisp = `0x20`, COL `0x141702110`, vtable `0x1414b66a8`):
+  - Slot 0 (`+0x00`): `0x140427220` — Handles ReplyGameLaunch (`0x90F2D04D`):
+    - Dispatches to `0x140427290`.
+    - String 1: Game server shard address (`{host}:{port}`).
+    - String 2: Session token / account string.
+    - Logs `Game launch reply address = %s` (`0x14157f0d8`).
+    - Passes shard target to downstream connection controller (`0x140427c90`).
+    - Clears `[ServerProxy + 0x78] = 0`.
+
+- **Base 6: `ReplyConnectionIFace`** (mdisp = `0x28`, COL `0x141702160`, vtable `0x1414b6690`):
+  - Slot 0 (`+0x00`): `0x140427bb0`.
+
+### Wire Ordering and Time-Sync Timing Contract
+
+1. **Type `0x01` is not a D4 handshake response:**
+   - In `ServerProxy::Login` (`0x140428183`), the client initializes its background time-sync timer interval to `0x2710` (10,000 ms = 10 seconds).
+   - The transport timer `0x14043de10` checks `now - Connection+0xD0 >= interval`.
+   - The client does not emit type `0x01` synchronously in response to D4.
+   - Gating `0x90F2D04D` behind type `0x01` in the server caused a deadlock and timeout.
+
+2. **Canonical Post-D4 Sequence:**
+   - The server transmits D4 (`0xD4BA5CCD`) containing canonical XML with:
+     - `title="Test Client"`
+     - `useSyncClock="true"`
+     - `loglevel="debug"`
+     - `additionalClientConfigs="username=...;WorldName=he1012;SHARD_PUBLIC_NAME=he1012;"`
+     - `<access-rights><client name="Automaton.exe"><network name="BWA" address="10.2.0.0/15"/></client></access-rights>`
+   - The server immediately transmits ReplyGameLaunch (`0x90F2D04D`) on routes `0xE6A7/0xE800` containing `{worldHost}:{worldPort}`.
+   - The server maintains an asynchronous receive loop for transport control frames; when type `0x01` arrives from the background timer, the server replies with type `0x02` (TransportTimeSync base response echoing the sequence and millisecond clock).

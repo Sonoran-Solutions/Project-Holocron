@@ -264,11 +264,15 @@ public sealed class AuthServer
         if (messageId != 0x011C5800)
             throw new InvalidDataException($"Expected login request message 0x011C5800, received 0x{messageId:X8}.");
 
-        // Historical candidate, not a proven minimum or a successful retail initializer.
-        // useSyncClock selects the application clock service; loglevel is optional.
-        // HandleInitialized tolerates missing access-rights/client/network elements,
-        // but present network records need their string attributes. See the evidence audit.
-        byte[] initializationDocument = "<client title=\"Test Client\" useSyncClock=\"true\" loglevel=\"debug\"><access-rights><client name=\"Automaton.exe\"><network name=\"BWA\" address=\"10.2.0.0/15\"/></client></access-rights></client>"u8.ToArray();
+        // Full canonical configuration grounded in static disassembly and historical evidence:
+        // - useSyncClock="true" enables the synchronized clock service.
+        // - loglevel="debug" sets client logging severity.
+        // - additionalClientConfigs MUST contain "username=...;" because OmegaClientApp::HandleInitialized
+        //   (0x140121360 at 0x140121bf0) executes std::map::find(L"username"). If absent, 0x14011e5d0 returns NULL
+        //   and 0x140121c39 unconditionally dereferences it (cmp WORD PTR [rbx+rax*2], 0), causing an immediate
+        //   access violation (0xC0000005) crash in swtor.exe.
+        // - access-rights provides client and network subnet declarations parsed by HandleInitialized.
+        byte[] initializationDocument = "<client title=\"Test Client\" useSyncClock=\"true\" loglevel=\"debug\" additionalClientConfigs=\"username=local-test;WorldName=he1012;SHARD_PUBLIC_NAME=he1012;\"><access-rights><client name=\"Automaton.exe\"><network name=\"BWA\" address=\"10.2.0.0/15\"/></client></access-rights></client>"u8.ToArray();
         int encodedStringLength = initializationDocument.Length + 1;
         byte[] envelope = new byte[16 + encodedStringLength];
         BinaryPrimitives.WriteUInt32LittleEndian(envelope, 0xD4BA5CCD);
@@ -289,14 +293,46 @@ public sealed class AuthServer
         CryptographicOperations.ZeroMemory(response);
         CryptographicOperations.ZeroMemory(envelope);
 
+        // Immediate game launch reply (0x90F2D04D).
+        // Retail client evidence (Client_20260904T113716_600.log) confirms that ServerProxy::ReplyGameLaunch (0x90F2D04D)
+        // arrives alongside or immediately following D4. It supplies the World shard address and clears
+        // [ServerProxy + 0x78]. If the connection closes before 0x90F2D04D arrives, ServerProxy::OnDisconnect (0x140427170)
+        // triggers HandleLaunchFailure(1003). Type 0x01 is on an independent 10-second background timer and must NOT gate 0x90F2D04D.
+        byte[] gameAddress = Encoding.UTF8.GetBytes($"{_worldHost}:{_worldPort}");
+        int encodedAddressLength = gameAddress.Length + 1;
+        int secondStringLengthOffset = 12 + encodedAddressLength;
+        byte[] launchEnvelope = new byte[secondStringLengthOffset + sizeof(uint) + 1];
+        BinaryPrimitives.WriteUInt32LittleEndian(launchEnvelope, 0x90F2D04D);
+        BinaryPrimitives.WriteUInt16LittleEndian(launchEnvelope.AsSpan(4), routeB);
+        BinaryPrimitives.WriteUInt16LittleEndian(launchEnvelope.AsSpan(6), routeA);
+        BinaryPrimitives.WriteUInt32LittleEndian(launchEnvelope.AsSpan(8), (uint)encodedAddressLength);
+        gameAddress.CopyTo(launchEnvelope.AsSpan(12));
+        BinaryPrimitives.WriteUInt32LittleEndian(launchEnvelope.AsSpan(secondStringLengthOffset), 1);
+
+        byte[] launchResponse = TransportFrame.Encode(0x10, launchEnvelope);
+        byte[] encryptedLaunchResponse = new byte[launchResponse.Length];
+        sendCipher.Process(launchResponse, encryptedLaunchResponse);
+        await stream.WriteAsync(encryptedLaunchResponse, ct);
+        await stream.FlushAsync(ct);
+        Console.WriteLine($"[AUTH] Sent encrypted game-launch reply ({launchResponse.Length} bytes, message=0x90F2D04D, route=0x{routeB:X4}/0x{routeA:X4}, address={_worldHost}:{_worldPort}, second-string=empty) to {endpoint}.");
+        CryptographicOperations.ZeroMemory(encryptedLaunchResponse);
+        CryptographicOperations.ZeroMemory(launchResponse);
+        CryptographicOperations.ZeroMemory(launchEnvelope);
+        CryptographicOperations.ZeroMemory(gameAddress);
+
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(TimeSpan.FromSeconds(5));
         try
         {
-            byte[]? next = await ReadEncryptedTransportFrameAsync(stream, recvCipher, timeout.Token);
-            if (next is null) Console.WriteLine("[AUTH] Client closed after the correlated envelope.");
-            else
+            while (!timeout.Token.IsCancellationRequested)
             {
+                byte[]? next = await ReadEncryptedTransportFrameAsync(stream, recvCipher, timeout.Token);
+                if (next is null)
+                {
+                    Console.WriteLine("[AUTH] Client closed connection after launch reply.");
+                    break;
+                }
+
                 if (next[0] == 0x01 && next.Length == TransportFrame.HeaderSize + sizeof(ulong))
                 {
                     ulong sequence = TransportTimeSync.ReadRequestSequence(next);
@@ -312,60 +348,17 @@ public sealed class AuthServer
                     Console.WriteLine($"[AUTH] Sent encrypted base-only transport time response: type=0x02, length={controlResponse.Length}, sequence=0x{sequence:X16}, count=1, local-ms=0x{localTimeMilliseconds:X8}.");
                     CryptographicOperations.ZeroMemory(encryptedControlResponse);
                     CryptographicOperations.ZeroMemory(controlResponse);
-
-                    byte[] gameAddress = Encoding.UTF8.GetBytes($"{_worldHost}:{_worldPort}");
-                    int encodedAddressLength = gameAddress.Length + 1;
-                    int secondStringLengthOffset = 12 + encodedAddressLength;
-                    byte[] launchEnvelope = new byte[secondStringLengthOffset + sizeof(uint) + 1];
-                    BinaryPrimitives.WriteUInt32LittleEndian(launchEnvelope, 0x90F2D04D);
-                    BinaryPrimitives.WriteUInt16LittleEndian(launchEnvelope.AsSpan(4), routeB);
-                    BinaryPrimitives.WriteUInt16LittleEndian(launchEnvelope.AsSpan(6), routeA);
-                    BinaryPrimitives.WriteUInt32LittleEndian(launchEnvelope.AsSpan(8), (uint)encodedAddressLength);
-                    gameAddress.CopyTo(launchEnvelope.AsSpan(12));
-                    BinaryPrimitives.WriteUInt32LittleEndian(launchEnvelope.AsSpan(secondStringLengthOffset), 1);
-
-                    byte[] launchResponse = TransportFrame.Encode(0x10, launchEnvelope);
-                    byte[] encryptedLaunchResponse = new byte[launchResponse.Length];
-                    sendCipher.Process(launchResponse, encryptedLaunchResponse);
-                    await stream.WriteAsync(encryptedLaunchResponse, timeout.Token);
-                    await stream.FlushAsync(timeout.Token);
-                    Console.WriteLine($"[AUTH] Sent encrypted post-sync game-launch reply ({launchResponse.Length} bytes, message=0x90F2D04D, route=0x{routeB:X4}/0x{routeA:X4}, address={_worldHost}:{_worldPort}, second-string=empty) to {endpoint}.");
-                    CryptographicOperations.ZeroMemory(encryptedLaunchResponse);
-                    CryptographicOperations.ZeroMemory(launchResponse);
-                    CryptographicOperations.ZeroMemory(launchEnvelope);
-                    CryptographicOperations.ZeroMemory(gameAddress);
-
-                    using var followUpTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    followUpTimeout.CancelAfter(TimeSpan.FromSeconds(5));
-                    try
-                    {
-                        byte[]? followUp = await ReadEncryptedTransportFrameAsync(stream, recvCipher, followUpTimeout.Token);
-                        if (followUp is null)
-                        {
-                            Console.WriteLine("[AUTH] Client closed after the transport time response.");
-                        }
-                        else
-                        {
-                            Console.WriteLine($"[AUTH] Client advanced after the transport time response: type=0x{followUp[0]:X2}, length={followUp.Length}.");
-                            CryptographicOperations.ZeroMemory(followUp);
-                        }
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        Console.WriteLine("[AUTH] Client did not send another frame within the bounded post-time-response window.");
-                    }
-                    return;
                 }
                 else
                 {
-                    Console.WriteLine($"[AUTH] Client advanced with next encrypted transport frame: type=0x{next[0]:X2}, length={next.Length}.");
+                    Console.WriteLine($"[AUTH] Client sent post-launch frame: type=0x{next[0]:X2}, length={next.Length}.");
+                    CryptographicOperations.ZeroMemory(next);
                 }
-                CryptographicOperations.ZeroMemory(next);
             }
         }
         catch (OperationCanceledException)
         {
-            Console.WriteLine("[AUTH] Client did not send a next frame within the bounded probe window.");
+            Console.WriteLine("[AUTH] Post-launch listen window completed.");
         }
     }
 
