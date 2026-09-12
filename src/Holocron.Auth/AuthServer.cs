@@ -264,9 +264,10 @@ public sealed class AuthServer
         if (messageId != 0x011C5800)
             throw new InvalidDataException($"Expected login request message 0x011C5800, received 0x{messageId:X8}.");
 
-        // The retail binary requires root <client> with attributes (e.g. useSyncClock, loglevel)
-        // for post-config handler 0x140447470, plus child <access-rights> containing
-        // <client name="..."> and <network name="..." address="..."/> for HandleInitialized.
+        // Historical candidate, not a proven minimum or a successful retail initializer.
+        // useSyncClock selects the application clock service; loglevel is optional.
+        // HandleInitialized tolerates missing access-rights/client/network elements,
+        // but present network records need their string attributes. See the evidence audit.
         byte[] initializationDocument = "<client title=\"Test Client\" useSyncClock=\"true\" loglevel=\"debug\"><access-rights><client name=\"Automaton.exe\"><network name=\"BWA\" address=\"10.2.0.0/15\"/></client></access-rights></client>"u8.ToArray();
         int encodedStringLength = initializationDocument.Length + 1;
         byte[] envelope = new byte[16 + encodedStringLength];
@@ -283,7 +284,7 @@ public sealed class AuthServer
         sendCipher.Process(response, encryptedResponse);
         await stream.WriteAsync(encryptedResponse, ct);
         await stream.FlushAsync(ct);
-        Console.WriteLine($"[AUTH] Sent encrypted login-reply envelope with minimal client initializer ({response.Length} bytes, message=0xD4BA5CCD, route=0x{routeB:X4}/0x{routeA:X4}, body={envelope.Length - 8} bytes) to {endpoint}.");
+        Console.WriteLine($"[AUTH] Sent encrypted login-reply envelope with candidate client initializer ({response.Length} bytes, message=0xD4BA5CCD, route=0x{routeB:X4}/0x{routeA:X4}, body={envelope.Length - 8} bytes) to {endpoint}.");
         CryptographicOperations.ZeroMemory(encryptedResponse);
         CryptographicOperations.ZeroMemory(response);
         CryptographicOperations.ZeroMemory(envelope);

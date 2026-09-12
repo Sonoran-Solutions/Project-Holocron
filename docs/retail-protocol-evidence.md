@@ -5,6 +5,10 @@ Addresses below are preferred virtual addresses in the installed x64 `swtor.exe`
 SHA-256: `ad541a742a62500c2095f87c3cff116def462ebd26d1de95de32bc7293eb596b`.
 No account credentials or captured session keys are recorded here.
 
+> September 11 audit: the current candidate was tested and still closes after D4.
+> See the final audit section before relying on earlier XML-rejection claims.
+> In particular, absence of type `0x01` does not identify a failing Frame lookup.
+
 ## Repository mode
 
 At `0x1400bdc25`–`0x1400bdc4f`, the client compares the first two UTF-16
@@ -1321,15 +1325,15 @@ that run was the still-incomplete `<client/>` initializer, this result does not
 disprove D4-first ordering; it isolates the failure before ReplyGameLaunch can
 be observed.
 
-**CONFIRMED — the missing D4 element is exactly `access-rights`.** The hidden
+**CONFIRMED lookup key; DISPROVEN failure attribution — `access-rights`.** The hidden
 return-buffer ABI gives `0x1404068C0` arguments in `RDX` and `R8`. At its call to
 `0x14044A030`, the compiler leaves the incoming `R8` unchanged; `0x14044A030`
 then calls `0x1404107F0` without reloading it. `0x1404107F0` reads the requested
 name from `R8` and compares it with Frame node names. The apparent absence of a
 key use in `0x14044A030` was therefore a register-forwarding artifact. A root
-`<client/>` document contains no node named `access-rights`, so the confirmed
-empty-setting guard explains the immediate close. No speculative runtime
-attribution is needed for this conclusion.
+`<client/>` document contains no node named `access-rights`, but the empty-setting branch logs and continues at `0x140121AEE`.
+It does not establish the cause of the immediate close; the former attribution
+is withdrawn by the September 11 audit.
 
 After serializing the matching `access-rights` element,
 `OmegaClientApp::HandleInitialized` reparses it and searches for its `client`
@@ -1351,7 +1355,7 @@ isolate XML acceptance: the established empty-D4 baseline sends type-`0x01`
 before any second application exchange, so the immediate launch frame crossed
 an unresolved transport-synchronization boundary.
 
-**DISPROVEN — the two-level tag document does not pass initialization.** A
+**CONFIRMED failed experiment; HYPOTHESIS internal rejection — two-level XML.** A
 clean synchronized run isolated the stages exactly as described below. The
 server sent only the corrected D4 frame first:
 
@@ -1366,9 +1370,9 @@ The client closed the connection immediately after that encrypted frame. It
 sent no type-`0x01`, logged the same launch failure `1003`, and therefore never
 received either the type-`0x02` response or ReplyGameLaunch. This removes the
 immediate second application frame as a confounder. Although the lookup key is
-confirmed to be `access-rights`, representing it as a conventional XML element
-containing a conventional `client` child is not sufficient for the retail
-Frame parser/lookup contract.
+confirmed to be `access-rights`, this observation does not demonstrate a Frame
+parser/lookup violation. It establishes only that this staged exchange failed
+to complete login. The September 11 audit withdraws the stronger attribution.
 
 `Holocron.Auth` remains staged at this boundary: it waits for the client
 type-`0x01` request and only if that request arrives sends the proven
@@ -1381,8 +1385,8 @@ body     encoded string `127.0.0.1:20061`
          encoded empty string
 ```
 
-Type-`0x01` remains the discriminator for any subsequent evidence-backed
-initializer experiment without allowing ReplyGameLaunch to interfere. The
+Type-`0x01` was used as the transport discriminator for these experiments.
+It is not an XML-acceptance oracle; see the September 11 audit. The
 first launch string uses
 the server's existing private World target. The second string remains at the
 parser-valid empty minimum; no session token or
@@ -1425,9 +1429,10 @@ complete C# suite passes **46/46** for the currently staged implementation.
   - `"loglevel"` (`0x1404474c2`)
   - `"logconfig"` (`0x140447545`)
   - `"useSyncClock"` (`0x140447bad`)
-  - `"addresses"` (`0x140447e0d`), `"ports"` (`0x14044827e`), etc.
+  Child element lookups, not attribute lookups, then inspect `"addresses"`
+  (`0x140447E25`) and `"ports"` (`0x140448298`) via `0x140410490`.
 
-**CONFIRMED — Root Document Shape and Historical Ground Truth:**
+**CONFIRMED historical shape; CONDITIONAL current-retail relevance:**
 - Historical emulator source (`research/SwTor-1.3/server/WorldServer/Src/Logic/Senders/Client.cpp`, lines 27-33) confirms the canonical initialization XML has root `<client ...>`:
   ```xml
   <client title="Test Client" useSyncClock="true" loglevel="debug">
@@ -1448,10 +1453,165 @@ complete C# suite passes **46/46** for the currently staged implementation.
     </access-rights>
   </client>
   ```
-- Corroborated by actual client log `.local-test/client-v1/game/swtor/retailclient/swtor/logs/Client_20260904T092441_708.log`:
+- Successful initialization (but not the historical XML contents) is corroborated by client log `.local-test/client-v1/game/swtor/retailclient/swtor/logs/Client_20260904T092441_708.log`:
   `HandleInitialize completed. [Firestorm.firestorm.client.OmegaClientApp](omegaclientapp.cpp:OmegaClientApp::HandleInitialized:411)` -> `setState changing state to [CS_APP_INITIALIZED]`.
 
-**DISPROVEN:**
-- `<access-rights>` as root document is disproven: `<access-rights>` is a child element of `<client>`, not the root configuration document. Having `<access-rights>` as root causes `0x140447470` to fail attribute extraction on the root node.
-- The hypothesis that `<access-rights><client/></access-rights>` failed because of element vs attribute XML dialect is disproven: `<client>` inside `<access-rights>` is an element, but it requires child `<network name="..." address="..."/>` elements and the root document requires the `<client ...>` shape with attributes.
+**DISPROVEN — prior mandatory-shape claims.** The earlier assertion that an
+`access-rights` root necessarily fails root-attribute extraction was unsupported.
+Missing `loglevel` and `useSyncClock` have explicit non-error paths. Likewise,
+`HandleInitialized` skips absent `client` and `network` elements; network children
+are not mandatory. Element/attribute distinctions remain confirmed, but they do
+not identify the cause of the failed runs. Historical emission of a `<client>`
+root with these attributes is not proof that retail requires all of them.
 
+## Senior audit and clean candidate experiment (September 11)
+
+**CONFIRMED — starting state.** Clean `main` at
+`f032f344b4c2d3e53e22432eac821d0d80f607d5`, not the reported `d7f12a5`.
+The initial C# suite passed 46/46 with `/home/dq/.dotnet/dotnet test
+--no-restore -m:1 -nr:false`. The sandbox denied MSBuild's local socket bind;
+the approved outside-sandbox run passed. NU1900 warnings concern the unavailable
+NuGet audit feed, not ignored test failures. Static addresses refer to the same
+private retail copy; only the already-established test key and bounded resolver
+patch differ from the retail executable identified at the start of this document.
+
+### Exact useSyncClock behavior
+
+**CONFIRMED.** The app constructor writes byte `App +0x1A0 = 0` at
+`0x14044574F`. At `0x140447BD3`, `FindAttributeValue` looks up `useSyncClock`.
+An absent attribute produces null at `0x140447BF1`; the test at
+`0x140447C15` skips the comparison. A present value is compared to ASCII
+`true` at `0x141571030` by imported `_stricmp` (IAT `0x14136AA00`). Only equality
+writes one at `0x140447C2E`. There is no false/absent reset in this handler.
+
+```text
+fresh app, absent       -> +0x1A0 stays 0
+fresh app, "false"      -> _stricmp != 0 -> +0x1A0 stays 0
+fresh app, "true"       -> _stricmp == 0 -> +0x1A0 = 1
+fresh app, "TRUE"       -> same as "true"
+previously enabled app -> absent/"false" leaves +0x1A0 = 1
+```
+
+**CONFIRMED — two consumers, neither the transport send gate.** After the
+configuration installer returns, `0x140427B6B` tests this byte. If set, it calls
+`0x140467BD0(App +0x1A8)`. That service first checks for a `*:timesource`
+connection via `0x140468B50`; if found, it schedules callback `0x140467DD0`
+and sets its own `+0x40` active byte. The second consumer, `0x14044A1D0`, returns
+the ordinary local clock when the flag is zero or the service pointer is null.
+With a service it adds the service's `+0xA0` correction and clamps against its
+`+0xB8` previous value to prevent backward time. Thus the attribute enables use
+of the application synchronized clock; it does not directly enable type `0x01`.
+The optional service's successful lookup is not proven in this local experiment.
+
+**CONFIRMED — transport request producer.** Login setup independently writes
+`Connection +0xB8 = 0x2710` (10,000 ms) at `0x140428183`. The transport timer
+`0x14043DE10` requires connection lifecycle state 4, a positive interval, and
+`now - Connection +0xD0 >= interval`. When control state `+0x98` is zero it
+writes one at `0x14043E023` and queues a send. The send path requires
+`Connection +0x180 == 1` at `0x14043B638` and `+0x98 == 1` at `0x14043B680`,
+then calls `0x14043C780`. That writes the type-1 sequence, snapshots local time
+at `+0xC0`, and sets outstanding state two. The timer's caller `0x1404301D3`
+and the serializer use the local interrupt-time-based clock, not
+`0x14044A1D0`. No dependency on the application flag occurs in this producer
+chain. Connection lifetime and scheduling still affect whether a request is
+observed before a close.
+
+**DISPROVEN — “nonempty config without type 0x01 means the Frame was rejected.”**
+That inference is too strong: transport liveness does not identify XML parser
+acceptance or an application failure site. The alternative claim that an absent
+`useSyncClock` directly disables this transport producer is also disproven by
+the separate state/clock paths. Broader application effects remain conditional
+on service discovery. The empty-string baseline already emitted type `0x01`
+without installing a true attribute. The new true-bearing candidate below also
+failed to restore type `0x01`; absence of that attribute cannot alone explain
+the observed difference.
+
+### Candidate fields: required versus optional
+
+These classifications concern the audited retail paths, not an assertion of
+end-to-end sufficiency. No successful nonempty D4 minimum has been established.
+
+| Field | Classification | Current retail evidence |
+| --- | --- | --- |
+| root `title` | HISTORICAL-ONLY | No requirement established in the audited installer/initializer; retained in candidate, not claimed mandatory. Other consumers remain unresolved. |
+| `useSyncClock` | REQUIRED FOR SPECIFIC BEHAVIOR | Case-insensitive true enables the application sync-clock service/use; absent and false are accepted by the lookup path. Not required by the transport type-1 producer. |
+| `loglevel` | OPTIONAL | Null at `0x14044750D`; branch `0x140447659` skips severity selection. A present recognized value changes logging. |
+| `access-rights` | OPTIONAL on this initializer path | Missing setting logs the diagnostic, then jumps from `0x1401214F8` to `0x140121AEE`, continuing initialization. It is needed to populate access-rights records, not proven a login gate. |
+| nested `client name` | REQUIRED FOR PARSING/INITIALIZATION, CONDITIONAL on a present network record | Absent client skips at `0x140121581`; no network skips at `0x140121643`. With a network, the client name string is dereferenced at `0x14012186A`; omission yields null. The literal `Automaton.exe` is historical, not a required match. |
+| `network name` | REQUIRED FOR PARSING/INITIALIZATION, CONDITIONAL on a present network record | Lookup at `0x140121671`; missing value becomes null, dereferenced at `0x1401217C9`. The literal `BWA` is historical. |
+| `network address` | REQUIRED FOR PARSING/INITIALIZATION, CONDITIONAL on a present network record | Lookup at `0x1401216D5`; missing value becomes null, dereferenced at `0x140121724`. Its string is passed with names to `0x140123E30`. Accepted address grammar beyond this historical candidate remains unresolved. |
+
+**CONFIRMED.** Missing client/network elements take explicit skip paths, so the
+previous requirement for at least one network was wrong. No access-control
+check is changed or bypassed by this audit. The candidate's actual rules remain
+unchanged. Static tolerance of a missing element does not justify describing
+`<client/>` or the two-level document as a successful runtime minimum.
+
+### Wire audit and new retail result
+
+**CONFIRMED — current implementation.** D4 remains `0xD4BA5CCD`, with the
+request routes reversed to `E6A7/E800`. Status is zero; the next LE u32 is 187,
+covering 186 UTF-8 XML bytes plus the terminal NUL. The XML is well formed and
+matches the exact historical candidate in `AuthServer.cs`. Body length is 195,
+total frame length 209, type `0x10` with complemented header checksum. The
+encoded-string parser `0x1403FB300`, called at `0x14045A921`, checks the NUL and
+length; the candidate satisfies those structural checks. No message, route,
+cipher ordering, status, XML bytes, or subsequent protocol behavior was changed
+in this audit.
+
+**CONFIRMED — clean normal-client experiment.** Fresh log
+`Client_20260911T210632_308.log`, one screenshot-verified selection at 21:07:44
+America/Phoenix. Auth and HTTPS platform ran in the isolated namespace, the
+private resolver's AI_ADDRCONFIG immediate was zero, and no WineDbg/GDB/strace
+mode was enabled. The user delegated selection; the agent clicked Select once.
+
+```text
+client  RSA type 4, 522 bytes, test-key envelope validated
+client  type 0x10, 46 bytes, 011C5800 / E800/E6A7
+server  type 0x10, 209 bytes, D4BA5CCD / E6A7/E800
+        status 0, current <client ... useSyncClock="true" ...> document
+client  EOF; no type 0x01 or later frame
+UI      connection-error dialog; fresh client log reports error 1003
+        no HandleInitialize completed / CS_APP_INITIALIZED / launch-reply log
+```
+
+**DISPROVEN — the current candidate restores transport sync.** It did not.
+The staged server therefore sent neither type `0x02` nor ReplyGameLaunch in
+this run. The client was quit normally and the runner reported restoration of
+the private resolver bytes. No login body or sensitive account data was retained.
+
+**HYPOTHESIS / unresolved boundary.** Failure remains between receipt of D4
+and a demonstrated initializer completion. The first failing internal lookup
+or validation has not been localized by this normal run. In particular, no
+evidence justifies adding title/loglevel/network fields as a correction: they
+are already present, and the audited missing-element branches do not prove
+rejection. Do not mutate multiple fields or claim a parser failure from EOF.
+Further work must distinguish XML parse/install completion from the owner
+callback at `0x140427B84` and its connection lifetime effects, using structural
+observations without recording login contents.
+
+### Existing type-2 implementation and regression coverage
+
+**CONFIRMED.** Type `0x02` was already implemented before this audit. Rechecking
+`0x14043C900` confirms the sequence store at `0x14043CB07`, count byte at
+`0x14043CB3B`, and low-32-bit local clock at `0x14043CB7D`. Its base response is
+19 bytes: ordinary XOR header `02 13 00 00 00 11`, LE u64 echo, u8 count one,
+LE u32 clock. Each optional downstream record adds two u32s, not another
+base-sized record. The clock producer reads shared InterruptTime, subtracts
+the saved base, divides by 10,000, and adds the saved FILETIME-millisecond base.
+`AuthServer`'s FILETIME seed plus Stopwatch elapsed milliseconds matches this
+construction; no timing value was fabricated or changed.
+
+The socket-test change to bind port zero removes the bind-release-rebind race.
+Retries still fail on exhaustion and faulted server tasks are awaited; they do
+not turn failures into passes. ReuseAddress affects local listener binding,
+not protocol validation. The added synthetic socket regression exercises the
+actual private-key probe path, independently checks D4 XML/framing/routes,
+sends a nontrivial sequence and verifies the type-2 echo/count/clock plus
+continued cipher state through the launch reply. This is server-contract
+coverage, not a claim of retail XML or launch acceptance.
+
+**CONFIRMED — final validation.** The same full-suite command passes **47/47**,
+zero skipped, after the audit changes. `git diff --check` passes. The restored
+resolver instruction is `C7 06 00 04 00 00`. Type-2 retail retesting is still
+conditional on reaching a type-1 request; the candidate run did not reach it.

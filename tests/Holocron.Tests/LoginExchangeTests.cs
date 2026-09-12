@@ -3,11 +3,84 @@ using System.Text;
 using System.Buffers.Binary;
 using Holocron.Common.Crypto;
 using Holocron.Common.Protocol;
+using Holocron.Auth;
+using System.Net;
+using System.Net.Sockets;
+using System.Xml.Linq;
 
 namespace Holocron.Tests;
 
 public class LoginExchangeTests
 {
+    [Fact]
+    public async Task ProbePreservesD4ConfigurationAndEncryptedTimeSyncContract()
+    {
+        // Synthetic peer only: this verifies the actual server wire output, not
+        // acceptance of the XML or launch reply by the retail client.
+        using RSA rsa = RSA.Create(2048);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var server = new AuthServer(0, testKey: rsa, handshakeOnly: true,
+            probeLoginReplyEnvelope: true);
+        Task serverTask = server.StartAsync(cancellation.Token);
+        try
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync(IPAddress.Loopback, server.Port, cancellation.Token);
+            var network = client.GetStream();
+            Assert.NotNull(await TransportFrame.ReadAsync(network, cancellation.Token));
+
+            byte[] clear = new byte[88];
+            for (int i = 8; i < clear.Length; i++) clear[i] = (byte)i;
+            await network.WriteAsync(Encode(clear, rsa), cancellation.Token);
+            using var encrypted = new Salsa20Stream(network,
+                new Salsa20(clear[8..40], clear[72..80]),
+                new Salsa20(clear[40..72], clear[80..88]));
+            byte[] request = TransportFrame.Encode(0x10,
+                Convert.FromHexString("00581C0100E8A7E6"));
+            await encrypted.WriteAsync(request, cancellation.Token);
+            byte[] reply = (await TransportFrame.ReadAsync(encrypted, cancellation.Token))!;
+            Assert.Equal(0x10, reply[0]);
+            Assert.Equal("CD5CBAD4A7E600E8", Convert.ToHexString(reply.AsSpan(6, 8)));
+            Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(reply.AsSpan(14)));
+            int stringBytes = BinaryPrimitives.ReadInt32LittleEndian(reply.AsSpan(18));
+            Assert.Equal(reply.Length - 22, stringBytes);
+            Assert.Equal(0, reply[^1]);
+            Assert.DoesNotContain((byte)0, reply[22..^1]);
+            string xml = new UTF8Encoding(false, true).GetString(reply[22..^1]);
+            var root = XElement.Parse(xml);
+            Assert.Equal("client", root.Name.LocalName);
+            Assert.Equal("Test Client", (string?)root.Attribute("title"));
+            Assert.Equal("true", (string?)root.Attribute("useSyncClock"));
+            Assert.Equal("debug", (string?)root.Attribute("loglevel"));
+            var rule = Assert.Single(root.Element("access-rights")!.Elements("client"));
+            Assert.Equal("Automaton.exe", (string?)rule.Attribute("name"));
+            var subnet = Assert.Single(rule.Elements("network"));
+            Assert.Equal("BWA", (string?)subnet.Attribute("name"));
+            Assert.Equal("10.2.0.0/15", (string?)subnet.Attribute("address"));
+
+            uint before = unchecked((uint)(DateTime.UtcNow.ToFileTimeUtc() / 10000));
+            byte[] sequence = Convert.FromHexString("0807060504030201");
+            await encrypted.WriteAsync(TransportFrame.Encode(1, sequence), cancellation.Token);
+            byte[] sync = (await TransportFrame.ReadAsync(encrypted, cancellation.Token))!;
+            Assert.Equal("021300000011", Convert.ToHexString(sync.AsSpan(0, 6)));
+            Assert.Equal(sequence, sync[6..14]);
+            Assert.Equal(1, sync[14]);
+            uint clock = BinaryPrimitives.ReadUInt32LittleEndian(sync.AsSpan(15));
+            // Modular subtraction handles the low-32-bit clock wrapping. Allow
+            // scheduling and millisecond quantization without accepting epoch zero.
+            Assert.InRange(unchecked((int)(clock - before)), -1000, 10000);
+
+            byte[] launch = (await TransportFrame.ReadAsync(encrypted, cancellation.Token))!;
+            Assert.Equal(0x10, launch[0]);
+            Assert.Equal("4DD0F290A7E600E8", Convert.ToHexString(launch.AsSpan(6, 8)));
+        }
+        finally
+        {
+            cancellation.Cancel();
+            await serverTask;
+        }
+    }
+
     [Fact]
     public void LocalKeyPairExtractsKeysAndRejectsDifferentKey()
     {
