@@ -1,0 +1,29 @@
+{
+  "/gamepad/lastshard": {
+    "name": "",
+    "isup": false,
+    "host": "",
+    "environmentDisabled": false
+  },
+  "/gamepad/shardlist": {
+    "accountRegion": 0,
+    "environmentDisabled": false,
+    "shards": [
+      {
+        "name": "Holocron Local Test",
+        "host": "localhost:7979:castlehilltest",
+        "isup": true,
+        "islocked": false,
+        "queuewait": 0,
+        "loadlevel": 0,
+        "timezone": 0,
+        "focusid": 0,
+        "region": 0,
+        "language": "en-us",
+        "weight": 0,
+        "characters": 0,
+        "isguilded": false
+      }
+    ]
+  }
+}

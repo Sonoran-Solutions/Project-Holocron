@@ -1,5 +1,22 @@
 # Project Holocron 🪐
 
+> Development status: this is an experimental server/simulation project. Retail SWTOR
+> login, repository attachment, and playable offline worlds have **not** been verified.
+> The architecture and features below describe intended behavior and internal simulations,
+> not a working retail-client integration. Passing unit tests and TCP greetings do not
+> establish game compatibility.
+>
+> Current blockers found in the implementation: auth attempts a legacy RSA key exchange
+> that failed against the installed client; its Salsa ciphers are created but unused;
+> auth/world process TCP reads as packets without stream reassembly; world dispatch uses
+> an internal 12-byte header rather than the observed retail transport framing. An explicit
+> bootstrap shard address also requests repository services which this server does not
+> implement. DNS changes or a Steam reinstall alone cannot solve these issues.
+>
+> OpenHands ran in a separate container. Its portable-script changes were not present in
+> this checkout. `run-server.sh` now resolves the local SDK and rebuilds Release before
+> starting the World process, so a stale binary cannot hide source changes.
+
 [![.NET 8](https://img.shields.io/badge/.NET-8.0-512bd4.svg)](https://dotnet.microsoft.com/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-27%2F27%20passing-brightgreen.svg)]()

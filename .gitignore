@@ -9,4 +9,6 @@ data/navmesh/
 research/
 scratch/
 *.log
-
+.local-test/
+__pycache__/
+*.pyc

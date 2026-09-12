@@ -9,24 +9,33 @@ public sealed class AuthServerTests
     [Fact]
     public async Task NewConnectionReceivesFramedLoginTransportGreeting()
     {
-        int port = GetUnusedTcpPort();
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        var server = new AuthServer(port);
+        var server = new AuthServer(0);
         Task serverTask = server.StartAsync(cancellation.Token);
 
-        using var client = new TcpClient();
+        TcpClient? client = null;
         for (int i = 0; i < 50; i++)
         {
+            if (serverTask.IsFaulted)
+                await serverTask;
+
             try
             {
-                await client.ConnectAsync(IPAddress.Loopback, port, cancellation.Token);
+                client = new TcpClient();
+                await client.ConnectAsync(IPAddress.Loopback, server.Port, cancellation.Token);
                 break;
             }
             catch (SocketException) when (i < 49)
             {
+                client?.Dispose();
+                client = null;
                 await Task.Delay(50, cancellation.Token);
             }
         }
+
+        Assert.NotNull(client);
+        using (client)
+        {
 
         byte[] actual = new byte[22];
         await client.GetStream().ReadExactlyAsync(actual, cancellation.Token);
@@ -40,16 +49,9 @@ public sealed class AuthServerTests
 
         Assert.Equal(expectedPrefix, actual[..14]);
         Assert.Contains(actual[14..], value => value != 0);
+
         cancellation.Cancel();
         await serverTask;
     }
-
-    private static int GetUnusedTcpPort()
-    {
-        var listener = new TcpListener(IPAddress.Loopback, 0);
-        listener.Start();
-        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
-        listener.Stop();
-        return port;
-    }
+}
 }
