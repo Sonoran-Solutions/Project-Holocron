@@ -2866,3 +2866,128 @@ pair `0x0001`/`0x0000` stands, and the next task is to localize the `X == 0`
 trigger — which decides whether the bootstrap connection is meant to end
 normally and the login continue elsewhere, or whether the client is aborting
 because a required peer message never arrived in the introduce/close window.
+
+## Close producer identified: `omega::TimeRequester` teardown (September 13)
+
+This section supersedes the "producer site not definitively resolved" line of the
+previous section. One of the two candidates is eliminated by reachability and the
+other is identified by RTTI.
+
+### Candidate A eliminated — the list-teardown is a type-3 transport path
+
+`0x1404371E6` lives in `0x140436C80`, whose **only** caller in the executable is
+`0x14043C409`, inside the transport **type-3** receive handler
+(`0x14043C321`). That handler's first instruction is:
+
+```text
+0x14043C321  cmp DWORD PTR [r12+0x180],0x3
+0x14043C32A  jne 0x14043C460              ; not 3 -> not this handler
+```
+
+`Connection + 0x180` is the role/state field: the client-role connection sets it
+to `1` (`0x14043E7E2`), and the send path requires `1` (`0x14043B638`); the RSA
+receive handler requires `2`. Nothing in the observed run sets `3`, and no type-3
+frame was ever sent by Holocron. **DISPROVEN as the producer for this run.**
+
+### Candidate B identified — `omega::TimeRequester`
+
+`0x140468D40` has **no direct callers**. It is referenced exactly once in the
+image, as a vtable slot at `0x1414B7CC8`. Its RTTI Complete Object Locator
+(`0x1417047C8`, `mdisp = 0x18`) resolves to:
+
+```text
+.?AVTimeRequester@omega@@          i.e. omega::TimeRequester
+vtable 0x1414B7CC8  slot +0x00 -> 0x140468D40
+                    slot +0x20 -> 0x140468530
+                    slot +0x30 -> 0x1404689A0
+                    slot +0x38 -> 0x140468B00
+```
+
+The object's identity is corroborated in the string data: the RTTI name is
+immediately followed by the literal `"*:timesource"` (file offsets `0x157EDD0`
+onward), and the sibling method `0x140468B50` uses the string at `0x1415803D0`.
+This is the same `*:timesource` lookup the September 11 audit found behind
+`0x140467BD0(App + 0x1A8)`.
+
+The teardown method itself:
+
+```text
+0x140468D40  rcx = this, rdx = arg2, r8 = arg3, r9d = arg4
+0x140468D55  rcx = [rdx+8]        the connection comes from an ARGUMENT struct,
+                                  not from the object
+0x140468D5F  je 0x140468D6B        null -> skip
+0x140468D61  xor r8d,r8d
+0x140468D64  xor edx,edx
+0x140468D66  call 0x1404123D0     (connection, 0, 0)  -> X = 0 -> Close is sent
+```
+
+**CONFIRMED — the observed `Close` was emitted by a teardown path belonging to
+`omega::TimeRequester`, an object whose purpose is to find and use a
+`*:timesource` connection.**
+
+### The causal chain, and where it is still open
+
+```text
+client completes introduce and self-registers route 0001/0000
+  -> an omega::TimeRequester that holds this connection is destroyed
+  -> 0x140468D66  0x1404123D0(connection, 0, 0)      [X = 0]
+  -> 0x1404124E1 state query == 4 and 0x1404124EB X == 0
+  -> 0x140412654 Close 0x43DB3479 sent
+  -> socket EOF
+  -> ServerProxy::OnDisconnect (0x140427170) sees the launch context at +0x90
+     still set and reports 1003
+```
+
+**What is still open:** both `omega::TimeRequester` constructor paths
+(`0x140467613`, `0x14046780F`, each installing the vtable at `0x14046771B` /
+`0x140467830`) also have **no direct callers**, so construction and destruction
+happen through virtual dispatch from a manager that has not been localized. The
+run has not yet been shown to reach `0x140467BD0`, whose activation the
+September 11 audit tied to the `useSyncClock` application flag — and that flag is
+set from D4, which in this run never reached its handler.
+
+### Causal ordering: is Close the cause or the cleanup?
+
+**CONFIRMED — Close is cleanup, not the cause.** `Close` is sent by `0x1404123D0`
+only after an owner has already decided to tear the connection down; the function
+performs state bookkeeping and the graceful frame, and its `X = 2` callers (the
+registration success and failure paths, and the reply's `0xFFFF` path) do not
+send at all. Error 1003 is produced afterwards by `ServerProxy::OnDisconnect`
+because the launch context at `+0x90` is still outstanding, i.e. because the login
+had not completed for an independent reason.
+
+### D4 on this connection — UNKNOWN, leaning NO for the current sequence
+
+```text
+Does D4 belong on this same connection?
+
+classification: UNKNOWN
+
+If YES (HYPOTHESIS, not proven):
+    the same auth socket, in the window between the client's
+    IntroduceConnectionSignature and its teardown
+    route 0x0001 / 0x0000 (proven key)
+    because D4 is what sets useSyncClock, which is what reaches
+    0x140467BD0 and the omega::TimeRequester activation path
+
+If NO:
+    the outstanding requirement is a *:timesource peer object; the
+    omega::TimeRequester teardown shows the client looking for one and
+    tearing the connection down when it is not there
+
+evidence: the RTTI identification, the adjacent "*:timesource" literal, the
+          X == 0 gate, and the absence of direct callers for construction
+```
+
+Sending D4 now would still be a guess: the previous task proved only that D4 sent
+after the teardown is committed is uninformative, and this task has not yet shown
+that any server message cancels the teardown. **No server behaviour was changed.**
+
+### NEW FAILURE BOUNDARY
+
+*The client's bootstrap connection is torn down by an `omega::TimeRequester`
+teardown, and that object exists to acquire a `*:timesource` connection.* The next
+task is to localize which manager constructs and destroys the `TimeRequester` on
+this connection, and what peer-visible condition makes its `*:timesource` lookup
+fail — that is the decision point in front of the teardown. Only then is a server
+action justified.
