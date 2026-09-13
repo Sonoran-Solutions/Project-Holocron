@@ -2312,3 +2312,201 @@ re-run this same one-reply experiment until the client emits
 
 Baseline after this task: **61/61** tests pass and the copied executable's
 resolver instruction was restored to `C7 06 00 04 00 00`.
+
+## ReplyIDSignature handler contract and the IntroduceConnection transition (September 13)
+
+This section supersedes the HYPOTHESIS paragraph at the end of the previous
+section. The bootstrap transition is now proven, and the exact condition that
+blocked it is known.
+
+### The handler control flow — CONFIRMED
+
+`0x14042C300` is the receiver of `0x6731C5AF`. Its arguments are
+`rcx = context`, `rdx = body reader`, `r8 = reader end`. Parse order, all
+required:
+
+```text
+0x14042C35E  remaining >= 2                      else exit 0x14042C8ED
+0x14042C376  u16 read into r12w and [rsp+0x40]   <- the reply's body word
+0x14042C3AC  length-prefixed string -> [rsp+0x68]
+0x14042C3C2  length-prefixed string -> [rsp+0x58]
+0x14042C3D8  length-prefixed string -> [rsp+0x48]
+0x14042C3E5  remaining >= 8                      else exit 0x14042C8F9
+0x14042C3FD  u64 read into r14 (the correlation)
+0x14042C423  0x1403FB230 requires complete body consumption
+0x14042C437  call 0x14042D320(rcx=context, rdx=&[rsp+0x128], r8=r14)
+0x14042C43D  rcx = [rsp+0x128]
+0x14042C445  test rcx,rcx
+0x14042C448  jne 0x14042C505                     <- builder result decides
+```
+
+```text
+builder returned NULL
+  0x14042C44E..0x14042C4E2  release the three strings and the object
+  0x14042C4E7  rcx = [rsi]
+  0x14042C4ED  je 0x14042C8D0                    -> function exit
+  0x14042C4FA  virtual release
+  0x14042C500  jmp 0x14042C8D0                   -> function exit
+  (IntroduceConnection is never reached)
+
+builder returned non-NULL
+  0x14042C505  eax = 0xFFFF
+  0x14042C50A  cmp r12w,ax                       <- reply word vs sentinel
+  0x14042C50E  jne 0x14042C5DA
+
+  reply word == 0xFFFF
+    0x14042C514/0x14042C519  edx = 2, r8d = 3
+    0x14042C51D  call 0x1404123D0(connection, 2, 3)   <- state transition
+    0x14042C523..0x14042C5BC  release everything
+    0x14042C5C2  je 0x14042C8D0
+    0x14042C5D5  jmp 0x14042C8D0                 -> function exit
+    (IntroduceConnection is never reached)
+
+  reply word != 0xFFFF
+    0x14042C5DA..0x14042C639  release the strings, take the object
+    0x14042C641  lock cmpxchg [object+0x88]
+    0x14042C6A5  r8d = [rsp+0x40]                <- the reply word
+    0x14042C6AB  edx = [object+0x28]             <- the pending record's id
+    0x14042C6B7  call 0x14045B620                <- IntroduceConnection
+```
+
+Answers, explicitly:
+
+1. **Does the `u16 == 0xFFFF` path reach `0x14042C6B7`?** No. It calls
+   `0x1404123D0(connection, 2, 3)` and then jumps to the exit at `0x14042C8D0`.
+2. **Does the `u16 != 0xFFFF` path reach it?** Yes, and it is the only path.
+3. **Is a non-null builder result required?** Yes. A null result releases
+   everything and exits at `0x14042C8D0`.
+4. **Additional checks?** Only the two above plus the strict parse. There is no
+   further state or object test between `0x14042C448` and `0x14042C6B7`.
+5. **What failed in the previous run?** The reply word was `0xFFFF`, so the
+   client took the equal branch. The builder condition held — the client only
+   reaches `0x14042C505` when the builder is non-null.
+
+### What the reply's body word means — CONFIRMED
+
+It is the **server-assigned object id** for this connection, and `0xFFFF` is the
+**"no object assigned" sentinel**. Evidence:
+
+* the client tests it against `0xFFFF` and treats that value as a distinct,
+  connection-transition-only outcome (`0x14042C50A`);
+* the client copies the received value straight back into the first field of
+  `IntroduceConnectionSignature` (`0x14042C6A5`), which the peer resolves to an
+  object surrogate;
+* the serializer `0x14045BCD0` writes it as a body field (`0x14045BE5D`), while
+  the envelope route words are hardcoded `0xFFFF` (`0x14045BDD5`,
+  `0x14045BE19`). The two are different values with different roles.
+
+The five in-binary producer sites in `0x14042BCA0` all pass the literal
+`0xFFFF`. Since that value cannot reach the introduce path, those sites are
+peer-role refusals, not the successful authentication reply. The success value
+must come from the server's own object allocation; this is why no in-binary
+producer demonstrates it.
+
+### The three strings — CONFIRMED provenance
+
+Serializer `0x14045BCD0` writes them in order, and each is taken from a
+different argument:
+
+```text
+string 1  0x14045BE80..0x14045BE99   *(arg3)   or 0x14156BD60 when null
+string 2  0x14045BE9E..0x14045BEB0   *(arg4)   or 0x14156BD60 when null
+string 3  0x14045BEBC..0x14045BECE   *(arg5)   or 0x14156BD60 when null
+```
+
+At every in-binary call site `arg3` is `0x14157F2D4`, the literal `"???"`, and
+`arg4` is `0x14156BD60`, the shared empty-string constant; `arg5` is
+`[context+0x10]`, a dynamic value. So `"???"` is a placeholder object name, not
+a meaningful token.
+
+The handler that consumes the reply parses all three, then **only frees them**:
+`0x14042D320` is called with `(context, &out, correlation)` and receives none of
+them. Their values therefore do not gate the introduce transition.
+
+The semantics come from the opposite direction. The client's own
+`IntroduceConnectionSignature` carries the object-surrogate descriptor, and the
+live capture names it outright:
+
+```text
+name        "OmegaServerProxyObjectName"
+class       "Client"
+interfaces  "b7a6bba3:8ab55405:5bc541f9"
+```
+
+`OmegaServerProxyObjectName` and `Client` are both entries in the object-name
+table beside the interface signatures, so the three fields are the **object
+name, its class, and its interface list**. An authentication reply that wants to
+name the object it is introducing would carry the same shape.
+
+### `0x14042D320` — CONFIRMED contract
+
+A mutex-guarded linear search, not an object allocator:
+
+```text
+signature  0x14042D320(rcx = context, rdx = out slot, r8 = u64 key)
+0x14042D342  rbp = r8                     the key
+0x14042D352  rsi = context + 0x28         the guard
+0x14042D35D  EnterCriticalSection
+0x14042D364  r15 = context + 0x130        the list sentinel
+0x14042D36B  rdi = [r15]
+0x14042D371  rdi == r15 -> empty -> 0x14042D3C0
+0x14042D380  rbx = [rdi+0x10]             the node payload
+0x14042D3A2  cmp [rbx+0x10], rbp          payload key == u64
+0x14042D3A6  equal -> 0x14042D3FC         found
+0x14042D3BE  jne 0x14042D380              advance and retry
+0x14042D3C0  [out] = 0                    not found
+0x14042D3CB  leave critical section, return the out slot
+```
+
+Working name: **`FindPendingRequestByCorrelationId`**. Its key is the 64-bit
+value the client sent in `RequestIDSignature` and expects echoed in the reply;
+its result is the pending-request record whose `+0x28` becomes the first word of
+`IntroduceConnectionSignature`. A reply that does not echo the correlation makes
+the lookup fail and the handler exits before any branch.
+
+### Runtime result — the transition is proven
+
+One reply, `u16 = 0x0001` (a real assignment rather than the sentinel), three
+empty strings (the parser-valid encoding, since this path does not consume
+them), correlation echoed. Two selections in one bounded run, identical:
+
+```text
+client  RequestIDSignature        correlation 0x06 / 0x0A
+server  ReplyIDSignature          u16 0x0001 on 0xFFFF/0xFFFF
+client  IntroduceConnectionSignature  *** EMITTED ***
+          client-object-id  0x0000
+          reply-word        0x0001   (the value we assigned, echoed)
+          name              "OmegaServerProxyObjectName"
+          class             "Client"
+          interfaces        "b7a6bba3:8ab55405:5bc541f9"
+          u64               0x0000000000000000
+          logical           111 bytes
+```
+
+**CONFIRMED.** The bootstrap transition the previous task could not obtain now
+occurs, reproducibly, and the only changed input is the reply's body word.
+
+### Route registration and D4 — NOT PROVEN
+
+The client-object-id came back as `0x0000`, which is itself a sentinel-shaped
+value, and the mirror `IntroduceConnectionSignature` the server sent to establish
+the client-side entry used it as a lookup key. Naming and pairing for the
+server-to-client direction are therefore still unproven. One routed D4 was sent
+on the mirror-derived pair `0x0001/0x0000`; the client closed the socket, the
+settings Frame stayed null, no `HandleInitialize completed` appeared, and error
+1003 followed 45 ms after `CS_LOGGING_IN`. D4 did **not** demonstrably reach its
+handler, and this pair must not be treated as the route.
+
+### NEW FAILURE BOUNDARY
+
+The failure has moved past identification and past connection introduction. It
+is now: *the client introduces `OmegaServerProxyObjectName`/`Client` and expects
+the peer to complete the pairing, but the server-to-client route key is still
+unknown because the introduced client object id is `0x0000` and the mirror rule
+used to derive the pair is a hypothesis.* The next task is to recover the
+client's inbound receive key directly — from the client's receive-tree
+registration path (`0x140412180` / `0x14043D380`) and from what the client does
+with an incoming `IntroduceConnectionSignature` — before any further D4 is sent.
+
+Baseline after this task: **63/63** tests pass and the copied executable's
+resolver instruction was restored to `C7 06 00 04 00 00`.

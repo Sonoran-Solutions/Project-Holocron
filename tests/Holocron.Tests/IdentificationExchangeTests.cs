@@ -90,6 +90,31 @@ public class IdentificationExchangeTests
         return IdentificationExchange.ReadString(Convert.FromHexString(hex), ref offset);
     }
 
+    [Fact]
+    public void IntroduceConnectionBodyRoundTripsInTheRecoveredFieldOrder()
+    {
+        byte[] body = IdentificationExchange.EncodeIntroduceConnection(
+            0x1234, 0x0001, "n", "c", "i", 0x0102030405060708UL);
+        IdentificationExchange.IntroduceConnection parsed =
+            IdentificationExchange.ReadIntroduceConnection(body);
+
+        Assert.Equal(0x1234, parsed.ClientObjectId);
+        Assert.Equal(0x0001, parsed.ReplyRouteWord);
+        Assert.Equal("n", parsed.Name);
+        Assert.Equal("c", parsed.ClassName);
+        Assert.Equal("i", parsed.Interfaces);
+        Assert.Equal(0x0102030405060708UL, parsed.Value);
+        // A server-to-client routed message addresses the swapped pair.
+        Assert.Equal((0x0001, 0x1234), parsed.PeerEnvelopeRoute);
+    }
+
+    [Fact]
+    public void ReplyWordSentinelIsNotAValidAssignment()
+    {
+        Assert.Equal(0xFFFF, IdentificationExchange.UnassignedObjectSentinel);
+        Assert.Equal(0xFFFF, IdentificationExchange.WildcardRouteWord);
+    }
+
     private static string ReadEncodedString(ReadOnlySpan<byte> body, ref int offset)
         => IdentificationExchange.ReadString(body, ref offset);
 }

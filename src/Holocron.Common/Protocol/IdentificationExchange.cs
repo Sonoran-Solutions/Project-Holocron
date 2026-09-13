@@ -27,6 +27,20 @@ namespace Holocron.Common.Protocol;
 /// </summary>
 public static class IdentificationExchange
 {
+    /// <summary>Decoded <c>IntroduceConnectionSignature</c> body.</summary>
+    public readonly record struct IntroduceConnection(
+        ushort ClientObjectId, ushort ReplyRouteWord, string Name, string ClassName, string Interfaces, ulong Value)
+    {
+        /// <summary>
+        /// The route pair a server-to-client routed message must carry once this
+        /// handshake completes. Both directions derive their key from the same
+        /// two words with the roles swapped: the receiver registers
+        /// <c>(localWord, resolvedPeerWord)</c> while the sender addresses
+        /// <c>(peerWord, localWord)</c>.
+        /// </summary>
+        public (ushort First, ushort Second) PeerEnvelopeRoute => (ReplyRouteWord, ClientObjectId);
+    }
+
     /// <summary><c>RequestIDIFace::RequestIDSignature</c>, sent by the client.</summary>
     public const uint RequestIdSignature = 0xA609E6A7;
 
@@ -36,8 +50,19 @@ public static class IdentificationExchange
     /// <summary><c>RequestIDIFace::IntroduceConnectionSignature</c>, sent by the client.</summary>
     public const uint IntroduceConnectionSignature = 0x8B0D492F;
 
-    /// <summary>The route word pair the client uses for its global requests.</summary>
+    /// <summary>The route word pair the client uses for its global requests, and
+    /// the value the reply's body word must NOT carry.</summary>
     public const ushort WildcardRouteWord = 0xFFFF;
+
+    /// <summary>
+    /// Sentinel meaning "no object assigned" in the reply's body word. The
+    /// client compares the reply word against this value at <c>0x14042C50A</c>;
+    /// on equality it performs a connection state transition
+    /// (<c>0x1404123D0(connection, 2, 3)</c>) and returns without introducing
+    /// the connection. Only a reply word that is <b>not</b> this sentinel
+    /// reaches the sole producer of <c>IntroduceConnectionSignature</c>.
+    /// </summary>
+    public const ushort UnassignedObjectSentinel = 0xFFFF;
 
     /// <summary>Encodes a length-prefixed string: u32 byte count including the
     /// terminal NUL, the bytes, then the NUL. Minimum encoding is <c>01 00 00 00 00</c>.</summary>
@@ -106,15 +131,43 @@ public static class IdentificationExchange
     }
 
     /// <summary>
-    /// The client's IntroduceConnection body. The producer supplies two 16-bit
-    /// route words (client <c>0x14042C6A5</c>/<c>0x14042C6AB</c>); this reads a
-    /// conservative leading pair and leaves additional fields to the caller.
+    /// The client's IntroduceConnection body, in the order its serializer
+    /// <c>0x14045B620</c> writes it: u16, u16, three length-prefixed strings,
+    /// then eight bytes. The first word is the client's own object id (the
+    /// pending record's <c>+0x28</c>); the second is the reply's body word
+    /// (<c>0x14042C6A5</c> reads it straight back out of <c>[rsp+0x40]</c>).
     /// </summary>
-    public static (ushort First, ushort Second) ReadIntroduceConnection(ReadOnlySpan<byte> body)
+    public static IntroduceConnection ReadIntroduceConnection(ReadOnlySpan<byte> body)
     {
         if (body.Length < 2 * sizeof(ushort))
             throw new InvalidDataException("Truncated introduce-connection payload.");
-        return (BinaryPrimitives.ReadUInt16LittleEndian(body),
-                BinaryPrimitives.ReadUInt16LittleEndian(body[sizeof(ushort)..]));
+        ushort first = BinaryPrimitives.ReadUInt16LittleEndian(body);
+        ushort second = BinaryPrimitives.ReadUInt16LittleEndian(body[sizeof(ushort)..]);
+        int offset = 2 * sizeof(ushort);
+        string name = ReadString(body, ref offset);
+        string className = ReadString(body, ref offset);
+        string interfaces = ReadString(body, ref offset);
+        if (body.Length - offset < sizeof(ulong))
+            throw new InvalidDataException("Truncated introduce-connection payload.");
+        ulong value = BinaryPrimitives.ReadUInt64LittleEndian(body[offset..]);
+        return new IntroduceConnection(first, second, name, className, interfaces, value);
+    }
+
+    /// <summary>Builds an IntroduceConnection body with the recovered field order.</summary>
+    public static byte[] EncodeIntroduceConnection(
+        ushort first, ushort second, string name, string className, string interfaces, ulong value)
+    {
+        using var buffer = new MemoryStream();
+        Span<byte> words = stackalloc byte[2 * sizeof(ushort)];
+        BinaryPrimitives.WriteUInt16LittleEndian(words, first);
+        BinaryPrimitives.WriteUInt16LittleEndian(words[sizeof(ushort)..], second);
+        buffer.Write(words);
+        buffer.Write(EncodeString(name));
+        buffer.Write(EncodeString(className));
+        buffer.Write(EncodeString(interfaces));
+        Span<byte> tail = stackalloc byte[sizeof(ulong)];
+        BinaryPrimitives.WriteUInt64LittleEndian(tail, value);
+        buffer.Write(tail);
+        return buffer.ToArray();
     }
 }

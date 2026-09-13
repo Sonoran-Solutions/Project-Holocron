@@ -383,45 +383,114 @@ public sealed class AuthServer
         (string shardName, ulong correlation) = IdentificationExchange.ReadRequestIdSignature(body.AsSpan(8));
         Console.WriteLine($"[AUTH] RequestIDSignature: name=\"{shardName}\", correlation=0x{correlation:X16}.");
 
+        // The reply's body word is the server-assigned object id. 0xFFFF is
+        // the "no object assigned" sentinel: the client takes it, performs a
+        // connection state transition at 0x1404123D0(connection, 2, 3) and
+        // returns without introducing the connection. The three strings are
+        // parsed and released by this handler and are not passed to the builder
+        // at 0x14042D320, so they are sent as the parser-valid empty encoding
+        // rather than inventing values. The u64 must echo the request
+        // correlation: the client looks its pending request up by that key.
+        const ushort assignedObjectId = 1;
         byte[] reply = IdentificationExchange.EncodeReplyIdSignature(
-            IdentificationExchange.WildcardRouteWord, shardName, shardName, shardName, correlation);
+            assignedObjectId, string.Empty, string.Empty, string.Empty, correlation);
         byte[] replyEnvelope = new byte[8 + reply.Length];
         BinaryPrimitives.WriteUInt32LittleEndian(replyEnvelope, IdentificationExchange.ReplyIdSignature);
         BinaryPrimitives.WriteUInt16LittleEndian(replyEnvelope.AsSpan(4), IdentificationExchange.WildcardRouteWord);
         BinaryPrimitives.WriteUInt16LittleEndian(replyEnvelope.AsSpan(6), IdentificationExchange.WildcardRouteWord);
         reply.CopyTo(replyEnvelope.AsSpan(8));
         await codec.WriteAsync(0, replyEnvelope, ct);
-        Console.WriteLine($"[AUTH] Sent ReplyIDSignature: message=0x{IdentificationExchange.ReplyIdSignature:X8}, route=0xFFFF/0xFFFF, logical={replyEnvelope.Length} bytes.");
+        Console.WriteLine($"[AUTH] Sent ReplyIDSignature: message=0x{IdentificationExchange.ReplyIdSignature:X8}, route=0xFFFF/0xFFFF, assigned-object-id=0x{assignedObjectId:X4}, correlation=0x{correlation:X16}, logical={replyEnvelope.Length} bytes.");
 
-        // Listen only. Any further frame is unprompted evidence about what the
-        // client does with the reply.
+        // Listen only until the client introduces its connection.
         using var window = CancellationTokenSource.CreateLinkedTokenSource(ct);
         window.CancelAfter(TimeSpan.FromSeconds(20));
+        IdentificationExchange.IntroduceConnection? introduced = null;
         try
         {
-            while (!window.Token.IsCancellationRequested)
+            while (!window.Token.IsCancellationRequested && introduced is null)
             {
                 TransportMessage? next = await codec.ReadAsync(window.Token);
                 if (next is null)
                 {
                     Console.WriteLine("[AUTH] Client closed the connection.");
-                    break;
+                    return;
                 }
 
                 byte[] payload = next.Value.Payload;
                 uint nextId = payload.Length >= 4 ? BinaryPrimitives.ReadUInt32LittleEndian(payload) : 0u;
-                string detail = string.Empty;
-                if (nextId == IdentificationExchange.IntroduceConnectionSignature && payload.Length >= 12)
+                if (nextId == IdentificationExchange.IntroduceConnectionSignature && payload.Length > 8)
                 {
-                    (ushort first, ushort second) = IdentificationExchange.ReadIntroduceConnection(payload.AsSpan(8));
-                    detail = $", introduce-words=0x{first:X4}/0x{second:X4}";
+                    IdentificationExchange.IntroduceConnection parsed =
+                        IdentificationExchange.ReadIntroduceConnection(payload.AsSpan(8));
+                    introduced = parsed;
+                    Console.WriteLine($"[AUTH] IntroduceConnectionSignature received: client-object-id=0x{parsed.ClientObjectId:X4}, reply-word=0x{parsed.ReplyRouteWord:X4}, name=\"{parsed.Name}\", class=\"{parsed.ClassName}\", interfaces=\"{parsed.Interfaces}\", value=0x{parsed.Value:X16}, logical={payload.Length} bytes.");
+                    break;
                 }
-                Console.WriteLine($"[AUTH] Client follow-up: transport-type=0x{next.Value.Type:X2}, logical={payload.Length} bytes, message=0x{nextId:X8}{detail}, body={Convert.ToHexString(payload.AsSpan(0, Math.Min(payload.Length, 48)))}.");
+
+                Console.WriteLine($"[AUTH] Client follow-up: transport-type=0x{next.Value.Type:X2}, logical={payload.Length} bytes, message=0x{nextId:X8}, body={Convert.ToHexString(payload.AsSpan(0, Math.Min(payload.Length, 48)))}.");
             }
         }
         catch (OperationCanceledException)
         {
-            Console.WriteLine("[AUTH] Bootstrap observation window completed.");
+            Console.WriteLine("[AUTH] Bootstrap observation window completed with no IntroduceConnectionSignature.");
+        }
+
+        if (introduced is null)
+        {
+            Console.WriteLine("[AUTH] No routed endpoint was registered; not sending any routed application message.");
+            return;
+        }
+
+        // The client registered nothing on our side yet, so mirror the
+        // handshake back on the wildcard route and only then address the client
+        // on the swapped pair it will have registered.
+        (ushort peerFirst, ushort peerSecond) = introduced.Value.PeerEnvelopeRoute;
+        Console.WriteLine($"[AUTH] Derived routed envelope pair for server->client traffic: 0x{peerFirst:X4}/0x{peerSecond:X4}.");
+
+        byte[] mirror = IdentificationExchange.EncodeIntroduceConnection(
+            introduced.Value.ReplyRouteWord, introduced.Value.ClientObjectId,
+            string.Empty, string.Empty, string.Empty, introduced.Value.Value);
+        byte[] mirrorEnvelope = new byte[8 + mirror.Length];
+        BinaryPrimitives.WriteUInt32LittleEndian(mirrorEnvelope, IdentificationExchange.IntroduceConnectionSignature);
+        BinaryPrimitives.WriteUInt16LittleEndian(mirrorEnvelope.AsSpan(4), IdentificationExchange.WildcardRouteWord);
+        BinaryPrimitives.WriteUInt16LittleEndian(mirrorEnvelope.AsSpan(6), IdentificationExchange.WildcardRouteWord);
+        mirror.CopyTo(mirrorEnvelope.AsSpan(8));
+        await codec.WriteAsync(0, mirrorEnvelope, ct);
+        Console.WriteLine($"[AUTH] Sent mirror IntroduceConnectionSignature on 0xFFFF/0xFFFF to register the client-side entry.");
+
+        // Exactly one routed D4 on the derived pair, with the frozen D4 body.
+        byte[] initializationDocument = "<client title=\"Test Client\" useSyncClock=\"true\" loglevel=\"debug\" additionalClientConfigs=\"username=local-test;WorldName=he1012;SHARD_PUBLIC_NAME=he1012;\"><access-rights><client name=\"Automaton.exe\"><network name=\"BWA\" address=\"10.2.0.0/15\"/></client></access-rights></client>"u8.ToArray();
+        byte[] d4 = new byte[16 + initializationDocument.Length + 1];
+        BinaryPrimitives.WriteUInt32LittleEndian(d4, LoginReplyMessage);
+        BinaryPrimitives.WriteUInt16LittleEndian(d4.AsSpan(4), peerFirst);
+        BinaryPrimitives.WriteUInt16LittleEndian(d4.AsSpan(6), peerSecond);
+        BinaryPrimitives.WriteUInt32LittleEndian(d4.AsSpan(12), (uint)(initializationDocument.Length + 1));
+        initializationDocument.CopyTo(d4.AsSpan(16));
+        await codec.WriteAsync(0, d4, ct);
+        Console.WriteLine($"[AUTH] Sent one routed D4 on 0x{peerFirst:X4}/0x{peerSecond:X4}, message=0x{LoginReplyMessage:X8}, logical={d4.Length} bytes.");
+        CryptographicOperations.ZeroMemory(d4);
+
+        using var tail = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        tail.CancelAfter(TimeSpan.FromSeconds(10));
+        try
+        {
+            while (!tail.Token.IsCancellationRequested)
+            {
+                TransportMessage? next = await codec.ReadAsync(tail.Token);
+                if (next is null)
+                {
+                    Console.WriteLine("[AUTH] Client closed the connection after the routed D4.");
+                    break;
+                }
+                byte[] payload = next.Value.Payload;
+                uint nextId = payload.Length >= 4 ? BinaryPrimitives.ReadUInt32LittleEndian(payload) : 0u;
+                Console.WriteLine($"[AUTH] Post-D4 client frame: transport-type=0x{next.Value.Type:X2}, logical={payload.Length} bytes, message=0x{nextId:X8}.");
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("[AUTH] Post-D4 observation window completed.");
         }
     }
 
