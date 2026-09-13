@@ -50,6 +50,22 @@ public static class IdentificationExchange
     /// <summary><c>RequestIDIFace::IntroduceConnectionSignature</c>, sent by the client.</summary>
     public const uint IntroduceConnectionSignature = 0x8B0D492F;
 
+    /// <summary>
+    /// <c>Close</c>. Registered in the same global block as the identification
+    /// messages (name string at <c>0x14157E740</c>) and dispatched at
+    /// <c>0x14042BABC</c> to <c>0x1404123D0(connection, 1, 0)</c>. The retail
+    /// client sends this immediately after
+    /// <see cref="IntroduceConnectionSignature"/>, tearing down the bootstrap
+    /// connection, so it is the boundary in front of any routed delivery.
+    /// </summary>
+    public const uint Close = 0x43DB3479;
+
+    /// <summary>
+    /// <c>RequestClose</c>, dispatched at <c>0x14042BACC</c> to
+    /// <c>0x1404123D0(connection, 0, 0)</c>.
+    /// </summary>
+    public const uint RequestClose = 0x0598D9A7;
+
     /// <summary>The route word pair the client uses for its global requests, and
     /// the value the reply's body word must NOT carry.</summary>
     public const ushort WildcardRouteWord = 0xFFFF;

@@ -442,6 +442,39 @@ public sealed class AuthServer
             return;
         }
 
+        // Control mode: the client registers its OWN receive entry when it
+        // sends this message (0x14042C782 sets Connection+0x60 from the reply
+        // word), so an incoming IntroduceConnection is not required for the
+        // client to be reachable. Unless explicitly enabled, send nothing
+        // further and only observe, so the next packet cannot be confounded.
+        if (Environment.GetEnvironmentVariable("HOLOCRON_BOOTSTRAP_SEND_D4") is null)
+        {
+            Console.WriteLine("[AUTH] Control mode: no mirror and no D4 sent; observing only.");
+            using var control = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            control.CancelAfter(TimeSpan.FromSeconds(20));
+            try
+            {
+                while (!control.Token.IsCancellationRequested)
+                {
+                    TransportMessage? next = await codec.ReadAsync(control.Token);
+                    if (next is null)
+                    {
+                        Console.WriteLine("[AUTH] Client closed the connection during the control window.");
+                        return;
+                    }
+                    byte[] payload = next.Value.Payload;
+                    uint id = payload.Length >= 4 ? BinaryPrimitives.ReadUInt32LittleEndian(payload) : 0u;
+                    Console.WriteLine($"[AUTH] Control-window frame: transport-type=0x{next.Value.Type:X2}, logical={payload.Length} bytes, message=0x{id:X8}.");
+                }
+                Console.WriteLine("[AUTH] Control window completed with the connection still open.");
+            }
+            catch (OperationCanceledException)
+            {
+                Console.WriteLine("[AUTH] Control window completed with the connection still open.");
+            }
+            return;
+        }
+
         // The client registered nothing on our side yet, so mirror the
         // handshake back on the wildcard route and only then address the client
         // on the swapped pair it will have registered.

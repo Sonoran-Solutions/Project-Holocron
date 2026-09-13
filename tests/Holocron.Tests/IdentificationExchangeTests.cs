@@ -109,6 +109,19 @@ public class IdentificationExchangeTests
     }
 
     [Fact]
+    public void GlobalCloseMessagesAreRecorded()
+    {
+        // Observed on the wire immediately after the client's introduce.
+        Assert.Equal(0x43DB3479u, IdentificationExchange.Close);
+        Assert.Equal(0x0598D9A7u, IdentificationExchange.RequestClose);
+        // They must not collide with the identification exchange ids.
+        Assert.NotEqual(IdentificationExchange.Close, IdentificationExchange.RequestIdSignature);
+        Assert.NotEqual(IdentificationExchange.Close, IdentificationExchange.ReplyIdSignature);
+        Assert.NotEqual(IdentificationExchange.Close, IdentificationExchange.IntroduceConnectionSignature);
+        Assert.NotEqual(IdentificationExchange.RequestClose, IdentificationExchange.Close);
+    }
+
+    [Fact]
     public void ReplyWordSentinelIsNotAValidAssignment()
     {
         Assert.Equal(0xFFFF, IdentificationExchange.UnassignedObjectSentinel);

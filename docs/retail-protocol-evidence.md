@@ -2510,3 +2510,198 @@ with an incoming `IntroduceConnectionSignature` — before any further D4 is sen
 
 Baseline after this task: **63/63** tests pass and the copied executable's
 resolver instruction was restored to `C7 06 00 04 00 00`.
+
+## Routed receive-key derivation and the post-introduce `Close` (September 13)
+
+This section supersedes the "Route registration and D4 — NOT PROVEN" paragraph
+and the NEW FAILURE BOUNDARY that followed it. The receive key is now derived
+from code, the two route words have proven roles, and the early socket death has
+been shown to be intrinsic to the client rather than caused by our packets.
+
+### Incoming `IntroduceConnectionSignature` handler — CONFIRMED CFG
+
+`0x14042C910`, arguments `rcx = context`, `rdx = body reader`, `r8 = reader end`:
+
+```text
+0x14042C99C  require remaining >= 2            else exit 0x14042D2FE
+0x14042C9BB  r14w = u16 #1 -> [rsp+0x88] and [rsp+0x428]
+0x14042C9F3  require remaining >= 2            else exit 0x14042D30A
+0x14042CA0D  r13w = u16 #2 -> [rsp+0x8c]
+0x14042CA40  string #1 -> [rsp+0x78]
+0x14042CA56  string #2 -> [rsp+0x60]
+0x14042CA6C  string #3 -> [rsp+0x50]
+0x14042CA7C  call 0x140411660
+0x14042CA84  call 0x1403FB230                  require complete consumption
+             failure -> 0x14042CB73            (cleanup)
+0x14042CC9C  r8d = r13w                        <- u16 #2
+0x14042CCAB  call 0x14042A950                  ObjectSurrogate lookup by id
+0x14042CCBC  jne 0x14042CE4D                   found -> continue
+             not found -> cleanup, exit 0x14042D2E1   (no registration)
+0x14042CE4D  rcx = [rax+0x30]; call 0x14042D470
+0x14042CE79  jne 0x14042D07B
+0x14042CE88  call 0x140431800 ; je 0x14042CF9C
+0x14042CECC  call 0x140430E20
+0x14042CF88  call 0x140411D30                  Connection+0x28 = surrogate+0x28
+0x14042D07B  call 0x140429100 ; 0x1404115B0 ; 0x140412C90 ; 0x1404117E0
+0x14042D14F  edx = [rsp+0x428]                 <- u16 #1
+0x14042D15A  call 0x140412180                  Connection+0x60 = u16 #1, then insert
+```
+
+Field flow, exactly:
+
+```text
+u16 #1  -> Connection + 0x60            via 0x1404121E4 "mov WORD PTR [rdi+0x60],bx"
+u16 #2  -> ObjectSurrogate lookup       via 0x14042A950
+        -> surrogate + 0x28             via 0x140411DE2/0x140411DE7
+        -> Connection + 0x28
+strings -> parsed and released; the registration path does not consume them
+```
+
+### Word roles — CONFIRMED
+
+| | Meaning | Evidence |
+| --- | --- | --- |
+| u16 #1 | the **peer's** object id for this connection; becomes the receiver's `Connection + 0x60` | `0x14042D14F` loads it into `edx` for `0x140412180`, which stores it at `[rdi+0x60]` (`0x1404121E4`) |
+| u16 #2 | the **receiver's own** object id; resolved to an `ObjectSurrogate` on the receiving side, whose `+0x28` becomes `Connection + 0x28` | `0x14042CC9C`/`0x14042CCAB` lookup, then `0x140411D30` |
+
+This is a mirror, not a symmetry assumption: the client sends the id it received
+in the reply as `#2` precisely so the peer can resolve it to the object the peer
+itself assigned.
+
+### `ObjectSurrogate + 0x28` — CONFIRMED
+
+It is the surrogate's **16-bit local object id**, copied verbatim into the
+connection:
+
+```text
+0x140411DE2  movzx eax, WORD PTR [r13+0x28]
+0x140411DE7  mov   WORD PTR [rdi+0x28], ax
+```
+
+The client's `Connection + 0x28` is set from its own surrogate by the
+`RequestIDSignature` send path (`0x14042B721`) and again by the incoming
+introduce handler (`0x14042CF88`).
+
+### Is object id `0x0000` valid? — CONFIRMED usable, sentinel is `0xFFFF`
+
+* `0x14042AA30` reserves `0xFFFF` explicitly: `mov r14d,0xffff` compared against
+  the candidate id, with collision checks against the existing id tree. No
+  comparable special case exists for zero anywhere on this path.
+* The receive path's wildcard test at `0x14043CF9D`-`0x14043CFB7` requires
+  **both** route words to be `0xFFFF`. A `(x, 0)` pair is therefore an ordinary
+  tree key, never a wildcard.
+* Operationally, the retail client itself produced `0x0000` as its connection's
+  local id and then used it as the second word of its own receive key.
+
+So zero is a normal key component. Whether it is specifically the *first*
+allocated id is not proven and is not needed.
+
+### Receive-tree key construction — CONFIRMED
+
+```text
+0x14043D416  movzx ecx, WORD PTR [rax+0x60]   Connection + 0x60  -> key field A
+0x14043D421  movzx ecx, WORD PTR [rax+0x28]   Connection + 0x28  -> key field B
+```
+
+stored adjacently at `[rbp+0x50]`/`[rbp+0x54]`, i.e. a packed
+`u32 = (B << 16) | A`, then inserted through `0x14043FEC0` into the ordered tree
+whose nodes compare at `+0x20` (field A) and `+0x24` (field B).
+
+### Envelope route words to tree-key words — CONFIRMED
+
+`0x140454070` (the dispatch envelope reader) writes its outputs in this order:
+
+```text
+0x140454098/0x14045409B  u32 at offset 0 -> rdx argument
+0x1404540C9/0x1404540CD  u16 at offset 4 -> r8  argument
+0x1404540FC/0x140454100  u16 at offset 6 -> r9  argument
+```
+
+and the receive call site `0x14043CF7D`-`0x14043CF92` passes
+`r9 = &[rsp+0xF8]`, `r8 = &[rsp+0x30]`. The tree search then uses
+`[rsp+0x30]` (offset-4 word) against node `+0x20` and `[rsp+0xF8]`
+(offset-6 word) against node `+0x24`.
+
+Therefore, for a message addressed to a connection `C`:
+
+```text
+envelope routeA (offset 4) == key field A == C + 0x60
+envelope routeB (offset 6) == key field B == C + 0x28
+```
+
+### Does the peer have to send an introduce back? — CONFIRMED NO
+
+The client sets its **own** `Connection + 0x60` and inserts its own receive entry
+when it *sends* `IntroduceConnectionSignature`, not when it receives one:
+
+```text
+0x14042C77A  movzx edx, WORD PTR [rsp+0x40]   <- the reply's body word
+0x14042C782  call 0x140412180                  -> Connection+0x60, then 0x14043D380 insert
+```
+
+`0x140412180` is reached from exactly two places, and the other one
+(`0x14042D15A`) is the incoming handler. So an incoming introduce registers the
+*receiver's* key; it is not required for the client to become reachable.
+
+### Derived route pair
+
+```text
+client object id:   0x0000   (its Connection + 0x28)
+server object id:   0x0001   (the reply's body word = its Connection + 0x60)
+
+client receive-tree key:
+    word A (Connection+0x60) = 0x0001
+    word B (Connection+0x28) = 0x0000
+
+server -> client routed envelope:
+    routeA = 0x0001
+    routeB = 0x0000
+
+confidence: high for the construction; the two numerals are the values the
+            retail client reported at runtime in this experiment
+evidence:   any one branch of the chain above, and the live IntroduceConnection
+            payload itself for the two numerals
+```
+
+### Runtime control result — the early close is intrinsic
+
+With the server sending **nothing** after `ReplyIDSignature` (no mirror, no D4),
+the client still emitted its introduce and then, one frame later:
+
+```text
+[AUTH] Control-window frame: transport-type=0x00, logical=8 bytes, message=0x43DB3479
+[AUTH] Client closed the connection during the control window.
+client error 1003 about 45 ms after CS_LOGGING_IN
+```
+
+**CONFIRMED — `0x43DB3479` is `Close`.** It is registered in the same global
+registration block as the other identification messages, and the name string
+loaded immediately after its constant is the one at `0x14157E740`, `"Close"`.
+Its dispatcher case at `0x14042BABC` performs a connection state transition:
+
+```text
+0x14042BABC  cmp r9d,0x43DB3479     ; Close
+0x14042BAC5  mov edx,1              ; -> 0x1404123D0(connection, 1, 0)
+0x14042BACC  cmp r9d,0x0598D9A7     ; RequestClose
+0x14042BAD5  xor edx,edx            ; -> 0x1404123D0(connection, 0, 0)
+```
+
+So `Close` and `RequestClose` are additional global messages in the same family,
+and the client closes the bootstrap connection itself. This also **DISPROVES**
+the earlier implication that our mirror packet or the routed D4 caused the
+~45 ms socket death: the same death occurs with nothing sent.
+
+### NEW FAILURE BOUNDARY
+
+The failure is now: *the client completes `IntroduceConnectionSignature` and then
+immediately sends `Close`, tearing down the bootstrap connection before any
+routed application message can be delivered.* The next task is to determine what
+the client requires between those two events — the strongest candidate is that
+`ReplyIDSignature` must carry the peer object's real descriptor in its three
+string fields (this experiment sent them empty, and the binary's own producer
+sends `"???"`/empty/dynamic), or that an additional global message is expected in
+that window. Only after that is resolved is a routed D4 meaningful.
+
+The derived pair `0x0001`/`0x0000` is recorded above and must not be re-tested
+until the `Close` boundary is resolved, because a socket that is already being
+torn down cannot demonstrate route delivery.
