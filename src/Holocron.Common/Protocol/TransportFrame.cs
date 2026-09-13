@@ -2,12 +2,22 @@ using System.Buffers.Binary;
 
 namespace Holocron.Common.Protocol;
 
-/// <summary>Uncompressed, unencrypted transport framing. Encryption/compression
-/// must be handled separately; application packets are not transport headers.</summary>
+/// <summary>Unencrypted, still-compressed transport framing. Encryption and
+/// payload compression belong to the session codec, not to this header.
+/// See <see cref="TransportCodec"/>.</summary>
 public static class TransportFrame
 {
     public const int HeaderSize = 6;
     public const int MaximumSize = 1024 * 1024;
+
+    /// <summary>Transport type byte bit meaning "the payload is Zstandard
+    /// compressed". The retail sender sets it only after compressing
+    /// (<c>0x14045C4F1</c>); the retail receiver decompresses exactly when it is
+    /// set (<c>0x14043BD24</c>). The low nibble carries the transport type.</summary>
+    public const byte CompressionFlag = 0x10;
+
+    /// <summary>Mask selecting the transport type from the type byte.</summary>
+    public const byte TypeMask = 0x0F;
 
     public static byte[] Encode(byte type, ReadOnlySpan<byte> payload)
     {

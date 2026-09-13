@@ -14,6 +14,14 @@ public static class TransportTimeSync
     public const int RequestPayloadSize = sizeof(ulong);
     public const int BaseResponsePayloadSize = sizeof(ulong) + sizeof(byte) + sizeof(uint);
 
+    /// <summary>Reads the sole little-endian sequence field from a logical payload.</summary>
+    public static ulong ReadRequestSequencePayload(ReadOnlySpan<byte> payload)
+    {
+        if (payload.Length != RequestPayloadSize)
+            throw new InvalidDataException("Expected an 8-byte type-0x01 transport time request payload.");
+        return BinaryPrimitives.ReadUInt64LittleEndian(payload);
+    }
+
     /// <summary>Reads the sole little-endian sequence field from a validated frame.</summary>
     public static ulong ReadRequestSequence(ReadOnlySpan<byte> frame)
     {
@@ -24,7 +32,20 @@ public static class TransportTimeSync
             throw new InvalidDataException("Expected a 14-byte type-0x01 transport time request.");
         }
 
-        return BinaryPrimitives.ReadUInt64LittleEndian(frame[TransportFrame.HeaderSize..]);
+        return ReadRequestSequencePayload(frame[TransportFrame.HeaderSize..]);
+    }
+
+    /// <summary>
+    /// Encodes the canonical base-only response payload. Count one denotes the
+    /// local clock record; optional relayed clock records follow as pairs of u32.
+    /// </summary>
+    public static byte[] EncodeBaseResponsePayload(ulong sequence, uint localTimeMilliseconds)
+    {
+        byte[] payload = new byte[BaseResponsePayloadSize];
+        BinaryPrimitives.WriteUInt64LittleEndian(payload, sequence);
+        payload[sizeof(ulong)] = 1;
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(sizeof(ulong) + sizeof(byte)), localTimeMilliseconds);
+        return payload;
     }
 
     /// <summary>
@@ -32,11 +53,5 @@ public static class TransportTimeSync
     /// clock record; optional relayed clock records follow as pairs of u32.
     /// </summary>
     public static byte[] EncodeBaseResponse(ulong sequence, uint localTimeMilliseconds)
-    {
-        Span<byte> payload = stackalloc byte[BaseResponsePayloadSize];
-        BinaryPrimitives.WriteUInt64LittleEndian(payload, sequence);
-        payload[sizeof(ulong)] = 1;
-        BinaryPrimitives.WriteUInt32LittleEndian(payload[(sizeof(ulong) + sizeof(byte))..], localTimeMilliseconds);
-        return TransportFrame.Encode(ResponseType, payload);
-    }
+        => TransportFrame.Encode(ResponseType, EncodeBaseResponsePayload(sequence, localTimeMilliseconds));
 }

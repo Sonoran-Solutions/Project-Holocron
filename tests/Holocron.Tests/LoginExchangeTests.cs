@@ -32,21 +32,25 @@ public class LoginExchangeTests
             byte[] clear = new byte[88];
             for (int i = 8; i < clear.Length; i++) clear[i] = (byte)i;
             await network.WriteAsync(Encode(clear, rsa), cancellation.Token);
-            using var encrypted = new Salsa20Stream(network,
+            using var codec = new TransportCodec(network,
                 new Salsa20(clear[8..40], clear[72..80]),
                 new Salsa20(clear[40..72], clear[80..88]));
-            byte[] request = TransportFrame.Encode(0x10,
-                Convert.FromHexString("00581C0100E8A7E6"));
-            await encrypted.WriteAsync(request, cancellation.Token);
-            byte[] reply = (await TransportFrame.ReadAsync(encrypted, cancellation.Token))!;
-            Assert.Equal(0x10, reply[0]);
-            Assert.Equal("CD5CBAD4A7E600E8", Convert.ToHexString(reply.AsSpan(6, 8)));
-            Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(reply.AsSpan(14)));
-            int stringBytes = BinaryPrimitives.ReadInt32LittleEndian(reply.AsSpan(18));
-            Assert.Equal(reply.Length - 22, stringBytes);
-            Assert.Equal(0, reply[^1]);
-            Assert.DoesNotContain((byte)0, reply[22..^1]);
-            string xml = new UTF8Encoding(false, true).GetString(reply[22..^1]);
+            // A real client request, exactly as recovered after transport
+            // decompression: message 0xA609E6A7 on the wildcard route pair.
+            await codec.WriteAsync(0, Convert.FromHexString("A7E609A6FFFFFFFF0F000000636173746C6568696C6C74657374000E0000000000000000000000"), cancellation.Token);
+            TransportMessage? replyOrNull = await codec.ReadAsync(cancellation.Token);
+            Assert.NotNull(replyOrNull);
+            TransportMessage reply = replyOrNull!.Value;
+            Assert.Equal(0, reply.Type);
+            Assert.Equal(0xD4BA5CCDu, BinaryPrimitives.ReadUInt32LittleEndian(reply.Payload));
+            Assert.Equal(0xFFFF, BinaryPrimitives.ReadUInt16LittleEndian(reply.Payload.AsSpan(4)));
+            Assert.Equal(0xFFFF, BinaryPrimitives.ReadUInt16LittleEndian(reply.Payload.AsSpan(6)));
+            Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(reply.Payload.AsSpan(8)));
+            int stringBytes = BinaryPrimitives.ReadInt32LittleEndian(reply.Payload.AsSpan(12));
+            Assert.Equal(reply.Payload.Length - 16, stringBytes);
+            Assert.Equal(0, reply.Payload[^1]);
+            Assert.DoesNotContain((byte)0, reply.Payload[16..^1]);
+            string xml = new UTF8Encoding(false, true).GetString(reply.Payload[16..^1]);
             var root = XElement.Parse(xml);
             Assert.Equal("client", root.Name.LocalName);
             Assert.Equal("Test Client", (string?)root.Attribute("title"));
@@ -59,18 +63,28 @@ public class LoginExchangeTests
             Assert.Equal("BWA", (string?)subnet.Attribute("name"));
             Assert.Equal("10.2.0.0/15", (string?)subnet.Attribute("address"));
 
-            byte[] launch = (await TransportFrame.ReadAsync(encrypted, cancellation.Token))!;
-            Assert.Equal(0x10, launch[0]);
-            Assert.Equal("4DD0F290A7E600E8", Convert.ToHexString(launch.AsSpan(6, 8)));
+            TransportMessage? launchOrNull = await codec.ReadAsync(cancellation.Token);
+            Assert.NotNull(launchOrNull);
+            TransportMessage launch = launchOrNull!.Value;
+            Assert.Equal(0, launch.Type);
+            Assert.Equal(0x90F2D04Du, BinaryPrimitives.ReadUInt32LittleEndian(launch.Payload));
+            Assert.Equal(0xFFFF, BinaryPrimitives.ReadUInt16LittleEndian(launch.Payload.AsSpan(4)));
+            Assert.Equal(0xFFFF, BinaryPrimitives.ReadUInt16LittleEndian(launch.Payload.AsSpan(6)));
+            int addressBytes = BinaryPrimitives.ReadInt32LittleEndian(launch.Payload.AsSpan(8));
+            Assert.Equal("127.0.0.1:20061", Encoding.UTF8.GetString(launch.Payload, 12, addressBytes - 1));
+            Assert.Equal(0, launch.Payload[12 + addressBytes - 1]);
 
             uint before = unchecked((uint)(DateTime.UtcNow.ToFileTimeUtc() / 10000));
             byte[] sequence = Convert.FromHexString("0807060504030201");
-            await encrypted.WriteAsync(TransportFrame.Encode(1, sequence), cancellation.Token);
-            byte[] sync = (await TransportFrame.ReadAsync(encrypted, cancellation.Token))!;
-            Assert.Equal("021300000011", Convert.ToHexString(sync.AsSpan(0, 6)));
-            Assert.Equal(sequence, sync[6..14]);
-            Assert.Equal(1, sync[14]);
-            uint clock = BinaryPrimitives.ReadUInt32LittleEndian(sync.AsSpan(15));
+            await codec.WriteAsync(TransportTimeSync.RequestType, sequence, cancellation.Token);
+            TransportMessage? syncOrNull = await codec.ReadAsync(cancellation.Token);
+            Assert.NotNull(syncOrNull);
+            TransportMessage sync = syncOrNull!.Value;
+            Assert.Equal(TransportTimeSync.ResponseType, sync.Type);
+            Assert.Equal("021300000011", Convert.ToHexString(TransportFrame.Encode(sync.Type, sync.Payload).AsSpan(0, 6)));
+            Assert.Equal(sequence, sync.Payload[..8]);
+            Assert.Equal(1, sync.Payload[8]);
+            uint clock = BinaryPrimitives.ReadUInt32LittleEndian(sync.Payload.AsSpan(9));
             // Modular subtraction handles the low-32-bit clock wrapping. Allow
             // scheduling and millisecond quantization without accepting epoch zero.
             Assert.InRange(unchecked((int)(clock - before)), -1000, 10000);

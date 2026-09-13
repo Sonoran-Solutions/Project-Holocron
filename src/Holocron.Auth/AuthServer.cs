@@ -11,6 +11,17 @@ namespace Holocron.Auth;
 
 public sealed class AuthServer
 {
+    // Client -> server login request message id. Recovered after transport
+    // decompression; the client's own serializer writes this exact constant
+    // (0x14045BAC4) together with the wildcard route pair 0xFFFF/0xFFFF.
+    private const uint ClientLoginRequestMessage = 0xA609E6A7;
+
+    // Server -> client login reply and game launch reply. These come from the
+    // omega::ServerProxy receive callback 0x14045A1C0, which dispatches them to
+    // LoginRequestIFace and AuthorizationReplyIFace respectively.
+    private const uint LoginReplyMessage = 0xD4BA5CCD;
+    private const uint GameLaunchReplyMessage = 0x90F2D04D;
+
     // Layout: 1-byte opcode, 4-byte LE packet length, 1-byte XOR checksum,
     // followed by transport type, content version, and a per-connection nonce.
     private static byte[] CreateInitialGreeting()
@@ -107,8 +118,7 @@ public sealed class AuthServer
             await stream.FlushAsync(ct);
             Console.WriteLine($"[AUTH] Sent login transport greeting ({greeting.Length} bytes) to {endpoint}");
 
-            // Step 2: Read CMSG_HANDSHAKE
-            byte[] buffer = new byte[4096];
+            // Step 2: Read CMSG_HANDSHAKE. The key exchange is not encrypted.
             byte[]? handshake = await TransportFrame.ReadAsync(stream, ct);
             if (handshake is null) return;
             if (handshake[0] != 4)
@@ -129,40 +139,31 @@ public sealed class AuthServer
             {
                 CryptographicOperations.ZeroMemory(handshake);
             }
-            var sendCipher = new Salsa20(sessionKeys.ServerToClientKey, sessionKeys.ServerToClientIv);
-            var recvCipher = new Salsa20(sessionKeys.ClientToServerKey, sessionKeys.ClientToServerIv);
+
+            // One transport implementation for every higher-level behavior: the
+            // session codec owns the Salsa20 stream state and the per-connection
+            // Zstandard contexts that retail keeps for the connection lifetime.
+            using var codec = new TransportCodec(
+                stream,
+                new Salsa20(sessionKeys.ClientToServerKey, sessionKeys.ClientToServerIv),
+                new Salsa20(sessionKeys.ServerToClientKey, sessionKeys.ServerToClientIv));
             CryptographicOperations.ZeroMemory(sessionKeys.ServerToClientKey);
             CryptographicOperations.ZeroMemory(sessionKeys.ClientToServerKey);
             CryptographicOperations.ZeroMemory(sessionKeys.ServerToClientIv);
             CryptographicOperations.ZeroMemory(sessionKeys.ClientToServerIv);
-            Console.WriteLine($"[AUTH] RSA envelope and historical key-field layout validated for {endpoint}; encrypted application protocol not yet verified.");
+            Console.WriteLine($"[AUTH] RSA envelope and historical key-field layout validated for {endpoint}.");
+
             if (_handshakeOnly)
             {
                 if (_probeLoginReplyEnvelope)
                 {
-                    await ProbeLoginReplyEnvelopeAsync(stream, recvCipher, sendCipher, endpoint, ct);
+                    await ProbeLoginReplyEnvelopeAsync(codec, endpoint, ct);
                     return;
                 }
                 if (_capturePostHandshake)
                 {
-                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    timeout.CancelAfter(TimeSpan.FromSeconds(3));
-                    try
-                    {
-                        byte[] probe = new byte[4096];
-                        int received = await stream.ReadAsync(probe, timeout.Token);
-                        if (received > 0)
-                        {
-                            byte[] plain = new byte[received];
-                            recvCipher.Process(probe.AsSpan(0, received), plain);
-                            int headerLength = Math.Min(6, plain.Length);
-                            int payloadPrefixLength = Math.Min(8, Math.Max(0, plain.Length - headerLength));
-                            Console.WriteLine($"[AUTH] Post-handshake client bytes: encrypted={received}, decrypted-header={Convert.ToHexString(plain.AsSpan(0, headerLength))}, decrypted-payload-prefix={Convert.ToHexString(plain.AsSpan(headerLength, payloadPrefixLength))}, decrypted-sha256={Convert.ToHexString(SHA256.HashData(plain))}");
-                            CryptographicOperations.ZeroMemory(plain);
-                        }
-                        else Console.WriteLine("[AUTH] Client closed without a post-handshake message.");
-                    }
-                    catch (OperationCanceledException) { Console.WriteLine("[AUTH] No post-handshake client bytes before timeout; client is waiting for a server message."); }
+                    await CapturePostHandshakeAsync(codec, endpoint, ct);
+                    return;
                 }
                 Console.WriteLine("[AUTH] Handshake-only probe complete; closing without speculative application replies.");
                 return;
@@ -174,19 +175,24 @@ public sealed class AuthServer
             // Serve session loop
             while (!ct.IsCancellationRequested)
             {
-                read = await stream.ReadAsync(buffer, ct);
-                if (read <= 0) break;
+                TransportMessage? message = await codec.ReadAsync(ct);
+                if (message is null) break;
 
-                // For raw or encrypted packets, parse opcode
-                uint opcode = BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(0, 4));
+                byte[] payload = message.Value.Payload;
+                if (payload.Length < 4)
+                {
+                    Console.WriteLine($"[AUTH] Ignoring short transport payload ({payload.Length} bytes, type 0x{message.Value.Type:X2}).");
+                    continue;
+                }
+
+                uint opcode = BinaryPrimitives.ReadUInt32LittleEndian(payload);
 
                 switch ((Opcode)opcode)
                 {
                     case Opcode.CMSG_PING:
                     {
                         var pingReply = new PacketWriter(Opcode.SMSG_PING);
-                        byte[] raw = pingReply.ToByteArray();
-                        await stream.WriteAsync(raw, ct);
+                        await codec.WriteAsync(0, pingReply.ToByteArray(), ct);
                         break;
                     }
 
@@ -199,7 +205,7 @@ public sealed class AuthServer
                             .WriteString("afc1bb5a")
                             .WriteString("loginserver")
                             .WriteUInt64(1);
-                        await stream.WriteAsync(sigReply.ToByteArray(), ct);
+                        await codec.WriteAsync(0, sigReply.ToByteArray(), ct);
                         break;
                     }
 
@@ -209,7 +215,7 @@ public sealed class AuthServer
                         var introReply = new PacketWriter(Opcode.SMSG_REQUEST_INTRODUCE_CONNECTION)
                             .WriteString($"{_worldHost}:{_worldPort}")
                             .WriteString(serverIdToken);
-                        await stream.WriteAsync(introReply.ToByteArray(), ct);
+                        await codec.WriteAsync(0, introReply.ToByteArray(), ct);
                         break;
                     }
 
@@ -218,7 +224,7 @@ public sealed class AuthServer
                         return;
 
                     default:
-                        Console.WriteLine($"[AUTH] Unhandled opcode: 0x{opcode:X8} ({read} bytes)");
+                        Console.WriteLine($"[AUTH] Unhandled opcode: 0x{opcode:X8} ({payload.Length} bytes, transport type 0x{message.Value.Type:X2})");
                         break;
                 }
             }
@@ -233,36 +239,31 @@ public sealed class AuthServer
         }
     }
 
-    private async Task ProbeLoginReplyEnvelopeAsync(
-        Stream stream, Salsa20 recvCipher, Salsa20 sendCipher, string endpoint, CancellationToken ct)
+    /// <summary>
+    /// Bounded login-reply probe. Reads one routed application frame through the
+    /// shared codec, so the dispatch envelope is taken from the decompressed
+    /// logical payload exactly as the retail receiver does.
+    /// </summary>
+    private async Task ProbeLoginReplyEnvelopeAsync(TransportCodec codec, string endpoint, CancellationToken ct)
     {
-        byte[]? request = await ReadEncryptedTransportFrameAsync(stream, recvCipher, ct);
+        TransportMessage? request = await codec.ReadAsync(ct);
         if (request is null)
         {
             Console.WriteLine("[AUTH] Client closed without a post-handshake message.");
             return;
         }
 
-        if (request[0] != 0x10 || request.Length < TransportFrame.HeaderSize + 8)
-            throw new InvalidDataException("Expected a type-0x10 frame with an 8-byte dispatch envelope.");
+        if (request.Value.Type != 0 || request.Value.Payload.Length < 8)
+            throw new InvalidDataException("Expected a routed application frame with an 8-byte dispatch envelope.");
 
-        // The retail receive path reads exactly uint32 + uint16 + uint16 before
-        // dispatch. Outbound calls serialize Connection+0x28 followed by +0x60,
-        // while the peer's receive registry is keyed by +0x60 followed by +0x28.
-        // The same proven ServerProxy callback accepts LoginRequestIFace reply
-        // D4BA5CCD and ReplyGameLaunch 90F2D04D. The login reply initializes the
-        // application first. ReplyGameLaunch then passes its first encoded string
-        // to the connection controller and finishes the retained Auth connection.
-        // Its second string is left at the parser-valid empty minimum so this probe
-        // does not invent a session token or other authentication data.
-        uint messageId = BinaryPrimitives.ReadUInt32LittleEndian(request.AsSpan(TransportFrame.HeaderSize));
-        ushort routeA = BinaryPrimitives.ReadUInt16LittleEndian(request.AsSpan(TransportFrame.HeaderSize + 4));
-        ushort routeB = BinaryPrimitives.ReadUInt16LittleEndian(request.AsSpan(TransportFrame.HeaderSize + 6));
-        Console.WriteLine($"[AUTH] Received type-0x10 login envelope: length={request.Length}, message=0x{messageId:X8}, route=0x{routeA:X4}/0x{routeB:X4}");
-        CryptographicOperations.ZeroMemory(request);
+        byte[] envelope = request.Value.Payload;
+        uint messageId = BinaryPrimitives.ReadUInt32LittleEndian(envelope);
+        ushort routeA = BinaryPrimitives.ReadUInt16LittleEndian(envelope.AsSpan(4));
+        ushort routeB = BinaryPrimitives.ReadUInt16LittleEndian(envelope.AsSpan(6));
+        Console.WriteLine($"[AUTH] Received routed client request: logical={envelope.Length} bytes, message=0x{messageId:X8}, route=0x{routeA:X4}/0x{routeB:X4}.");
 
-        if (messageId != 0x011C5800)
-            throw new InvalidDataException($"Expected login request message 0x011C5800, received 0x{messageId:X8}.");
+        if (messageId != ClientLoginRequestMessage)
+            Console.WriteLine($"[AUTH] WARNING: expected client login request 0x{ClientLoginRequestMessage:X8}, received 0x{messageId:X8}; replying on the observed route pair.");
 
         // Full canonical configuration grounded in static disassembly and historical evidence:
         // - useSyncClock="true" enables the synchronized clock service.
@@ -273,27 +274,23 @@ public sealed class AuthServer
         // - access-rights provides client and network subnet declarations parsed by HandleInitialized.
         byte[] initializationDocument = "<client title=\"Test Client\" useSyncClock=\"true\" loglevel=\"debug\" additionalClientConfigs=\"username=local-test;WorldName=he1012;SHARD_PUBLIC_NAME=he1012;\"><access-rights><client name=\"Automaton.exe\"><network name=\"BWA\" address=\"10.2.0.0/15\"/></client></access-rights></client>"u8.ToArray();
         int encodedStringLength = initializationDocument.Length + 1;
-        byte[] envelope = new byte[16 + encodedStringLength];
-        BinaryPrimitives.WriteUInt32LittleEndian(envelope, 0xD4BA5CCD);
-        BinaryPrimitives.WriteUInt16LittleEndian(envelope.AsSpan(4), routeB);
-        BinaryPrimitives.WriteUInt16LittleEndian(envelope.AsSpan(6), routeA);
+        byte[] replyEnvelope = new byte[16 + encodedStringLength];
+        BinaryPrimitives.WriteUInt32LittleEndian(replyEnvelope, LoginReplyMessage);
+        // The observed client request uses the wildcard route pair 0xFFFF/0xFFFF,
+        // where word order is not observable. Echo the observed pair.
+        BinaryPrimitives.WriteUInt16LittleEndian(replyEnvelope.AsSpan(4), routeA);
+        BinaryPrimitives.WriteUInt16LittleEndian(replyEnvelope.AsSpan(6), routeB);
         // Body: u32 status = 0; u32 byte length including the terminal NUL;
         // UTF-8 XML bytes; terminal NUL (provided by the zero-initialized array).
-        BinaryPrimitives.WriteUInt32LittleEndian(envelope.AsSpan(12), (uint)encodedStringLength);
-        initializationDocument.CopyTo(envelope.AsSpan(16));
+        BinaryPrimitives.WriteUInt32LittleEndian(replyEnvelope.AsSpan(12), (uint)encodedStringLength);
+        initializationDocument.CopyTo(replyEnvelope.AsSpan(16));
 
-        byte[] response = TransportFrame.Encode(0x10, envelope);
-        byte[] encryptedResponse = new byte[response.Length];
-        sendCipher.Process(response, encryptedResponse);
-        await stream.WriteAsync(encryptedResponse, ct);
-        await stream.FlushAsync(ct);
-        Console.WriteLine($"[AUTH] Sent encrypted login-reply envelope with candidate client initializer ({response.Length} bytes, message=0xD4BA5CCD, route=0x{routeB:X4}/0x{routeA:X4}, body={envelope.Length - 8} bytes) to {endpoint}.");
-        CryptographicOperations.ZeroMemory(encryptedResponse);
-        CryptographicOperations.ZeroMemory(response);
-        CryptographicOperations.ZeroMemory(envelope);
+        await codec.WriteAsync(0, replyEnvelope, ct);
+        Console.WriteLine($"[AUTH] Sent login-reply envelope (message=0x{LoginReplyMessage:X8}, route=0x{routeA:X4}/0x{routeB:X4}, body={replyEnvelope.Length - 8} bytes) to {endpoint}.");
+        CryptographicOperations.ZeroMemory(replyEnvelope);
 
         // Immediate game launch reply (0x90F2D04D).
-        // Retail client evidence (Client_20260904T113716_600.log) confirms that ServerProxy::ReplyGameLaunch (0x90F2D04D)
+        // Retail client evidence confirms that ServerProxy::ReplyGameLaunch (0x90F2D04D)
         // arrives alongside or immediately following D4. It supplies the World shard address and clears
         // [ServerProxy + 0x78]. If the connection closes before 0x90F2D04D arrives, ServerProxy::OnDisconnect (0x140427170)
         // triggers HandleLaunchFailure(1003). Type 0x01 is on an independent 10-second background timer and must NOT gate 0x90F2D04D.
@@ -301,21 +298,15 @@ public sealed class AuthServer
         int encodedAddressLength = gameAddress.Length + 1;
         int secondStringLengthOffset = 12 + encodedAddressLength;
         byte[] launchEnvelope = new byte[secondStringLengthOffset + sizeof(uint) + 1];
-        BinaryPrimitives.WriteUInt32LittleEndian(launchEnvelope, 0x90F2D04D);
-        BinaryPrimitives.WriteUInt16LittleEndian(launchEnvelope.AsSpan(4), routeB);
-        BinaryPrimitives.WriteUInt16LittleEndian(launchEnvelope.AsSpan(6), routeA);
+        BinaryPrimitives.WriteUInt32LittleEndian(launchEnvelope, GameLaunchReplyMessage);
+        BinaryPrimitives.WriteUInt16LittleEndian(launchEnvelope.AsSpan(4), routeA);
+        BinaryPrimitives.WriteUInt16LittleEndian(launchEnvelope.AsSpan(6), routeB);
         BinaryPrimitives.WriteUInt32LittleEndian(launchEnvelope.AsSpan(8), (uint)encodedAddressLength);
         gameAddress.CopyTo(launchEnvelope.AsSpan(12));
         BinaryPrimitives.WriteUInt32LittleEndian(launchEnvelope.AsSpan(secondStringLengthOffset), 1);
 
-        byte[] launchResponse = TransportFrame.Encode(0x10, launchEnvelope);
-        byte[] encryptedLaunchResponse = new byte[launchResponse.Length];
-        sendCipher.Process(launchResponse, encryptedLaunchResponse);
-        await stream.WriteAsync(encryptedLaunchResponse, ct);
-        await stream.FlushAsync(ct);
-        Console.WriteLine($"[AUTH] Sent encrypted game-launch reply ({launchResponse.Length} bytes, message=0x90F2D04D, route=0x{routeB:X4}/0x{routeA:X4}, address={_worldHost}:{_worldPort}, second-string=empty) to {endpoint}.");
-        CryptographicOperations.ZeroMemory(encryptedLaunchResponse);
-        CryptographicOperations.ZeroMemory(launchResponse);
+        await codec.WriteAsync(0, launchEnvelope, ct);
+        Console.WriteLine($"[AUTH] Sent game-launch reply (message=0x{GameLaunchReplyMessage:X8}, route=0x{routeA:X4}/0x{routeB:X4}, address={_worldHost}:{_worldPort}, second-string=empty) to {endpoint}.");
         CryptographicOperations.ZeroMemory(launchEnvelope);
         CryptographicOperations.ZeroMemory(gameAddress);
 
@@ -325,33 +316,28 @@ public sealed class AuthServer
         {
             while (!timeout.Token.IsCancellationRequested)
             {
-                byte[]? next = await ReadEncryptedTransportFrameAsync(stream, recvCipher, timeout.Token);
+                TransportMessage? next = await codec.ReadAsync(timeout.Token);
                 if (next is null)
                 {
                     Console.WriteLine("[AUTH] Client closed connection after launch reply.");
                     break;
                 }
 
-                if (next[0] == 0x01 && next.Length == TransportFrame.HeaderSize + sizeof(ulong))
+                if (next.Value.Type == TransportTimeSync.RequestType &&
+                    next.Value.Payload.Length == TransportTimeSync.RequestPayloadSize)
                 {
-                    ulong sequence = TransportTimeSync.ReadRequestSequence(next);
-                    Console.WriteLine($"[AUTH] Client advanced with transport time request: type=0x01, length={next.Length}, sequence=0x{sequence:X16}.");
-                    CryptographicOperations.ZeroMemory(next);
+                    ulong sequence = TransportTimeSync.ReadRequestSequencePayload(next.Value.Payload);
+                    Console.WriteLine($"[AUTH] Client advanced with transport time request: type=0x01, length={next.Value.Payload.Length}, sequence=0x{sequence:X16}.");
 
                     uint localTimeMilliseconds = GetTimeSyncMilliseconds();
-                    byte[] controlResponse = TransportTimeSync.EncodeBaseResponse(sequence, localTimeMilliseconds);
-                    byte[] encryptedControlResponse = new byte[controlResponse.Length];
-                    sendCipher.Process(controlResponse, encryptedControlResponse);
-                    await stream.WriteAsync(encryptedControlResponse, timeout.Token);
-                    await stream.FlushAsync(timeout.Token);
-                    Console.WriteLine($"[AUTH] Sent encrypted base-only transport time response: type=0x02, length={controlResponse.Length}, sequence=0x{sequence:X16}, count=1, local-ms=0x{localTimeMilliseconds:X8}.");
-                    CryptographicOperations.ZeroMemory(encryptedControlResponse);
-                    CryptographicOperations.ZeroMemory(controlResponse);
+                    byte[] controlPayload = TransportTimeSync.EncodeBaseResponsePayload(sequence, localTimeMilliseconds);
+                    await codec.WriteAsync(TransportTimeSync.ResponseType, controlPayload, timeout.Token);
+                    Console.WriteLine($"[AUTH] Sent base-only transport time response: type=0x02, payload={controlPayload.Length}, sequence=0x{sequence:X16}, count=1, local-ms=0x{localTimeMilliseconds:X8}.");
+                    CryptographicOperations.ZeroMemory(controlPayload);
                 }
                 else
                 {
-                    Console.WriteLine($"[AUTH] Client sent post-launch frame: type=0x{next[0]:X2}, length={next.Length}.");
-                    CryptographicOperations.ZeroMemory(next);
+                    Console.WriteLine($"[AUTH] Client sent post-launch frame: type=0x{next.Value.Type:X2}, logical-length={next.Value.Payload.Length}.");
                 }
             }
         }
@@ -361,48 +347,35 @@ public sealed class AuthServer
         }
     }
 
+    /// <summary>Bounded diagnostic: decodes one post-handshake frame through the
+    /// shared codec and reports only structural facts, never payload contents.</summary>
+    private async Task CapturePostHandshakeAsync(TransportCodec codec, string endpoint, CancellationToken ct)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(TimeSpan.FromSeconds(3));
+        try
+        {
+            TransportMessage? message = await codec.ReadAsync(timeout.Token);
+            if (message is null)
+            {
+                Console.WriteLine("[AUTH] Client closed without a post-handshake message.");
+                return;
+            }
+
+            byte[] payload = message.Value.Payload;
+            string digest = Convert.ToHexString(SHA256.HashData(payload));
+            Console.WriteLine($"[AUTH] Post-handshake frame from {endpoint}: transport-type=0x{message.Value.Type:X2}, logical-length={payload.Length}, logical-sha256={digest}{(payload.Length >= 8 ? $", message=0x{BinaryPrimitives.ReadUInt32LittleEndian(payload):X8}, route=0x{BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(4)):X4}/0x{BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(6)):X4}" : string.Empty)}.");
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("[AUTH] No post-handshake client bytes before timeout; client is waiting for a server message.");
+        }
+    }
+
     private uint GetTimeSyncMilliseconds()
     {
         long elapsedMilliseconds = Stopwatch.GetElapsedTime(_timeBaseStopwatchTimestamp).Ticks /
                                    TimeSpan.TicksPerMillisecond;
         return unchecked((uint)(_timeBaseFileTimeMilliseconds + elapsedMilliseconds));
-    }
-
-    private static async Task<byte[]?> ReadEncryptedTransportFrameAsync(Stream stream, Salsa20 cipher, CancellationToken ct)
-    {
-        byte[] encryptedHeader = new byte[TransportFrame.HeaderSize];
-        int first = await stream.ReadAsync(encryptedHeader.AsMemory(0, 1), ct);
-        if (first == 0) return null;
-        await stream.ReadExactlyAsync(encryptedHeader.AsMemory(1), ct);
-
-        byte[] header = new byte[TransportFrame.HeaderSize];
-        cipher.Process(encryptedHeader, header);
-        int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(1, 4));
-        if (length < TransportFrame.HeaderSize || length > TransportFrame.MaximumSize)
-            throw new InvalidDataException("Invalid encrypted transport frame length.");
-
-        byte[] frame = new byte[length];
-        header.CopyTo(frame, 0);
-        if (length > TransportFrame.HeaderSize)
-        {
-            byte[] encryptedPayload = new byte[length - TransportFrame.HeaderSize];
-            await stream.ReadExactlyAsync(encryptedPayload, ct);
-            cipher.Process(encryptedPayload, frame.AsSpan(TransportFrame.HeaderSize));
-            CryptographicOperations.ZeroMemory(encryptedPayload);
-        }
-        CryptographicOperations.ZeroMemory(encryptedHeader);
-        CryptographicOperations.ZeroMemory(header);
-
-        // Reuse the established checksum validation without exposing any body.
-        using var parser = new MemoryStream(frame, writable: false);
-        byte[]? validated;
-        try { validated = await TransportFrame.ReadAsync(parser, ct); }
-        catch (InvalidDataException ex)
-        {
-            throw new InvalidDataException($"{ex.Message} Decrypted header={Convert.ToHexString(frame.AsSpan(0, TransportFrame.HeaderSize))}.", ex);
-        }
-        if (validated is null) throw new InvalidDataException("Missing decrypted transport frame.");
-        CryptographicOperations.ZeroMemory(frame);
-        return validated;
     }
 }
