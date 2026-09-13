@@ -2705,3 +2705,164 @@ that window. Only after that is resolved is a routed D4 meaningful.
 The derived pair `0x0001`/`0x0000` is recorded above and must not be re-tested
 until the `Close` boundary is resolved, because a socket that is already being
 torn down cannot demonstrate route delivery.
+
+## Close/RequestClose lifecycle, the `0x1404123D0` contract, and route survival (September 13)
+
+This section supersedes the "NEW FAILURE BOUNDARY" of the previous section and
+records what the post-introduce `Close` actually is.
+
+### `0x1404123D0` is the close verb, not a generic state setter — CONFIRMED
+
+Signature `0x1404123D0(rcx = connection, edx = X, r8d = Y)`. It contains the
+`Close` serializer and sender:
+
+```text
+0x140412419  call 0x140414CB0(connection, 7, 0x7F, 0x180)   state query
+0x140412481  rbx = [rbp+0xF8]
+0x1404124D3  rdi = [rsp+0x28]        the connection resolved from the correlation lookup at 0x140412465
+0x1404124DB  je 0x1404126FE          null -> cleanup, nothing sent
+0x1404124E1  cmp r14d, 0x4           r14d = the state-query result
+0x1404124E5  jne 0x1404126C5         not 4 -> skip the send
+0x1404124EB  test r15d, r15d         r15d = X
+0x1404124EE  jne 0x1404126C5         X != 0 -> skip the send
+0x140412572  mov DWORD PTR [rax], 0x43DB3479        write "Close"
+0x140412594  movzx edx, WORD PTR [rsi+0x28]         body word 1 = Connection+0x28
+0x1404125A2  movzx edx, WORD PTR [rsi+0x60]         body word 2 = Connection+0x60
+0x140412604/0x14041260C  requires state 4 or 7
+0x140412654  mov r9d, 0x43DB3479
+0x140412667  call 0x14043B460                       transport send
+0x1404126F2  call 0x14043D550                       receive-tree operation
+```
+
+**The exact condition that emits a `Close` frame is therefore: the connection is
+non-null, the state query returns `4`, and `X == 0`.** Every other `X` value
+simply performs the state bookkeeping without sending.
+
+Caller `X`/`Y` values recovered:
+
+| Caller | X | Y | Sends Close? |
+| --- | --- | --- | --- |
+| `0x140412317` registration insert failed (`0x140412180`) | 2 | 1 | no |
+| `0x14043D4E7` registration insert succeeded (insert helper `0x14043D380`) | 2 | 12 | no |
+| `0x14042C51D` `ReplyIDSignature` with reply word `0xFFFF` | 2 | 3 | no |
+| `0x14042BADD` incoming `RequestClose` dispatch | 0 | 0 | **yes** |
+| `0x1404371E6` list teardown over connections | 0 | 0 | **yes** |
+| `0x140468D66` single-connection teardown (`rcx = [rdx+8]`) | 0 | 0 | **yes** |
+| `0x14043B190`, `0x14043B210`, `0x14042B94F`, `0x140438268`, `0x140430270`, `0x140430460` | 2 | varies | no |
+
+So `X` behaves as a **verb**: `2` = state bookkeeping only, `0` = close this
+connection. The dispatcher confirms it: an incoming `RequestClose` is turned into
+`(connection, 0, 0)`.
+
+### Directionality — CONFIRMED
+
+`RequestClose` (`0x0598D9A7`) has **no serializer anywhere** in the executable
+(only the registration at `0x140406059`, the receive comparison at `0x140412B7E`
+and the dispatcher case at `0x14042BACC`). The client never sends it: it is a
+server-to-client message. `Close` (`0x43DB3479`) has both a serializer
+(`0x140412572`) and a dispatcher case (`0x14042BABC`), so it travels both ways.
+
+The `Close` body is the sender's own two route words in sender order —
+`Connection + 0x28` then `Connection + 0x60` — which is the reverse of the
+receive-tree key order. For our observation that is `0x0000` then `0x0001`.
+
+### DISPROVEN — the introduce/registration path does not send Close
+
+Both branches of the client's post-introduce registration call
+`0x1404123D0` with `X = 2`:
+
+```text
+insert failed  -> 0x140412317  (connection, 2, 1)
+insert success -> 0x14043D4E7  (connection, 2, 12)
+```
+
+Since `X = 2` never sends, **neither the success nor the failure of the client's
+own receive-tree insertion produces the observed `Close`**. The trigger is a
+separate lifecycle path that passes `X = 0`. Two concrete call sites do, and both
+are teardown shaped:
+
+* `0x1404371E6` walks a list of connections and closes each;
+* `0x140468D66` closes the single connection held at `[rdx+8]` of its argument.
+
+Which of the two fired in the retail run is **UNRESOLVED**; localizing it needs
+either a breakpoint (not viable in this environment, see the September 7
+debugger findings) or a distinguishing runtime observable.
+
+### Post-introduce state and route survival — CONFIRMED structure, UNRESOLVED runtime
+
+`0x1404123D0` ends by calling `0x14043D550` (`0x1404126F2`) on the connection,
+which is a receive-tree operation and is the only tree mutation this function
+performs. The tree entry inserted by the client at `0x14042C782` is therefore
+subject to it. The connection's `+0x28`/`+0x60` and the resolved
+`ObjectSurrogate` are released on the same teardown path.
+
+Because the bootstrap socket closes immediately afterwards and the client makes
+no further connection, the practical answer is:
+
+```text
+route 0001/0000 after Close:  REMOVED with the bootstrap connection (HYPOTHESIS)
+```
+
+It is not MIGRATED: no subsequent TCP connection of any kind was observed, and
+no code path was found that transfers a receive key between connections.
+
+### Subsequent network activity — CONFIRMED none
+
+From the two selections of the control run:
+
+```text
+auth   two connections, one per manual selection, each ending in Close
+world  no connection at all (world.log shows only startup)
+platform  /gamepad/shardlist requested again after each failure
+client  returns to the server list and reports error 1003
+```
+
+There is no automatic retry, no second auth connection, no World connection, and
+no connection to any other destination.
+
+### Reply strings — CONFIRMED not causal to this boundary
+
+`0x14042D320` receives only `(context, &out, correlation)`; the three strings are
+stored in locals, freed, and never passed on. Nothing in the recovered path
+copies them elsewhere. They are **not causal to the current Close boundary**.
+
+### Classification of the observed post-introduce Close
+
+```text
+Observed post-introduce Close:
+
+classification:
+    FAILURE TEARDOWN  (leaning; producer site not definitively resolved)
+
+producer:
+    one of 0x1404371E6 / 0x140468D66, both calling
+    0x1404123D0(connection, 0, 0); NOT the registration branches, which pass X=2
+
+triggering condition:
+    X == 0 AND the connection state query returns 4; the upstream condition that
+    chooses the teardown path is unresolved
+
+connection state before:  CS_LOGGING_IN, launch context still outstanding
+connection state after:   disconnected; ServerProxy::OnDisconnect reports 1003
+
+route 0001/0000 after Close:
+    REMOVED with the bootstrap connection (HYPOTHESIS)
+
+next client network action:
+    none; it returns to the server list and re-requests /gamepad/shardlist
+
+evidence:
+    0x1404124E1/0x1404124EB gate; X values of every caller; absence of any
+    serializer for RequestClose; world.log and platform.log of the control run;
+    the 45 ms 1003 while the launch context was still set
+```
+
+### D4 RULE — still not satisfiable
+
+D4 must not be sent on the bootstrap socket: the client resolves that socket
+through `Close` within tens of milliseconds and makes no further connection, so
+there is no proven point at which a routed delivery would be valid. The derived
+pair `0x0001`/`0x0000` stands, and the next task is to localize the `X == 0`
+trigger — which decides whether the bootstrap connection is meant to end
+normally and the login continue elsewhere, or whether the client is aborting
+because a required peer message never arrived in the introduce/close window.

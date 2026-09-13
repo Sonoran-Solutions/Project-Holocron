@@ -109,6 +109,18 @@ public class IdentificationExchangeTests
     }
 
     [Fact]
+    public void CloseBodyCarriesTheSendersRouteWordsInSenderOrder()
+    {
+        // A close frame observed from the client would carry its own object id
+        // (0x0000) then its peer word (0x0001) - the reverse of the receive key.
+        byte[] body = Convert.FromHexString("0000" + "0100");
+        (ushort own, ushort peer) = IdentificationExchange.ReadClose(body);
+        Assert.Equal(0x0000, own);
+        Assert.Equal(0x0001, peer);
+        Assert.Throws<InvalidDataException>(() => IdentificationExchange.ReadClose(new byte[3]));
+    }
+
+    [Fact]
     public void GlobalCloseMessagesAreRecorded()
     {
         // Observed on the wire immediately after the client's introduce.

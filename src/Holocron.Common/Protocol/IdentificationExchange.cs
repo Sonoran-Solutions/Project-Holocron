@@ -62,9 +62,27 @@ public static class IdentificationExchange
 
     /// <summary>
     /// <c>RequestClose</c>, dispatched at <c>0x14042BACC</c> to
-    /// <c>0x1404123D0(connection, 0, 0)</c>.
+    /// <c>0x1404123D0(connection, 0, 0)</c>. It has no serializer in the
+    /// executable, so the client never sends it: it is a server-to-client
+    /// message only.
     /// </summary>
     public const uint RequestClose = 0x0598D9A7;
+
+    /// <summary>
+    /// Reads the two route words a <see cref="Close"/> frame carries. The
+    /// producer <c>0x1404123D0</c> writes the sending connection's own object
+    /// id (<c>Connection + 0x28</c>) first and its peer word
+    /// (<c>Connection + 0x60</c>) second, at <c>0x140412594</c> and
+    /// <c>0x1404125A2</c> - the sender's order, which is the reverse of the
+    /// receive-tree key order.
+    /// </summary>
+    public static (ushort OwnObjectId, ushort PeerWord) ReadClose(ReadOnlySpan<byte> body)
+    {
+        if (body.Length < 2 * sizeof(ushort))
+            throw new InvalidDataException("Truncated close payload.");
+        return (BinaryPrimitives.ReadUInt16LittleEndian(body),
+                BinaryPrimitives.ReadUInt16LittleEndian(body[sizeof(ushort)..]));
+    }
 
     /// <summary>The route word pair the client uses for its global requests, and
     /// the value the reply's body word must NOT carry.</summary>
