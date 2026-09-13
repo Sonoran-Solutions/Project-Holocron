@@ -8,6 +8,15 @@ No account credentials or captured session keys are recorded here.
 > September 11 audit: the current candidate was tested and still closes after D4.
 > See the final audit section before relying on earlier XML-rejection claims.
 > In particular, absence of type `0x01` does not identify a failing Frame lookup.
+>
+> **September 13 correction, read this first.** Transport type bit `0x10` is a
+> **Zstandard compression flag**, not an encryption class, and a `0x10` payload
+> is compressed rather than a raw application envelope. Every earlier section
+> that reads a dispatch envelope directly out of a `0x10` payload — including
+> the recovered message `0x011C5800` and routes `0xE800`/`0xE6A7` — is
+> **DISPROVEN**. See "Transport bit `0x10` is Zstandard compression" at the end
+> of this document for the byte-exact evidence, the corrected pipeline, and the
+> corrected `omega::ServerProxy` field offsets.
 
 ## Repository mode
 
@@ -192,13 +201,24 @@ bytes, sufficient to classify the inner message without recording a string or
 credential field.
 
 That bounded prefix capture produced `00 58 1C 01 00 E8 A7 E6` after the
-transport header. The first byte and following three-byte/word-looking region
+transport header. **DISPROVEN as an envelope (September 13):** those bytes are
+a magicless Zstandard frame header, a block header, and the first literal
+bytes, not a message id and two route words. The first byte and following three-byte/word-looking region
 must be treated as an unclassified inner envelope: the remaining bytes vary
 per session, and the project's legacy `Opcode` enum is not evidence of its
 retail meaning. The next step is static tracing of the installed client's
 type-`0x10` receive/send handler before attempting a response.
 
+
+> **DISPROVEN (September 13).** Those bytes are a magicless Zstandard frame
+> header (`00 58`), a block header (`1C 01 00`), and the first literal bytes of
+> the compressed block. They are not a message id and two route words.
 ## Encrypted type-`0x10` dispatch envelope (September 6, 13:13)
+
+> **SUPERSEDED (September 13).** Bit `0x10` is the Zstandard compression flag,
+> not an encrypted-frame flag, and `0x10` is not a transport class. The
+> low-nibble routing described below is still correct, but it applies to the
+> *decompressed* payload. See the September 13 section.
 
 The client receive path at `0x14043bbe0` validates the six-byte transport
 header, treats bit `0x10` as the encrypted-frame flag, and routes low-nibble
@@ -212,6 +232,9 @@ registered receive-handler lookup; the `uint32` is forwarded to that selected
 handler. This establishes the inner envelope layout without retaining a login
 body. The observed client-first prefix is consequently consistent with
 `uint32 0x011c5800` followed by a session-varying 16-bit routing pair.
+**DISPROVEN (September 13):** the same reasoning applied to a compressed
+payload, and the recovered message is `0xA609E6A7` on the wildcard route pair
+`0xFFFF`/`0xFFFF`.
 
 A test-only server mode now sends a **bounded structural probe**: after reading
 the client's fully framed encrypted request, it returns type `0x10` containing
@@ -1632,9 +1655,10 @@ cause of this observed close.
 
 **CONFIRMED — error 1003 is disconnect aftermath.** At `0x14042718E`,
 `ServerProxy::OnDisconnect` inspects the retained launch context at
-`ServerProxy +0x78`. If it is still present, `0x1404271D6` supplies decimal
-1003 and invokes the application's launch-failure callback. The context is
-cleared only by successful ReplyGameLaunch dispatch. Thus the visible 1003
+`ServerProxy +0x90`. If it is still present, `0x1404271D6` supplies decimal
+1003 and invokes the application's launch-failure callback through the
+application pointer at `ServerProxy +0x78`. **CONFIRMED (September 13) from
+`0x14042718E`/`0x1404271CF`.** Thus the visible 1003
 identifies an Auth disconnect before completed launch dispatch; it does not
 identify the original D4 rejection and is not evidence of a process crash.
 
@@ -1666,7 +1690,7 @@ Extracted directly from RTTI Complete Object Locators in `.rdata`:
     - `0x14045a71d`: checks message ID `0xD4BA5CCD` -> calls `LoginRequestIFace::slot0` (`0x1404279d0`)
     - `0x14045a216`: checks message ID `0x90F2D04D` -> calls `AuthorizationReplyIFace::slot0` (`0x140427220`)
   - Slot 7 (`+0x38`): `0x140459bb0` — Route dispatcher (checks `*` route `0x14156e2d0`)
-  - Slot 8 (`+0x40`): `0x140427170` — `OnDisconnect` (checks `[ServerProxy + 0x78]` -> `HandleLaunchFailure(1003)`)
+  - Slot 8 (`+0x40`): `0x140427170` — `OnDisconnect` (**SUPERSEDED: the state check is at `[ServerProxy + 0x90]`, and `+0x78` is the application pointer used to report 1003**; see the September 13 section)
 
 - **Base 4: `LoginRequestIFace`** (mdisp = `0x18`, COL `0x141702138`, vtable `0x1414b65d0`):
   - Slot 0 (`+0x00`): `0x1404279d0` — Handles D4 (`0xD4BA5CCD`):
@@ -1686,7 +1710,7 @@ Extracted directly from RTTI Complete Object Locators in `.rdata`:
     - String 2: Session token / account string.
     - Logs `Game launch reply address = %s` (`0x14157f0d8`).
     - Passes shard target to downstream connection controller (`0x140427c90`).
-    - Clears `[ServerProxy + 0x78] = 0`.
+    - Clears a `+0x78` field. **SUPERSEDED:** on the `OnDisconnect` path `+0x78` is the application pointer and the retained launch context is `+0x90`; see the September 13 section.
 
 - **Base 6: `ReplyConnectionIFace`** (mdisp = `0x28`, COL `0x141702160`, vtable `0x1414b6690`):
   - Slot 0 (`+0x00`): `0x140427bb0`.
@@ -1874,3 +1898,261 @@ adding another guessed field would violate the focused-change criterion.
 The final full-suite baseline remains **47/47**. The copied executable's
 temporary resolver instruction was restored to `C7 06 00 04 00 00` after
 each run.
+
+## Transport bit `0x10` is Zstandard compression — CONFIRMED (September 13)
+
+This section is the current authority on the transport type byte. It supersedes
+every earlier statement that `0x10` is an encryption class, that a type-`0x10`
+payload is a raw application envelope, or that the client's login request
+carries message `0x011C5800` on routes `0xE800`/`0xE6A7`.
+
+### Method
+
+One bounded private-client run used the existing isolated launcher with the
+documented local test key and the temporary copied-client resolver adjustment.
+The auth probe was temporarily extended to write the fully decrypted
+post-handshake transport frame to a local, git-ignored analysis path; that
+capture switch has been removed again. The private test client presents
+synthetic credentials only, and no credential, token, or account field is
+recorded here.
+
+### The captured request
+
+The client sent one encrypted frame whose decrypted transport header is
+`10 2E 00 00 00 C1` (type byte `0x10`, declared length 46, complemented XOR
+checksum), i.e. a 40-byte payload:
+
+```text
+00581C0100E8A7E609A6FFFFFFFF0F000000636173746C6568696C6C74657374000E0001006DC009
+```
+
+### That payload is a magicless Zstandard frame — CONFIRMED
+
+Parsing it as a magicless Zstandard frame is self-consistent to the byte:
+
+| Offset | Bytes | Meaning |
+| --- | --- | --- |
+| 0 | `00` | Frame_Header_Descriptor: no content size, no dictionary, no checksum, not single-segment |
+| 1 | `58` | Window_Descriptor: windowLog 21, i.e. a 2 MiB window |
+| 2 | `1C 01 00` | Block_Header 0x00011C: Last_Block 0, Block_Type 2 (compressed), Block_Size 35 |
+| 5–39 | 35 bytes | the compressed block |
+
+`2 + 3 + 35 = 40`, exactly the payload length. Independently, a reference
+Zstandard library reports `headerSize = 2`, `frameContentSize = unknown`,
+`windowSize = 2097152` for this payload under the magicless format, and rejects
+it under the standard format because the frame begins without the
+`28 B5 2F FD` magic number.
+
+`Last_Block = 0` is expected rather than anomalous: the retail sender flushes
+but does not terminate its frame (see below), so the stream continues into the
+next transport frame.
+
+### Exact Zstandard mode and configuration — CONFIRMED
+
+Recovered from the installed client and then validated on the wire:
+
+```text
+context creation   client-role connection setup
+                   0x14043E749 compressor, 0x14043E7AB decompressor
+                   shared initializer 0x140439E90; the level argument is 0,
+                   which selects Zstandard level 3
+format             ZSTD_c_format (parameter 10) = 1
+                   (ZSTD_f_zstd1_magicless), set at 0x140439F80
+decompressor       ZSTD_d_format (parameter 1000) = 1
+                   (ZSTD_f_zstd1_magicless), set at 0x140439F22
+flush mode         ZSTD_e_flush: output flushes the pending input but leaves
+                   Last_Block = 0, so one connection is one continuous frame
+threshold          the sender compresses only payloads of at least 0x20 bytes
+                   (0x14043B887) and then sets bit 0x10 (0x14045C4F1)
+dictionary         none; no dictionary is loaded on either context
+checksum flag      off (frame descriptor bit 2 clear)
+```
+
+There is no dictionary, no special format parameter beyond magicless framing,
+and no preprocessing step.
+
+### Byte-exact confirmation — CONFIRMED
+
+Decompressing the captured payload yields 39 logical bytes:
+
+```text
+A7E609A6FFFFFFFF0F000000636173746C6568696C6C74657374000E0000000000000000000000
+```
+
+Re-encoding exactly those 39 bytes with Zstandard level 3, magicless framing and
+`ZSTD_e_flush` reproduces the captured 40-byte payload **byte for byte**. Two
+independent implementations agree on the decode, and the encode is
+deterministic, so this pair is the client's actual request and not a
+plausible-looking coincidence.
+
+### DISPROVEN — the former `0x011C5800` / `0xE800` / `0xE6A7` envelope
+
+Those values were read from the *compressed* payload as if it were an
+application envelope. Their source bytes are the frame header (`00 58`), the
+block header (`1C 01 00`), and the first literal bytes of the compressed block.
+They are therefore not a message id, not routes, and carry no protocol meaning:
+
+```text
+old reading   message 0x011C5800, route 0xE800/0xE6A7   DISPROVEN
+              "0x10 is an encrypted transport class"     DISPROVEN
+              "the payload after the header is the       DISPROVEN
+               application dispatch envelope"
+```
+
+The route-reversal conclusion and every response that used
+`0xE6A7`/`0xE800` inherited the same error.
+
+### Corrected request envelope — CONFIRMED
+
+After decompression the dispatch envelope is:
+
+```text
+offset  width  value
++0x00   u32    0xA609E6A7   message
++0x04   u16    0xFFFF       route word 1 (wildcard)
++0x06   u16    0xFFFF       route word 2 (wildcard)
++0x08   u32    15           length-prefixed string, including its NUL
++0x0C   15      "castlehilltest" + NUL
++0x1B   ...     two trailing fields
+```
+
+The client's own serializer corroborates this independently: `0x14045BAC4`
+writes `0xA609E6A7` as the message and `0x14045BB02`/`0x14045BB46` write the
+constant `0xFFFF` for both route words immediately after it. The same constant
+is compared at `0x140412B61` and `0x14042B9B9` and passed as the message at
+`0x14045BC5E`.
+
+Because both route words are the wildcard value, the previously reported
+"route direction" question does not apply to the observed login request:
+there is nothing to swap.
+
+### Corrected transport pipeline
+
+```text
+before (incorrect)
+  receive: socket -> Salsa20 -> header -> payload used directly as envelope
+  send:    envelope -> TransportFrame(0x10) -> Salsa20 -> socket
+
+after (confirmed)
+  receive: socket -> Salsa20 -> header -> if bit 0x10: Zstd decompress
+           -> logical payload -> envelope
+  send:    logical payload -> if >= 0x20 bytes: Zstd compress and set bit 0x10
+           -> transport frame -> Salsa20 -> socket
+```
+
+Encryption is session state, not a per-frame property, and `0x10` is a flag on
+the transport type byte rather than a discrete transport class; the low nibble
+carries the actual transport type (`0` routed application, `1`/`2` time sync,
+`4` key exchange). Transport control frames we send are 8 and 13 bytes, below
+the compression threshold, so they stay uncompressed and unchanged.
+
+### Corrected `omega::ServerProxy` layout — CONFIRMED
+
+`ServerProxy::OnDisconnect` at `0x140427170` gates the whole failure path on
+`[this + 0x90]`:
+
+```text
+0x14042718E  cmp QWORD PTR [rcx+0x90],0      state/launch context test
+0x140427196  je  ...                         no context -> no failure report
+0x1404271A9  mov rcx,[rcx+0x90]              take it
+0x1404271B5  mov [rbx+0x90],rax(0)           clear it, releasing via vtable +0x30
+0x1404271CF  mov rcx,[rbx+0x78]              application pointer
+0x1404271D6  mov DWORD PTR [rsp+0x40],0x3EB  error 1003
+0x1404271E3  call [rax+0x98]                 report through the application
+```
+
+Therefore `ServerProxy + 0x78` is the application pointer used to report the
+failure, and the retained launch/state context that gates `OnDisconnect` is at
+`ServerProxy + 0x90`. The earlier statement that `+0x78` is the retained
+launch-request context is **SUPERSEDED**. Reply handlers also read and clear a
+`+0x78` field (`0x140427264`, `0x140427516`, `0x14042757F`); whether that is
+the same field or a field of an adjusted base subobject is not resolved by this
+pass and is not used as evidence here.
+
+### Implementation and regression coverage — CONFIRMED
+
+`TransportCompressor` / `TransportDecompressor` own the payload layer and
+`TransportCodec` owns the session layer (Salsa20 state plus the per-connection
+compression contexts). Both the bounded probe and the normal AuthServer session
+loop now use that single implementation; there is no separate probe protocol.
+
+The captured payload is committed as a fixed test vector. Tests assert that it
+decompresses to the exact logical bytes, that re-encoding reproduces it byte for
+byte, that its frame header and unfinished block match the layout above, that
+consecutive messages share one continuous compressed stream, that a corrupt or
+non-compressed payload is rejected, that control frames stay uncompressed, and
+that cipher and compression state survive consecutive frames in both
+directions. The complete suite passes **56/56**.
+
+### One bounded retail validation run — CONFIRMED and HYPOTHESIS separated
+
+A single bounded private-client run (both automatic selections in that one run
+produced the same result) changed only the transport payload codec: Salsa20
+framing, D4 XML, ReplyGameLaunch strings, message ids, request timing and
+ordering were untouched. The captured executable's temporary resolver
+adjustment was restored by the runner afterwards, and no payload or credential
+was retained.
+
+```text
+CONFIRMED  client  RSA type 4, 522 bytes, test-key envelope validated
+CONFIRMED  client  routed application frame decoded through the codec
+                   logical 39 bytes, message 0xA609E6A7, route 0xFFFF/0xFFFF
+CONFIRMED  server  login reply D4BA5CCD, route 0xFFFF/0xFFFF, 284-byte body
+CONFIRMED  server  game launch reply 90F2D04D, route 0xFFFF/0xFFFF
+CONFIRMED  client  EOF after the launch reply, twice, on two connections
+CONFIRMED  client  error 1003 about 341 ms after CS_LOGGING_IN
+CONFIRMED  snapshot after both attempts: initialized byte 0, settings Frame 0
+```
+
+The server-side decode is a real advance: before this change the server read a
+compressed payload as if it were an envelope, and its replies set bit `0x10` on
+an *uncompressed* payload, so the client could never decode any server
+application frame at all.
+
+**CONFIRMED — the server's outbound frames are decodable.** The exact 292-byte
+D4 reply envelope, compressed through the same code path, round-trips through a
+reference Zstandard library (magic restored) with no residue. The client's
+decoder is configured for the same magicless format, so the reply is not
+rejected at the payload layer.
+
+**HYPOTHESIS — the reply does not reach the D4 handler.** The post-run snapshot
+still reports no installed settings Frame, which the D4 success path would
+install at `ApplicationImpl + 0xF0` before calling `HandleSettings`. Since the
+payload layer is now known-good, the remaining candidates are the reply's
+dispatch key and the connection-setup stage that precedes routed delivery.
+
+**CONFIRMED — `(0xFFFF, 0xFFFF)` is a dedicated wildcard route, not a map key.**
+At `0x14043CF9D` the receiver loads `0xFFFF` and compares both decoded route
+words against it; when *both* match it branches at `0x14043CFB7` to a separate
+path at `0x14043D060` instead of searching the composite-key tree at
+`0x14043CFBD`. Both paths rejoin the global-message check at `0x14043D266`.
+The client's login request and the server's replies therefore use the dedicated
+wildcard route rather than a per-connection route entry.
+
+**CONFIRMED — the receiver's global message cases.** `0x14042B990` compares the
+incoming message against exactly three constants and consumes the event for
+them:
+
+```text
+0xA609E6A7  -> 0x14042BCA0   the client's own login request message
+0x6731C5AF  -> 0x14042C300
+0x8B0D492F  -> 0x14042C910   the control-setup parser that installs the
+                             composite receive-tree entry for a connection
+```
+
+The reply message `0xD4BA5CCD` matches none of them, so a wildcard-routed reply
+falls through to wildcard endpoint resolution. Whether that resolves to
+`omega::ServerProxy` is unresolved, and the earlier attribution of the reply
+message ids was obtained under the disproven envelope reading.
+
+**NEW FAILURE BOUNDARY.** The failure is no longer "the server cannot speak the
+retail transport". It is now: *the client accepts nothing on the wildcard route
+beyond the three global messages, so a `D4BA5CCD` reply never reaches the D4
+handler.* The next stage to investigate is the client-initiated connection
+setup that the three global messages represent, in particular the payload
+contract of `0x8B0D492F` at `0x14042C910` and of `0x6731C5AF` at `0x14042C300`,
+and which endpoint the wildcard path resolves to. No speculative change was
+made to that stage.
+
+The complete suite passes **56/56** with these findings, and the working tree
+passes `git diff --check`.
