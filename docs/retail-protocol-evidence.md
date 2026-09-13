@@ -2156,3 +2156,159 @@ made to that stage.
 
 The complete suite passes **56/56** with these findings, and the working tree
 passes `git diff --check`.
+
+## Global connection bootstrap: the identification exchange (September 13)
+
+This section answers what the client's first global request is, what answers it,
+and how a routed endpoint is meant to be established. It supersedes the
+September 13 note in the transport section that listed the three global message
+ids only as dispatch cases.
+
+### Semantic names — CONFIRMED
+
+The client binary registers each global message id together with an interface
+signature string (`0x1404060AA`/`0x1404060FB`/`0x14040614E` store the id and the
+adjacent `lea` loads the name):
+
+```text
+0xA609E6A7  RequestIDIFace::RequestIDSignature
+0x6731C5AF  ReplyIDIFace::ReplyIDSignature
+0x8B0D492F  RequestIDIFace::IntroduceConnectionSignature
+```
+
+They live in the omega object system's name table next to
+`OmegaServerProxyObjectName`, `Close`, and `RequestClose`.
+
+### Proven directionality — CONFIRMED, by producer/consumer pairing
+
+Direction is not inferred from the mere existence of a handler. Each id has a
+serializer (producer) and a comparison in the receive dispatcher (consumer), and
+the producers form a closed exchange:
+
+| Id | Producer (serializer) | Only caller | Consumer (receive) |
+| --- | --- | --- | --- |
+| `0xA609E6A7` | `0x14045BA00` | `0x14042BC19` | `0x14042BCA0` |
+| `0x6731C5AF` | `0x14045BCD0` | `0x14042BECD`, `0x14042BFA4`, `0x14042C06D`, `0x14042C151`, `0x14042C208` | `0x14042C300` |
+| `0x8B0D492F` | `0x14045B620` | `0x14042C6B7` | `0x14042C910` |
+
+The decisive fact is where each producer is called **from**:
+
+```text
+0x14042BCA0  handler for an incoming 0xA609E6A7  ->  sends 0x6731C5AF
+0x14042C300  handler for an incoming 0x6731C5AF  ->  sends 0x8B0D492F
+```
+
+So the exchange is `RequestIDSignature` (client) → `ReplyIDSignature` (server) →
+`IntroduceConnectionSignature` (client). The pairing is defined by the binary
+itself, not by convention.
+
+### `0xD4BA5CCD` and `0x90F2D04D` re-verified — CONFIRMED as server → client
+
+Both ids occur **only** as comparisons in the `omega::ServerProxy` message
+dispatcher (`0x14045A71D` and `0x14045A216`). Neither has a serializer anywhere
+in the executable, so the client never produces them. Their direction is
+independently confirmed even though the route interpretation that originally
+introduced them was wrong.
+
+### Payload layouts — CONFIRMED
+
+`RequestIDSignature`, server-side parser `0x14042BCA0` (string at `0x14042BD56`
+through the length-prefixed string reader `0x1403FB300`, then eight bytes):
+
+```text
++0x00  encoded string   shard name ("castlehilltest" in every observed run)
++0x..  u64              session correlation, echoed by the reply
+```
+
+The captured real body is `0F 00 00 00 "castlehilltest" 00 | 0E 00 00 00 00 00 00 00`.
+The correlation is **not** the string length: two later runs carried `6` and
+`10` with the same 14-character name.
+
+`ReplyIDSignature`, client-side parser `0x14042C300`, which requires remaining
+length `2`, then a `u16`, then three strings, then eight bytes, then complete
+consumption:
+
+```text
++0x00  u16              route word; every producer site passes 0xFFFF
++0x02  encoded string
++0x..  encoded string
++0x..  encoded string
++0x..  u64              echoes the request correlation
+```
+
+`IntroduceConnectionSignature`, serializer `0x14045B620`, arguments
+`(out, u16 a, u16 b, struct*)`:
+
+```text
+envelope  u32 0x8B0D492F, u16 0xFFFF, u16 0xFFFF
++0x00  u16 a            client 0x14042C6AB: ObjectSurrogate + 0x28 local id
++0x02  u16 b            client 0x14042C6A5: the route word from the reply
++0x04  encoded string
++0x..  encoded string
++0x..  encoded string
++0x..  u64
+```
+
+### Route-registration mechanism — CONFIRMED
+
+`0x14042C910` is the receiver of `IntroduceConnectionSignature`. It parses two
+`u16` words and, through `0x140412180` / `0x140411D30`, stores the first as the
+connection's local route word and resolves the second to an object surrogate
+whose local id becomes the peer word, then inserts the composite receive key
+`(word 1, word 2)` for that connection. **These words originate on the client**,
+from its own object surrogate and from the route word carried in the server's
+`ReplyIDSignature`.
+
+The client's first request does not use that mechanism: `0x14045BA00`
+hardcodes the wildcard pair `0xFFFF`/`0xFFFF`, and the receiver recognises it at
+`0x14043CF9D` and branches to a dedicated wildcard path instead of the
+composite-key tree.
+
+### Runtime experiment — one reply, listen only
+
+`Holocron.Auth --probe-id-bootstrap` answers the client's global request with
+exactly one `ReplyIDSignature` (u16 `0xFFFF`, the shard name in all three string
+fields, request correlation echoed) and then only listens. Nothing else was
+changed: no D4, no ReplyGameLaunch, frozen transport codec, frozen compression.
+
+Two selections in one bounded run produced identical results:
+
+```text
+client  type 0x00  logical 39 bytes  RequestIDSignature name="castlehilltest" correlation=0x06 / 0x0A
+server  type 0x10  ReplyIDSignature 0x6731C5AF on route 0xFFFF/0xFFFF
+client  type 0x01  logical 8 bytes   transport time request, sequence 1
+client  no IntroduceConnection within the 20 s window
+client  HandleLaunchFailure 1003 about 104 ms after CS_LOGGING_IN
+state   initialized byte 0, settings Frame 0
+```
+
+**CONFIRMED — the reply is the paired response and moves the state machine.**
+The client's reply handler reaches `0x14042C50A`, compares the reply's `u16`
+against `0xFFFF`, takes the *equal* branch, and calls
+`0x1404123D0(connection, 2, 3)` — a connection state transition. That call is
+reached only because our reply carried `0xFFFF`.
+
+**CONFIRMED — the client sends its transport time request on this path.** No
+earlier run of ours ever observed a client `0x01` frame; it appears in both
+attempts here.
+
+**HYPOTHESIS — the bootstrap is still incomplete.** The client did not send
+`IntroduceConnectionSignature`, so no routed endpoint exists yet. The three
+string fields and the object produced by `0x14042D320` (called at `0x14042C437`,
+whose result is dereferenced at `0x14042C4EA` where a null bails to
+`0x14042C8D0`) are the next unknowns; the placeholder value used in this
+experiment was the shard name, and the binary's own server-side handler passes
+the literal `"???"` there.
+
+### NEW FAILURE BOUNDARY
+
+The failure is no longer "the client never answers the bootstrap". It is now:
+*the client accepts `ReplyIDSignature` and runs the connection transition, but
+does not emit `IntroduceConnectionSignature`, so no route is registered and no
+routed endpoint exists to deliver D4 to.* The next task is to recover the
+`ReplyIDSignature` string semantics and the `0x14042D320` object contract, then
+re-run this same one-reply experiment until the client emits
+`0x8B0D492F`; its two `u16` words are then the proven route pair for D4.
+
+Baseline after this task: **61/61** tests pass and the copied executable's
+resolver instruction was restored to `C7 06 00 04 00 00`.

@@ -7,10 +7,11 @@ Console.WriteLine("=================================================");
 
 bool capturePostHandshake = args.Length == 3 && args[2] == "--capture-post-handshake";
 bool probeLoginReplyEnvelope = args.Length == 3 && args[2] == "--probe-login-reply-envelope";
-if ((args.Length != 0 && args.Length != 2 && !capturePostHandshake && !probeLoginReplyEnvelope) ||
+bool probeIdBootstrap = args.Length == 3 && args[2] == "--probe-id-bootstrap";
+if ((args.Length != 0 && args.Length != 2 && !capturePostHandshake && !probeLoginReplyEnvelope && !probeIdBootstrap) ||
     (args.Length >= 1 && args[0] != "--test-key"))
 {
-    Console.Error.WriteLine("Usage: Holocron.Auth [--test-key /path/to/local-auth-key.pem [--capture-post-handshake|--probe-login-reply-envelope]]");
+    Console.Error.WriteLine("Usage: Holocron.Auth [--test-key /path/to/local-auth-key.pem [--capture-post-handshake|--probe-login-reply-envelope|--probe-id-bootstrap]]");
     return;
 }
 using RSA? testKey = args.Length >= 2 ? RSA.Create() : null;
@@ -21,7 +22,7 @@ if (testKey is not null)
 }
 var authServer = new AuthServer(port: 7979, worldHost: "127.0.0.1", worldPort: 20061,
     testKey: testKey, handshakeOnly: testKey is not null, capturePostHandshake: capturePostHandshake,
-    probeLoginReplyEnvelope: probeLoginReplyEnvelope);
+    probeLoginReplyEnvelope: probeLoginReplyEnvelope, probeIdBootstrap: probeIdBootstrap);
 using var cts = new CancellationTokenSource();
 
 Console.CancelKeyPress += (s, e) =>

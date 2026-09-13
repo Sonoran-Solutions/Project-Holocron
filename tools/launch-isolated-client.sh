@@ -49,7 +49,7 @@ exec flock -n -E 75 "$TEST/runner.lock" bwrap --unshare-user --unshare-net --uns
 
     "$DOTNET_ROOT/dotnet" /home/dq/project-holocron/src/Holocron.World/bin/Debug/net8.0/Holocron.World.dll > /opt/holocron-test/logs/world.log 2>&1 &
     world=$!
-    "$DOTNET_ROOT/dotnet" /home/dq/project-holocron/src/Holocron.Auth/bin/Debug/net8.0/Holocron.Auth.dll --test-key /opt/holocron-test/local-auth-key.pem ${HOLOCRON_AUTH_CAPTURE:+--capture-post-handshake} ${HOLOCRON_AUTH_LOGIN_REPLY:+--probe-login-reply-envelope} > /opt/holocron-test/logs/auth.log 2>&1 &
+    "$DOTNET_ROOT/dotnet" /home/dq/project-holocron/src/Holocron.Auth/bin/Debug/net8.0/Holocron.Auth.dll --test-key /opt/holocron-test/local-auth-key.pem ${HOLOCRON_AUTH_CAPTURE:+--capture-post-handshake} ${HOLOCRON_AUTH_LOGIN_REPLY:+--probe-login-reply-envelope} ${HOLOCRON_AUTH_ID_BOOTSTRAP:+--probe-id-bootstrap} > /opt/holocron-test/logs/auth.log 2>&1 &
     auth=$!
     python3 /home/dq/project-holocron/tools/install-private-platform-ca.py --prefix /opt/holocron-test/compatdata/pfx --proton /opt/private-proton/proton --certificate /opt/holocron-test/platform-ca.der > /opt/holocron-test/logs/platform-ca.log 2>&1
     python3 /home/dq/project-holocron/tools/local-platform.py --tls-cert /opt/holocron-test/platform-server-cert.pem --tls-key /opt/holocron-test/platform-server-key.pem --responses /home/dq/project-holocron/tools/fixtures/platform-responses.json > /opt/holocron-test/logs/platform.log 2>&1 &

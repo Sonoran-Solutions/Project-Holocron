@@ -47,12 +47,13 @@ public sealed class AuthServer
     private readonly bool _handshakeOnly;
     private readonly bool _capturePostHandshake;
     private readonly bool _probeLoginReplyEnvelope;
+    private readonly bool _probeIdBootstrap;
     private readonly long _timeBaseFileTimeMilliseconds;
     private readonly long _timeBaseStopwatchTimestamp;
 
     public AuthServer(int port = 7979, string worldHost = "127.0.0.1", int worldPort = 20061,
         RSA? testKey = null, bool handshakeOnly = false, bool capturePostHandshake = false,
-        bool probeLoginReplyEnvelope = false)
+        bool probeLoginReplyEnvelope = false, bool probeIdBootstrap = false)
     {
         _port = port;
         _worldHost = worldHost;
@@ -61,6 +62,7 @@ public sealed class AuthServer
         _handshakeOnly = handshakeOnly;
         _capturePostHandshake = capturePostHandshake;
         _probeLoginReplyEnvelope = probeLoginReplyEnvelope;
+        _probeIdBootstrap = probeIdBootstrap;
         _timeBaseFileTimeMilliseconds = DateTime.UtcNow.ToFileTimeUtc() / TimeSpan.TicksPerMillisecond;
         _timeBaseStopwatchTimestamp = Stopwatch.GetTimestamp();
     }
@@ -155,6 +157,11 @@ public sealed class AuthServer
 
             if (_handshakeOnly)
             {
+                if (_probeIdBootstrap)
+                {
+                    await ProbeIdBootstrapAsync(codec, endpoint, ct);
+                    return;
+                }
                 if (_probeLoginReplyEnvelope)
                 {
                     await ProbeLoginReplyEnvelopeAsync(codec, endpoint, ct);
@@ -344,6 +351,77 @@ public sealed class AuthServer
         catch (OperationCanceledException)
         {
             Console.WriteLine("[AUTH] Post-launch listen window completed.");
+        }
+    }
+
+    /// <summary>
+    /// Minimal falsifiable bootstrap experiment. The client's first global
+    /// request is answered with exactly one message - the reply its own binary
+    /// pairs with that request - and the server then only listens, so whatever
+    /// the client sends next is new behavioural evidence and not a reaction to
+    /// anything else we invented.
+    /// </summary>
+    private async Task ProbeIdBootstrapAsync(TransportCodec codec, string endpoint, CancellationToken ct)
+    {
+        TransportMessage? request = await codec.ReadAsync(ct);
+        if (request is null)
+        {
+            Console.WriteLine("[AUTH] Client closed without a post-handshake message.");
+            return;
+        }
+
+        byte[] body = request.Value.Payload;
+        uint messageId = body.Length >= 8 ? BinaryPrimitives.ReadUInt32LittleEndian(body) : 0u;
+        Console.WriteLine($"[AUTH] Bootstrap request: transport-type=0x{request.Value.Type:X2}, logical={body.Length} bytes, message=0x{messageId:X8}.");
+
+        if (messageId != IdentificationExchange.RequestIdSignature || body.Length <= 8)
+        {
+            Console.WriteLine($"[AUTH] Not the expected global request; stopping without replying.");
+            return;
+        }
+
+        (string shardName, ulong correlation) = IdentificationExchange.ReadRequestIdSignature(body.AsSpan(8));
+        Console.WriteLine($"[AUTH] RequestIDSignature: name=\"{shardName}\", correlation=0x{correlation:X16}.");
+
+        byte[] reply = IdentificationExchange.EncodeReplyIdSignature(
+            IdentificationExchange.WildcardRouteWord, shardName, shardName, shardName, correlation);
+        byte[] replyEnvelope = new byte[8 + reply.Length];
+        BinaryPrimitives.WriteUInt32LittleEndian(replyEnvelope, IdentificationExchange.ReplyIdSignature);
+        BinaryPrimitives.WriteUInt16LittleEndian(replyEnvelope.AsSpan(4), IdentificationExchange.WildcardRouteWord);
+        BinaryPrimitives.WriteUInt16LittleEndian(replyEnvelope.AsSpan(6), IdentificationExchange.WildcardRouteWord);
+        reply.CopyTo(replyEnvelope.AsSpan(8));
+        await codec.WriteAsync(0, replyEnvelope, ct);
+        Console.WriteLine($"[AUTH] Sent ReplyIDSignature: message=0x{IdentificationExchange.ReplyIdSignature:X8}, route=0xFFFF/0xFFFF, logical={replyEnvelope.Length} bytes.");
+
+        // Listen only. Any further frame is unprompted evidence about what the
+        // client does with the reply.
+        using var window = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        window.CancelAfter(TimeSpan.FromSeconds(20));
+        try
+        {
+            while (!window.Token.IsCancellationRequested)
+            {
+                TransportMessage? next = await codec.ReadAsync(window.Token);
+                if (next is null)
+                {
+                    Console.WriteLine("[AUTH] Client closed the connection.");
+                    break;
+                }
+
+                byte[] payload = next.Value.Payload;
+                uint nextId = payload.Length >= 4 ? BinaryPrimitives.ReadUInt32LittleEndian(payload) : 0u;
+                string detail = string.Empty;
+                if (nextId == IdentificationExchange.IntroduceConnectionSignature && payload.Length >= 12)
+                {
+                    (ushort first, ushort second) = IdentificationExchange.ReadIntroduceConnection(payload.AsSpan(8));
+                    detail = $", introduce-words=0x{first:X4}/0x{second:X4}";
+                }
+                Console.WriteLine($"[AUTH] Client follow-up: transport-type=0x{next.Value.Type:X2}, logical={payload.Length} bytes, message=0x{nextId:X8}{detail}, body={Convert.ToHexString(payload.AsSpan(0, Math.Min(payload.Length, 48)))}.");
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("[AUTH] Bootstrap observation window completed.");
         }
     }
 
