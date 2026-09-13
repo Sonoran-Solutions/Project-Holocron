@@ -267,10 +267,9 @@ public sealed class AuthServer
         // Full canonical configuration grounded in static disassembly and historical evidence:
         // - useSyncClock="true" enables the synchronized clock service.
         // - loglevel="debug" sets client logging severity.
-        // - additionalClientConfigs MUST contain "username=...;" because OmegaClientApp::HandleInitialized
-        //   (0x140121360 at 0x140121bf0) executes std::map::find(L"username"). If absent, 0x14011e5d0 returns NULL
-        //   and 0x140121c39 unconditionally dereferences it (cmp WORD PTR [rbx+rax*2], 0), causing an immediate
-        //   access violation (0xC0000005) crash in swtor.exe.
+        // - additionalClientConfigs contains the currently tested client identifiers. Static analysis found a
+        //   null-unsafe username lookup in HandleInitialized, but process-lifetime evidence disproves that
+        //   dereference as the active cause of the observed Auth-socket close.
         // - access-rights provides client and network subnet declarations parsed by HandleInitialized.
         byte[] initializationDocument = "<client title=\"Test Client\" useSyncClock=\"true\" loglevel=\"debug\" additionalClientConfigs=\"username=local-test;WorldName=he1012;SHARD_PUBLIC_NAME=he1012;\"><access-rights><client name=\"Automaton.exe\"><network name=\"BWA\" address=\"10.2.0.0/15\"/></client></access-rights></client>"u8.ToArray();
         int encodedStringLength = initializationDocument.Length + 1;

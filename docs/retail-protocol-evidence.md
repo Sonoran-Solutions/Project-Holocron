@@ -1618,39 +1618,25 @@ conditional on reaching a type-1 request; the candidate run did not reach it.
 
 ## Comprehensive static disassembly audit: ConnectionObject, ServerProxy, and ReplyGameLaunch (September 12)
 
-### Root Cause of 283ms Termination & Error 1003
+### Corrected attribution of the early close and error 1003
 
-Static disassembly of `swtor.exe` (SHA-256: `ad541a74...`) has definitively localized the failure of the nonempty D4 candidate (`0xD4BA5CCD`) that led to client termination after 283ms and visible error 1003 (`LOGIN_ERROR_FAILED_CONNECT_TO_LOGIN_SERVER`) in `Client_20260911T210632_308.log`.
+**DISPROVEN — process crash and active `username` null dereference.** A clean
+September 12 run left `swtor.exe` alive for more than two minutes after the
+Auth EOF. Wine/Proton emitted no `0xC0000005`, page fault, fatal signal, or
+client exit. The approximately 250--268 ms event is an Auth socket/ServerProxy
+close, not process termination. The unchecked `username` dereference at
+`0x140121C39` is real static code for a document that reaches
+`HandleInitialized` without that key, but the current document supplies
+`username=local-test;` and the surviving process disproves it as the active
+cause of this observed close.
 
-1. **Unchecked Null Pointer Dereference in `OmegaClientApp::HandleInitialized` (`0x140121360`):**
-   - At `0x140121af5` - `0x140121b10`, `HandleInitialized` looks up the root attribute `"additionalClientConfigs"`.
-   - `0x14011e860` parses this semicolon-delimited string (`key=value;...`) into the application configuration map at `[OmegaClientApp + 0xF0]`.
-   - At `0x140121b40`, the function loads wide string `L"username"` (`0x14156cbc8`).
-   - At `0x140121bf0`, it invokes `0x14011e5d0` (`std::map::find(L"username")`):
-     - If the key is found, `0x14011e5d0` returns a pointer to the value string buffer in `RAX`.
-     - If the key is absent, `0x14011e5d0` executes `0x14011e65b: xor eax, eax` and returns `NULL` (`0x0`).
-   - At `0x140121bf5`, `mov rbx, rax` stores the result in `RBX`.
-   - At `0x140121c2e` - `0x140121c39`, the code computes the string length:
-     ```x86asm
-     140121c2e: mov    rax, 0xffffffffffffffff
-     140121c35: lea    rax, [rax+0x1]
-     140121c39: cmp    WORD PTR [rbx+rax*2], 0x0
-     140121c3e: jne    0x140121c35
-     ```
-   - **Crucially, there is no null check on `RBX`.** If `additionalClientConfigs` does not contain `username=...;`, `RBX` is `0x0`. Instruction `0x140121c39` unconditionally dereferences address zero, triggering an immediate `0xC0000005` Access Violation (SIGSEGV / crash) in the retail executable!
-   - Because of this crash:
-     - `HandleInitialize completed.` at `0x140121ce1` is never logged.
-     - The initialized flag at `0x140121c7b` (`mov BYTE PTR [0x141bab4fa], 1`) is never set.
-     - `ConnectionObject::slot0` is never called.
-     - The socket closes prematurely on crash (EOF).
-
-2. **Error 1003 Attribution in `omega::ServerProxy::OnDisconnect` (`0x140427170`):**
-   - At `0x14042718e`, `ServerProxy::OnDisconnect` inspects `[ServerProxy + 0x78]`.
-   - `[ServerProxy + 0x78]` is the retained launch request context set during `ServerProxy::Login` (`0x140428183`).
-   - It is **only cleared** when `ReplyGameLaunch` (`0x90F2D04D`) is successfully received and dispatched (at `0x140427264` and `0x140427516`).
-   - If the connection disconnects while `[ServerProxy + 0x78]` is non-zero (whether due to a client crash, timeout, or server close), `0x1404271d6` loads error code `0x3eb` (1003 decimal) into `[rsp+0x40]` and calls `[rax+0x98]`.
-   - This invokes `OmegaClientApp::HandleLaunchFailure(1003)` at `0x140121fd0`, which formats and outputs:
-     `HandleLaunchFailure with error type 1003 : LOGIN_ERROR_FAILED_CONNECT_TO_LOGIN_SERVER`.
+**CONFIRMED — error 1003 is disconnect aftermath.** At `0x14042718E`,
+`ServerProxy::OnDisconnect` inspects the retained launch context at
+`ServerProxy +0x78`. If it is still present, `0x1404271D6` supplies decimal
+1003 and invokes the application's launch-failure callback. The context is
+cleared only by successful ReplyGameLaunch dispatch. Thus the visible 1003
+identifies an Auth disconnect before completed launch dispatch; it does not
+identify the original D4 rejection and is not evidence of a process crash.
 
 ### ConnectionObject Lifecycle State Machine
 
@@ -1688,7 +1674,10 @@ Extracted directly from RTTI Complete Object Locators in `.rdata`:
     - Parses XML via `0x14040d4d0`.
     - Installs Frame and inspects `loglevel`, `logconfig`, `useSyncClock`, `addresses`, `ports` via `0x140446c90`.
     - If `useSyncClock` is true, initializes clock service (`0x140467bd0`).
-    - Calls `OmegaClientApp::HandleInitialized` (`0x140121360`, `OmegaClientApp::slot1`).
+    - Calls the connection object's slot 0 (`0x140135D20`) at `0x140427B84` after settings processing.
+    - `0x140447470` reaches `OmegaClientApp::HandleInitialized` (`0x140121360`)
+      only through the configured `<objects>` / `<globalobject>` loop; it is
+      not an unconditional direct call from the D4 handler.
 
 - **Base 5: `AuthorizationReplyIFace`** (mdisp = `0x20`, COL `0x141702110`, vtable `0x1414b66a8`):
   - Slot 0 (`+0x00`): `0x140427220` — Handles ReplyGameLaunch (`0x90F2D04D`):
@@ -1719,3 +1708,169 @@ Extracted directly from RTTI Complete Object Locators in `.rdata`:
      - `<access-rights><client name="Automaton.exe"><network name="BWA" address="10.2.0.0/15"/></client></access-rights>`
    - The server immediately transmits ReplyGameLaunch (`0x90F2D04D`) on routes `0xE6A7/0xE800` containing `{worldHost}:{worldPort}`.
    - The server maintains an asynchronous receive loop for transport control frames; when type `0x01` arrives from the background timer, the server replies with type `0x02` (TransportTimeSync base response echoing the sequence and millisecond clock).
+
+### Runtime validation of canonical `additionalClientConfigs` and immediate ReplyGameLaunch (September 12)
+
+**CONFIRMED — resolver and encrypted-envelope boundary.** A clean isolated
+private-client run, with only the documented copied-client `AI_ADDRCONFIG`
+adjustment active, selected `Holocron Local Test`, connected to Auth, received
+the 22-byte greeting, completed the 522-byte RSA handshake, and sent:
+
+```text
+client  type 0x10, message 011C5800, route E800/E6A7
+```
+
+This removes the previously observed no-socket failure from consideration for
+this run. The test-only resolver bytes were restored after validation.
+
+**CONFIRMED — server transmission order.** Auth then sent, in order, one
+encrypted D4 response followed immediately by one encrypted ReplyGameLaunch:
+
+```text
+server  type 0x10, message D4BA5CCD, route E6A7/E800, 298 bytes
+server  type 0x10, message 90F2D04D, route E6A7/E800, 39 bytes
+```
+
+The D4 document used the current canonical
+`additionalClientConfigs="username=local-test;WorldName=he1012;SHARD_PUBLIC_NAME=he1012;"`
+value. ReplyGameLaunch used `127.0.0.1:20061` plus its parser-valid empty
+second string. No type-`0x01` gate was used.
+
+**DISPROVEN as a complete behavioral explanation — missing `username` alone.**
+The client closed the Auth socket approximately 268 ms after entering
+`CS_LOGGING_IN`, before a type-`0x01` frame, the `Game launch reply address`
+log, `HandleInitialize completed`, `CS_APP_INITIALIZED`, or any World socket
+connection. The visible result remained error 1003. This is materially the
+same early boundary as the prior roughly 283 ms failure, despite transmission
+of a D4 document containing `username`.
+
+The static null-dereference remains a **HYPOTHESIS** for documents whose
+parsed configuration map lacks `username`; this run does not directly expose
+the client map and therefore cannot prove whether that field was installed
+before another D4 initialization failure. It does, however, show that adding
+the field does not by itself advance this retail run.
+
+**HYPOTHESIS — next deepest boundary.** Failure occurs during D4 handling,
+before `AuthorizationReplyIFace::ReplyGameLaunch` dispatch and before shard
+connection. Preserve the D4 field set, immediate launch ordering, and
+asynchronous type-`0x01` handler. The next investigation must distinguish the
+D4 XML parse/install path from `OmegaClientApp::HandleInitialized` without
+randomly changing XML fields or treating error 1003 as the original rejection.
+
+## Exact current-config D4 path and correction decision (September 12)
+
+### Process lifetime discriminator
+
+**BEHAVIORALLY CONFIRMED — socket close, not process crash.** In the clean
+current-config run beginning at 07:53, Auth sent the 298-byte D4 frame and the
+39-byte ReplyGameLaunch frame. The client entered `CS_LOGGING_IN`, reported
+1003 about 250 ms later, and closed only the Auth connection. `swtor.exe`
+remained alive for more than two minutes. Its log continued to receive platform
+events, and Wine/Proton reported no `0xC0000005`, page fault, fatal signal, or
+process exit. This directly resolves the earlier 268 ms ambiguity and makes
+the crash explanation **DISPROVEN** for the observed event.
+
+### First concrete failure on the current XML path
+
+**CONFIRMED — static current-config branch.** The D4 success handler at
+`0x1404279D0` parses the nonempty string, obtains the Frame, and calls
+`0x140446C90` at `0x140427B3D`. `0x140446C90` installs the Frame at
+`ApplicationImpl +0xF0` (`0x140446D8F`) and calls
+`ApplicationImpl::HandleSettings` at `0x140447470` (`0x140446E7A`).
+
+`HandleSettings` looks for the root child element `objects` at `0x140448E36`.
+The current D4 XML has no such child. The null result is tested at
+`0x140448EA4`, and `0x140448EA7` branches to cleanup/return at `0x140449FF4`.
+That branch skips the global-object loop and therefore never dispatches the
+application object's virtual slot `+0x08`, whose `OmegaClientApp` target is
+`HandleInitialized` at `0x140121360`. The global initialized byte
+`0x141BAB4FA`, which `HandleInitialized` would set at `0x140121C7B`, remains
+zero.
+
+After settings processing, the D4 handler calls the connection object's slot 0
+at `0x140427B84`. `ConnectionObject::slot0` (`0x140135D20`) checks the
+application error byte and then reads the initialized byte at
+`0x140135D43`. The zero result makes the conditional branch at
+`0x140135D4A` go to `0x140135DB0`; with error value 3 it loads virtual slot
+`+0x20` at `0x140135DB8` and tail-calls the connection failure/close path.
+
+The first failing function is therefore **`ConnectionObject::slot0` at
+`0x140135D20`**. The first concrete failing check is the initialized-byte read
+at **`0x140135D43`**, with its zero branch at **`0x140135D4A`**. The explicit
+failure dispatch is **`0x140135DB8`**. Error 1003 is subsequently synthesized
+by `ServerProxy::OnDisconnect`; it is not this internal error value and is not
+the root cause.
+
+### Null-unsafe and mandatory accesses in `OmegaClientApp::HandleInitialized`
+
+The table is limited to settings actually touched by `0x140121360`. It does
+not imply that this function is reached by the current XML; the missing
+`objects` branch above prevents that callback.
+
+| Setting/key | Lookup address | Missing-value behavior |
+| --- | --- | --- |
+| `access-rights` | `0x1401213B4` | Safe on this path: logs that it is not configured, then continues at `0x140121AEE`. |
+| child `client` | `0x14012154E` | Safe: absent child skips the access-rights iteration. |
+| child `network` | `0x1401215B2` | Safe: absent child skips the network loop. |
+| `client/@name` | `0x1401215FD` | Conditionally unsafe when a network record exists; null is later dereferenced at `0x14012186A`. |
+| `network/@name` | `0x140121671` | Conditionally unsafe when a network record exists; null is dereferenced at `0x1401217C9`. |
+| `network/@address` | `0x1401216D5` | Conditionally unsafe when a network record exists; null is dereferenced at `0x140121724`. |
+| `additionalClientConfigs` | `0x140121B10` | Missing/empty input produces no parsed entries; the later mandatory `username` lookup then returns null. |
+| `username` | `0x140121BF0` | Unsafe if the callback is reached without the key: null from `0x14011E65B` is dereferenced at `0x140121C39`. Current XML supplies it. |
+| `WorldName` | not touched | Not read by this function; no requirement established here. |
+| `SHARD_PUBLIC_NAME` | not touched | Not read by this function; no requirement established here. |
+| `repositoryserver` | not touched | Not read by this function; no requirement established here. |
+| `worldserver` | not touched | Not read by this function; no requirement established here. |
+
+The object dereference through `[r12+0x80]` at `0x140121E55` is not a config
+lookup and occurs after the initialized byte is set and the completion log is
+dispatched. It cannot explain the current absence of `HandleInitialize
+completed`.
+
+### Historical comparison and ReplyGameLaunch boundary
+
+**CONFIRMED — historical source cannot supply the missing representation.**
+`research/SwTor-1.3/server/WorldServer/Src/Logic/Senders/Client.cpp` supplies
+the access-rights hierarchy and many root attributes, but it contains neither
+an `objects` subtree nor `username`. It is an older-client reference and does
+not establish the current retail global-object `code` value. Copying its full
+initializer would therefore be speculation rather than a focused correction.
+
+**CONFIRMED — ReplyGameLaunch is downstream and independent of the D4 failure.**
+`0x140427220` is a separate message dispatch. No instruction in the missing-
+`objects` branch or the initialized-byte failure check consumes its strings or
+depends on its timing. `ServerProxy +0x78` remains retained until the reply is
+successfully dispatched; the later disconnect merely converts that retained
+context into visible error 1003. D4 opcode/routes, immediate ReplyGameLaunch,
+type `0x01`/`0x02`, and launch ordering remain frozen.
+
+### Focused correction experiments
+
+**DISPROVEN — `<globalobject name="$appname"/>` is sufficient.** A clean run
+with only `<objects><globalobject name="$appname"/></objects>` added sent a
+348-byte D4 envelope. The client closed Auth at the same boundary and emitted
+neither `HandleInitialize completed` nor `CS_APP_INITIALIZED`. Static control
+flow also shows that an absent `code` supplies an empty module key to
+`0x1404416D0`; a null return branches at `0x14044910D` to the application
+failure callback at `0x1404495EF`.
+
+**DISPROVEN — `code="HeroEngine"` is sufficient.** The local `swtor.icb`
+installs and starts `HeroEngine`, making it a focused candidate rather than a
+random historical attribute. A second clean run used exactly
+`<objects><globalobject name="$appname" code="HeroEngine"/></objects>` and
+sent a 366-byte D4 envelope. It produced the same Auth close and error 1003,
+with no completion marker and no World connection. The experiment was reverted;
+the production D4 XML and its focused test remain unchanged.
+
+**CONFIRMED — correction decision.** The required configuration concept is a
+root `objects` entry whose `globalobject` resolves the already-running
+application object and invokes virtual slot `+0x08`. The exact accepted
+current-retail `code`/representation is not recovered by the historical source,
+and both evidence-derived minimal candidates failed runtime validation.
+Consequently **no one-field correction is justified or retained**. The next
+one-field correction is `none` until an accepted object descriptor is recovered;
+adding another guessed field would violate the focused-change criterion.
+
+The final full-suite baseline remains **47/47**. The copied executable's
+temporary resolver instruction was restored to `C7 06 00 04 00 00` after
+each run.
