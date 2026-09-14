@@ -5403,3 +5403,112 @@ it does not rearm itself                                      CONFIRMED
 callee semantics                                              UNKNOWN
 transitive reachability to the historical chain               UNKNOWN
 ```
+
+---
+
+## `boundobj+0x260` is a deferred-destruction stack, and the 5 ms callable drains it (September 13)
+
+### The bound object, proven by RTTI
+
+The 5 ms registration binds `rdi` from `0x14042F960`. The constructor at
+`0x1404292E0` installs `0x1414B6798` at `[rcx]`, and `0x1414B6798 - 8` is a COL
+(signature 1, moffset 0) whose type descriptor reads:
+
+```text
+.?AVObjectManagerImpl@omega@@
+```
+
+```text
+bound object = omega::ObjectManagerImpl      COL 0x141702418
+allocated by 0x140405F20 (0x360 bytes), built by ctor 0x1404292E0
+```
+
+The same constructor zeroes `+0x220`, `+0x228`, `+0x238`, `+0x248` and `+0x260`,
+and sets `+0x258 = 1`. That is why the poller-tile fields and the object-manager
+fields had been conflated: they belong to this one class, not to the application
+object.
+
+### The producer, and what its return value means
+
+`0x140406530` is the push:
+
+```asm
+140406540  mov  rdi, qword ptr [rcx + 8]      ; rdi = ObjectManagerImpl
+140406547  mov  rax, qword ptr [rax + 0x28]   ; virtual call on the retired obj
+14040654B  call qword ptr [rip + 0xf6476f]
+140406551  add  rbx, 0x30                     ; node = obj + 0x30
+140406555  prefetchw byte ptr [rdi + 0x260]
+140406560  mov  rcx, qword ptr [rdi + 0x260]  ; CAS retry
+140406567  mov  qword ptr [rbx], rcx          ; node->next = head
+14040656D  lock cmpxchg qword ptr [rdi + 0x260], rbx
+140406576  jne  0x140406560
+14040657D  test rcx, rcx
+140406580  sete al                           ; returns (old_head == NULL)
+```
+
+The `sete al` is the interesting part. The push reports **whether the stack was
+empty before this element**, which is exactly the condition a caller needs to
+decide "I am the first retirement, so a drain must be scheduled". The consumer
+`0x140430800` is the mirror image: one `lock cmpxchg` of the head to `NULL`, then
+a walk of the stolen list via `element+0x30`.
+
+```text
+boundobj+0x260 = lock-free LIFO stack of objects awaiting destruction
+intrusive link embedded at element+0x30, element base = node-0x30
+```
+
+### At least two manager instances share the idiom
+
+`0x14043A390` performs the same `lock cmpxchg` on `+0x260` but pairs it with a
+*different* queue at `+0x168`/`+0x164` on another instance, and re-installs a
+vtable of its own at `0x1414B69A8`. So the deferred-destroy stack is a reusable
+idiom in this object manager family, not a one-off. How many instances exist is
+`UNKNOWN`.
+
+### Terminology retracted
+
+```text
+0x14043B5D0                       "per-element teardown"   HYPOTHESIS
+element vtable+0x30               "virtual destructor"     HYPOTHESIS
+```
+
+`0x14043B5D0` has a full prologue and takes a critical section at
+`[rcx+0x80]+0x10`; it is an ordinary image function whose body has only been
+read at its head. The `vtable+0x30` slot is called by both
+`0x140430800` and `0x14043A390` on retiring objects, and `0x14043A390` also
+calls `vtable+0x28` and `vtable+0x00`; which of these is a destructor, a release,
+or a detach is not established.
+
+### The 5 ms period is a drain deadline, not a poll interval
+
+`0x140430800` contains no polling whatsoever — no state test, no comparison, no
+periodic re-evaluation. It steals a batch and destroys it. Combined with the
+producer's "was the stack empty" return, the natural reading is a **coalescing
+window**: the first retirement arms the timer, later retirements accumulate, and
+one drain pass collects the batch. The callable does not rearm itself
+(`CONFIRMED`), so the periodicity must come from the framework or from each new
+first-push.
+
+This replaces the earlier framing of the 5 ms operation as a connection-state
+poller. It was never polling anything.
+
+### What this does and does not establish about the historical chain
+
+```text
+boundobj = omega::ObjectManagerImpl                    CONFIRMED
+boundobj+0x260 is a deferred-destruction LIFO stack    CONFIRMED
+producer 0x140406530, push with link at element+0x30   CONFIRMED
+consumer 0x140430800 drains it                         CONFIRMED
+5 ms is a coalescing drain deadline                    HYPOTHESIS
+element concrete class(es)                             UNKNOWN
+0x14043B5D0 semantics                                  UNKNOWN
+element vtable+0x00/+0x28/+0x30 semantics              UNKNOWN
+transitive path to 0x1404245F0 or 0x140434430          UNKNOWN
+```
+
+The last line is unchanged from the previous correction and was not resolved
+here. What *has* changed is that the elements are now known to be objects being
+**retired for destruction** by an object manager, which makes a connection to
+connection/route teardown plausible but still unproven.
+
+**No server behaviour was changed and D4 was not sent.**

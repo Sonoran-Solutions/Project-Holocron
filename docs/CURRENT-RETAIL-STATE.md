@@ -568,6 +568,107 @@ list, issues the two calls per element, and returns. Whether the surrounding
 framework re-arms the operation is `UNKNOWN`; the callable itself is one-shot.
 `CONFIRMED`
 
+### The bound object is `omega::ObjectManagerImpl`
+
+`CONFIRMED` from the constructor `0x1404292E0`:
+
+```asm
+14042930F  lea rax, [rip + 0x108d482]     ; -> 0x1414B6798
+140429316  mov qword ptr [rcx], rax       ; install vtable
+14042930B  mov qword ptr [rcx + 8], rdx   ; +0x08 = owner/app back-pointer
+```
+
+`0x1414B6798 - 8` is a COL with signature 1, `moffset 0`, whose type descriptor
+reads:
+
+```text
+.?AVObjectManagerImpl@omega@@
+```
+
+```text
+bound object class = omega::ObjectManagerImpl     CONFIRMED (COL 0x141702418)
+allocation site    = 0x140405F20 (0x360 bytes), constructor 0x1404292E0
+```
+
+This supersedes "ClientApplicationImpl-related". The earlier assumption that the
+5 ms registration's bound object was the application object was wrong; the
+constructor at `0x1404292E0` also zeroes `+0x220`/`+0x228`/`+0x238`/`+0x248` and
+sets `+0x258 = 1`, which is why the two were conflated.
+
+### The list at `boundobj+0x260` is a lock-free deferred-destruction stack
+
+`CONFIRMED`. The producer is `0x140406530`:
+
+```asm
+140406540  mov  rdi, qword ptr [rcx + 8]      ; rdi = ObjectManagerImpl
+140406547  mov  rax, qword ptr [rax + 0x28]   ; virtual call on [rdx]
+14040654B  call qword ptr [rip + 0xf6476f]
+140406551  add  rbx, 0x30                     ; rbx = node->link (link at +0x30)
+140406555  prefetchw byte ptr [rdi + 0x260]
+140406560  mov  rcx, qword ptr [rdi + 0x260]  ; <-- CAS retry label
+140406567  mov  qword ptr [rbx], rcx          ; node->next = head
+14040656A  mov  rax, rcx
+14040656D  lock cmpxchg qword ptr [rdi + 0x260], rbx   ; push
+140406576  jne  0x140406560
+14040657D  test rcx, rcx
+140406580  sete al                           ; returns (old_head == NULL)
+140406588  ret
+```
+
+The consumer in `0x140430800` is the exact mirror: it atomically exchanges the
+head with `NULL` and walks the list via `element+0x30`. So `boundobj+0x260` is a
+**lock-free LIFO stack of objects awaiting destruction, with the intrusive link
+embedded at object offset `0x30`**.
+
+Key consequences:
+
+```text
+element base      = stored node pointer - 0x30
+link offset       = element + 0x30
+push              = CAS loop, node->next = head; head = node
+pop-all           = one lock cmpxchg head -> NULL
+producer returns  = (old head == NULL), i.e. "was the stack empty before me?"
+```
+
+That return value is the arming signal: the caller uses "I pushed onto an empty
+stack" to decide whether a drain must be scheduled. `HYPOTHESIS` (strongly
+supported by shape; the caller's use of `al` was not followed to its branch).
+
+A second, structurally identical producer exists at `0x14043A390`, which also
+does a lock `cmpxchg` of `+0x260` but pairs it with a *different* queue at
+`+0x168`/`+0x164` on another manager instance. At least two manager instances use
+this same deferred-destroy idiom, so the pattern is a reusable one rather than a
+one-off. `CONFIRMED` that the idiom repeats; `UNKNOWN` how many instances exist.
+
+### Correction: `0x14043B5D0` is a real image function, and the "one call per element" label was premature
+
+`0x14043B5D0` has a full prologue (`push rbp/rbx/rsi/rdi/r12-r15`, `sub rsp,
+0x808`) and takes a critical section at `[rcx+0x80]+0x10`; it is an ordinary
+image function, not a thunk. Its complete semantics are **UNKNOWN** — only its
+head was read. The earlier label "per-element teardown" remains `HYPOTHESIS`.
+
+Likewise `element vtable+0x30` is **`HYPOTHESIS`, not proven to be a
+destructor**. What is established is only that `0x14043A390` calls the same
+`vtable+0x30` slot on objects it is retiring, and that `0x14043A390` also calls
+`vtable+0x28` (retain/release-shaped) and `vtable+0x00` (per-object work)
+elsewhere. Resolving `vtable+0x00/+0x28/+0x30` against a concrete element class
+is the next required step.
+
+### The 5 ms timer is a coalescing drain deadline
+
+`0x140430800` performs no polling at all: it steals and destroys. Combined with
+the producer's `sete al` (armed only when the stack was empty), the 5 ms period
+reads as **a coalescing window**: the first retirement arms the timer, further
+retirements pile onto the stack during the window, and 5 ms later the whole
+batch is drained in one pass. `0x140430800` does not rearm itself (`CONFIRMED`).
+
+```text
+5 ms operation = deferred-destruction drain deadline (coalescing)
+```
+
+`HYPOTHESIS` for the coalescing reading; `CONFIRMED` that the callable only
+drains and never polls, and that it does not rearm itself.
+
 ### The operation object produced by the factory, byte-for-byte
 
 `0x1404595E0` allocates **`0x78`** bytes and constructs the operation
