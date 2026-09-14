@@ -6562,3 +6562,212 @@ write dispatch -> WSASend 0x140A82CB0                                 UNKNOWN
 That single unresolvable hop does not change the classification: every layer that
 *was* resolved is a transmit path, and the Close envelope is produced upstream of
 all of it.
+
+## `0x1404245F0` identified: the per-owner deferred element drain (September 13)
+
+The causal boundary was pushed back one layer. `0x1404245F0` is no longer
+"collection teardown" generically; it is a concrete drain with a concrete
+registration site.
+
+### Extent and unwind structure
+
+```text
+0x1404245F0 - 0x140424749    0x159 bytes, 71 instructions reached
+exactly ONE .pdata RUNTIME_FUNCTION: begin=0x1404245F0 end=0x140424749
+no chained entries with the same BeginAddress, so the extent is unambiguous
+```
+
+### Complete pseudocode
+
+```c
+// rcx = owner.  Lock at owner+0xC0, circular-list sentinel at owner+0xF0,
+// registered-operation shared_ptr at owner+0x100/+0x108.
+void Owner::drain_pending_elements() {
+    EnterCriticalSection(&owner->[0xC0]);          // 0x140424620
+
+    owner->[0x100] = NULL;                         // 0x14042463E  clear handle
+    owner->[0x108] = NULL;                         // 0x14042464C
+    destroy_shared(old_handle);                    // 0x1400B79F0   // 0x14042465D
+
+    int n = 0;                                     // edi = -1, then ++ per node
+    Node* s = &owner->[0xF0];
+    for (Node* p = s->next; p != s; p = p->next)   // 0x140424662..0x140424679
+        n++;
+
+    LeaveCriticalSection(&owner->[0xC0]);          // 0x140424683
+
+    for (;;) {                                     // 0x1404246A8
+        if (n == 0) return;                        // 0x1404246AA
+
+        // jiffies / 100ns-time read; signed compare gates the loop
+        //   0x1404246D0..0x14042470C: KUSER_SHARED_DATA retry, magic-divide,
+        //   then `jns` back to the epilogue when the result is negative
+        if (now_is_negative()) return;
+
+        Node* e = pop_front(&owner->[0xF0]);        // 0x140424711 -> 0x140424550
+        if (e) {
+            void* o = (char*)e - 8;
+            (*(void***)o)[0x08/8](o);               // 0x140424728  vtable+0x08
+            (*(void***)o)[0x00/8](o, /*edx=*/1);    // 0x14042473C  vtable+0x00
+        }
+        n--;                                        // 0x140424742
+    }
+}
+```
+
+`0x140424550` (`0x140424550 - 0x1404245E1`) is the pop helper: it takes the same
+`owner+0xC0` lock, unlinks the first real node from the circular list at
+`owner+0xF0` (`node->next` at `+0x00`, `node->prev` at `+0x08`), releases the lock,
+and returns `node - 8`.
+
+```text
+collection      circular doubly-linked list, sentinel at owner+0xF0
+element         node - 8; killed through its own vtable
+destroy seq     vtable+0x08(o) then vtable+0x00(o, 1)
+lock            owner+0xC0 in both the drain and the pop helper
+```
+
+### The single materialisation site
+
+`xref_le64(0x1404245F0)` returns **0**. There is no raw 8-byte pointer to it
+anywhere, which is exactly why the earlier raw-pointer scan failed. The only
+address materialisation in the image is one `lea`:
+
+```asm
+; fn 0x1403FC0B0 - 0x1403FC204
+1403fc11a  lea  rax, [rip + 0x284cf]      ; -> 0x1404245F0     <-- the only site
+1403fc121  mov  [rsp + 0x40], rax         ; callable slot 0
+1403fc126  mov  [rsp + 0x48], rsi         ; bound object = the owner
+1403fc12b  mov  [rsp + 0x50], rbp         ; NULL
+1403fc13b  lea  rcx, [rsp + 0x40]
+1403fc140  call 0x1400c37b0               ; closure validity/ownership check
+1403fc14e..1403fc15e  (on the false path) lea rax,[0x1414b6550]; or rax,1;
+                                             mov [rsp+0x50], rax
+1403fc16a  mov  byte ptr [rsp + 0x20], 0  ; registration flag = 0
+1403fc16f  xor  r9d, r9d                  ; timeout = 0
+1403fc172  lea  r8,  [rsp + 0x50]         ; callable
+1403fc177  lea  rdx, [rsp + 0x40]         ; closure
+1403fc17c  mov  rcx, rsi                  ; owner
+1403fc17f  call 0x140423b50               ; REGISTRATION
+1403fc185  mov  rdx, rax
+1403fc188  lea  rcx, [rsi + 0x100]
+1403fc18f  call 0x1400c67e0               ; shared_ptr move into owner+0x100
+```
+
+So the framework **is** `0x140423B50` — this is answer (A)+framework for Phase 3,
+and the callable is a `{fn|1, owner}` closure of the same three-slot shape the
+notebook already recorded for the historical `0x140423DD0` operation.
+
+### The same function also inserts the elements
+
+`0x1403FC0B0` does both halves of the producer contract:
+
+```c
+Owner* owner = *rcx;                       // rsi
+EnterCriticalSection(&owner->[0xC0]);      // 0x1403FC0E3
+Node* s = &owner->[0xF0];
+node->[0x10] = s->prev;                    // 0x1403FC0F5
+node->[0x08] = s;                          // 0x1403FC0FD
+s->prev->next = &node->[0x08];             // 0x1403FC108
+s->prev = &node->[0x08];                   // 0x1403FC100
+if (owner->[0x100] == NULL) {              // 0x1403FC10D
+    /* the materialisation + 0x140423B50 registration above */
+}
+LeaveCriticalSection(...);                 // and the epilogue
+```
+
+So `0x1404245F0` is armed by the **first** element insertion and is the drain
+that then destroys the elements. It has 12 callers, all inside
+`0x140435CE0`-`0x1404385D0`, each an "add one element, arm if idle" site.
+
+### The inbound dispatcher, complete
+
+`0x14042B990 - 0x14042BB20`, read from its `cmp r9d, <opcode>` chain:
+
+```text
+opcode        handler             message
+0xA609E6A7    0x14042BCA0         RequestIDSignature
+0x6731C5AF    0x14042C300         ReplyIDSignature
+0x8B0D492F    0x14042C910         IntroduceConnection
+0x43DB3479    0x14042BAC5 edx=1 r8d=0 -> 0x1404123D0(conn,1,0)   Close
+0x598D9A7     0x14042BAD5 edx=0 r8d=0 -> 0x1404123D0(conn,0,0)   RequestClose
+```
+
+This reproduces the earlier finding that an inbound *Close* is routed with
+`arg2 = 1` (no reply envelope) while inbound *RequestClose* is routed with
+`arg2 = 0`.
+
+Both `0x14042C300` (ReplyIDSignature) and `0x14042C910` (IntroduceConnection)
+reach `0x140412180`, which attaches the routed peer and feeds the element list:
+
+```asm
+14042c754  lock cmpxchg qword ptr [rdx + 0x88], rdi   ; attach to conn+0x88
+```
+
+`0x140412180` is also the only caller of `0x140435CE0`, which is the only caller
+of `0x1403FC0B0`. So the element list is fed from the inbound RequestIDSignature
+and IntroduceConnection handler paths.
+
+### `0x140434430` is a vtable slot, not an LEA
+
+A different materialisation shape from `0x1404245F0`:
+
+```text
+xref_le64(0x140434430) = [0x1414B6940]      (one raw pointer, in a vtable)
+xref_indexed(0x140434430) = []              (no lea, no direct call)
+```
+
+The containing table resolves cleanly:
+
+```text
+vtable base      0x1414B6938
+COL              0x1417029F8   (self-pointer verified)
+class            omega::ObjectSurrogateEventConnectionOpen
+slot             0x140434430 sits at vtable+0x08
+bases            ObjectSurrogateEventConnectionOpen
+                 ObjectSurrogateEvent
+                 ApartmentEvent
+                 eastl::intrusive_list_node   (mdisp 0, pdisp 8)
+```
+
+`0x140434430` reads `[this+0x18]` and `[this+0x20]`, and for the object at
+`[[this+0x18]+0x100]` invokes `vtable+0x28` and then `vtable+0x70`, each time
+passing a copy of the `[this+0x20]` intrusive pointer, and skips the second call
+when the first returns non-zero. Its sibling at the same vtable base,
+`0x1404344F0`, is the scalar deleting destructor (releases `+0x20` and `+0x18` via
+`vtable+0x30` and calls `operator delete` with `edx = 0x28`), so the class'
+instances are 0x28 bytes.
+
+```text
+0x140434430 = a virtual method of omega::ObjectSurrogateEventConnectionOpen
+              that notifies the listener at [[this+0x18]+0x100] with the
+              captured value at [this+0x20]
+              CONFIRMED as to identity/class; the full semantics of the two
+              notified slots (vtable+0x28, vtable+0x70) are UNKNOWN
+```
+
+Note this is an *event/notification* object, and its base list includes
+`eastl::intrusive_list_node`, consistent with it living in a collection — but it
+is not itself the owner of the `0x1404245F0` collection.
+
+### What is now fixed vs still open
+
+```text
+0x1404245F0 materialisation site      0x1403FC11A inside 0x1403FC0B0   CONFIRMED
+0x1404245F0 registration framework    0x140423B50, r9d = 0 (no timeout) CONFIRMED
+0x1404245F0 bound argument            the owner object (rsi)             CONFIRMED
+0x1404245F0 complete pseudocode       drain + destroy list elements     CONFIRMED
+0x1404245F0 collection                circular list at owner+0xF0,
+                                      lock owner+0xC0                   CONFIRMED
+0x1404245F0 element type              node - 8, destroyed via vtable    UNKNOWN name
+0x140434430 identity                  vtable slot of
+                                      omega::ObjectSurrogateEventConnectionOpen
+                                                                        CONFIRMED
+0x140434430 -> 0x14040AEC0 dispatch   UNKNOWN (not direct, not via vtable
+                                      adjacency in the same table)
+first non-cleanup decision            still UPSTREAM / UNKNOWN
+primary failure vs secondary cleanup  UNKNOWN
+D4                                    UNKNOWN
+```
+
+**No server behaviour was changed, no breakpoint was placed, and D4 was not sent.**

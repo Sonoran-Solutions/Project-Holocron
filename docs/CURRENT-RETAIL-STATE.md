@@ -42,6 +42,155 @@ transitive path to 0x1404245F0 / 0x140434430                           UNKNOWN
 
 ---
 
+## The `0x1404245F0` teardown path — newly recovered (this pass)
+
+The causal boundary remains upstream and was pushed back one layer this pass.
+`0x1404245F0` is now identified concretely.
+
+```text
+0x1404245F0 = the deferred DRAIN of a per-owner element list      CONFIRMED
+its single materialisation is 0x1403FC11A, inside 0x1403FC0B0     CONFIRMED
+it is registered through 0x140423B50 with r9d = 0 (no timeout)    CONFIRMED
+the registration site is the same function that ADDS to the list  CONFIRMED
+```
+
+### What `0x1404245F0` does
+
+Function extent `0x1404245F0 - 0x140424749` (0x159 bytes, single `.pdata` record,
+no chained unwind entries), 71 instructions.
+
+```c
+// rcx = owner.  Returns void.  Lock is at owner+0xC0, list sentinel at owner+0xF0.
+void Owner::drain_pending() {
+    EnterCriticalSection(&owner->[0xC0]);
+    owner->[0x100] = NULL;            // clear the registered-operation handle
+    owner->[0x108] = NULL;
+    destroy_shared(owner->[0x100]);   // 0x1400B79F0 on the old handle
+
+    int n = 0;                        // count elements in the circular list
+    Node* s = &owner->[0xF0];
+    for (Node* p = s->next; p != s; p = p->next) n++;
+
+    LeaveCriticalSection(&owner->[0xC0]);
+
+    while (n != 0) {
+        // 0x1404246A8 is the gate; 0x1404246D0..0x14042470C is the jiffies read
+        if (now_ms() < 0) return;                 // abort the drain
+
+        Node* e = pop_front(&owner->[0xF0]);      // 0x140424550
+        if (e) {
+            Node* o = e - 8;                      // container_of
+            (*o)[0x08](o);                        // vtable+0x08
+            (*o)[0x00](o, 1);                     // vtable+0x00 with edx=1
+        }
+        n--;
+    }
+}
+```
+
+`0x140424550` (the pop helper, `0x140424550 - 0x1404245E1`) takes the same owner
+lock, unlinks the first real node of the circular list at `owner+0xF0`, drops the
+lock, and returns `node - 8`.
+
+```text
+list             circular doubly-linked, sentinel at owner+0xF0
+                 node->next at node+0x00, node->prev at node+0x08
+element          node - 8; destroyed via its own vtable
+lock             owner+0xC0, taken and released inside both functions
+registered slot  owner+0x100 (two-pointer shared_ptr)
+```
+
+So `0x1404245F0` is a **bounded drain that pops every element off a per-owner
+circular list and destroys each one**, aborting early via a jiffies comparison.
+It is a teardown of *pending elements*, not of the owner itself.
+
+### The insertion / registration function `0x1403FC0B0`
+
+Extent `0x1403FC0B0 - 0x1403FC204`. It does both halves of the producer contract:
+
+```c
+// rcx = &owner, rdx = new node
+void Owner::add_element(Node* node) {
+    Owner* owner = *rcx;                     // rsi = [rcx]
+    EnterCriticalSection(&owner->[0xC0]);
+
+    // link `node` into the circular list at owner+0xF0
+    Node* s = &owner->[0xF0];
+    node->[0x10] = s->prev;
+    node->[0x08] = s;
+    s->prev->next = &node->[0x08];
+    s->prev = &node->[0x08];
+
+    if (owner->[0x100] == NULL) {            // register the drain if not armed
+        LEA 0x1404245F0 -> [rsp+0x40];       // 0x1403FC11A  <-- the only site
+        [rsp+0x48] = owner;                  // bound object
+        [rsp+0x50] = NULL;
+        validate_closure(0x1400C37B0);        // may set the +1 "bound method" tag
+        op = 0x140423B50(owner, closure, flag=0, r9d=0);   // 0x140423B50
+        shared_ptr_move(&owner->[0x100], op);              // 0x1400C67E0
+    }
+    LeaveCriticalSection(&owner->[0xC0]);
+}
+```
+
+The materialisation instruction is exactly one site:
+
+```asm
+1403fc11a  lea  rax, [rip + 0x284cf]      ; -> 0x1404245F0
+1403fc121  mov  [rsp + 0x40], rax         ; callable slot 0
+1403fc126  mov  [rsp + 0x48], rsi         ; bound object = the owner
+```
+
+and there is **no** 8-byte raw pointer to `0x1404245F0` anywhere in the image
+(`xref_le64` returns 0), which is why the older raw-pointer scan could not find
+it. Registration is through the **same** `0x140423B50` operation factory used by
+the timer registrations, here with `r9d = 0` (no timeout).
+
+`0x1403FC0B0` has 12 callers, all inside `0x140435CE0`-`0x1404385D0`, and every
+one of them is an "add one element, then arm the drain if idle" site.
+
+### The inbound dispatcher, and where this list is fed from
+
+`0x14042B990 - 0x14042BB20` is the inbound opcode dispatcher. Its complete branch
+set, read from the `cmp r9d, <opcode>` chain:
+
+```text
+opcode        handler                  message
+0xA609E6A7    0x14042BCA0              RequestIDSignature
+0x6731C5AF    0x14042C300              ReplyIDSignature
+0x8B0D492F    0x14042C910              IntroduceConnection
+0x43DB3479    0x14042BAC5 edx=1 r8d=0  Close        -> 0x1404123D0(conn,1,0)
+0x598D9A7     0x14042BAD5 edx=0 r8d=0  RequestClose -> 0x1404123D0(conn,0,0)
+```
+
+This reproduces the previously recorded fact that an inbound *Close* is routed
+with `arg2 = 1` (no reply envelope) while inbound *RequestClose* is routed with
+`arg2 = 0`.
+
+Both `0x14042C300` and `0x14042C910` reach `0x140412180`, which is the function
+that attaches a routed peer and feeds the element list:
+
+```asm
+14042c754  lock cmpxchg qword ptr [rdx + 0x88], rdi   ; attach to conn+0x88
+```
+
+so the element list is fed from the **inbound RequestIDSignature and
+IntroduceConnection paths**, and the same `0x140412180` is what calls
+`0x140435CE0` → `0x1403FC0B0` (add + arm).
+
+### What this changes about the boundary
+
+```text
+0x1404245F0      = per-owner deferred element drain (destroys list elements)
+                   CONFIRMED
+0x140434430      NOT yet reversed
+0x14040AEC0      still the routed-peer classifier that can call 0x1404123D0
+primary failure decision   still UPSTREAM / UNKNOWN
+```
+
+The old label "collection teardown" for `0x1404245F0` is **narrowed**: it is the
+drain of a *pending-element* list, whose element type is not yet named.
+
 ## Authority / how to use this file
 
 Status vocabulary — use these five words and nothing else:
