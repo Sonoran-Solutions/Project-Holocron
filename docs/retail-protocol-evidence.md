@@ -7094,18 +7094,24 @@ empty-string singleton, then performs **four** parameter assignments:
 
 ```asm
 140412948..140412961  append p3   (cmovne from [rbp+0xd0] onto the "" default)
+                      NOTE: this is p3, and it is appended FIRST
 140412966..14041299c  append the literal ':'  (0x14156E658)
 1404129c2..1404129db  append p2   (cmovne from [rbp+0xc8] onto the "" default)
+                      NOTE: this is p2, and it is appended LAST
 1404129e0..1404129e9  peer+0x20 := the builder's buffer (0x14012D1F0)
 1404129ee            normalise
 ```
 
 ```text
-peer+0x20 = p2 || ":" || p3
+peer+0x20 = p3 || ":" || p2
 ```
 
-Runtime agreement is exact: the captured `peerB+0x20 = ":castlehilltest"` is
-`"" + ":" + "castlehilltest"`. StrRef slots are 16 bytes
+**SUPERSEDED — the operand order in the `+0x20` formula below is transposed.**
+The builder appends *p3*, then `":"`, then *p2*, so the formula is
+`p3 ":" p2` and not `p2 ":" p3`; see the later section
+"Phase 0 corrections, second pass" at the end of this file. The runtime witness
+`peerB+0x20 = ":castlehilltest"` requires `p3 = ""` and `p2 = "castlehilltest"`,
+which the transposed formula cannot produce. StrRef slots are 16 bytes
 (`char* +0x00`, `u32 len +0x08`, `u32 cap +0x0C`); the peer is 0x88 bytes and has
 no vtable.
 
@@ -7191,14 +7197,166 @@ task's explicit prohibition, so no experiment was run.
 ### Classification
 
 ```text
-0x14040AEEB = conditional compare-and-clear (expected 0, replacement 0)  CONFIRMED
+0x14040AEEB = atomic null-probe / current-peer load                      CONFIRMED
+              (zero-to-zero compare-exchange; field mutation = NONE)
 conn+0x88 changes in 0x14040AEC0:                                         NO
 +0x40 test base = the CAS destination operand (= attached peer)           CONFIRMED
 0x6731C5AF -> 0x14042C300 ReplyIDSignature                                CONFIRMED
-peer has five StrRef slots; +0x20 = p2 ":" p3                             CONFIRMED
+peer has five StrRef slots; +0x20 = p3 ":" p2                             CONFIRMED
 new_peer+0x40 = old_peer+0x00                                             CONFIRMED
 "*" is a real client-side wildcard name value                             CONFIRMED
 server controls peer+0x40 directly                                        DISPROVEN
-server controls peer+0x40 indirectly (two hops)                           YES
+server controls peer+0x40 indirectly (two hops)                    HYPOTHESIS
+                                                                  (was "YES";
+                                                                   withdrawn --
+                                                                   the wire hop
+                                                                   is unproven)
 D4                                                                        UNKNOWN
 ```
+
+## Phase 0 corrections, second pass: null-probe label, server control, p3:p2 order (September 13, third pass)
+
+Three model/evidence problems were corrected. Two of them were introduced by the
+previous pass of this notebook.
+
+### A. `0x14040AEEB` is an ATOMIC NULL-PROBE, not a compare-and-clear
+
+Instruction and operands, re-read from the image:
+
+```asm
+14040aee7  xor  ecx, ecx                       ; RCX = replacement = 0
+14040aee9  xor  eax, eax                       ; RAX = expected    = 0
+14040aeeb  lock cmpxchg [rdx+0x88], rcx
+```
+
+```text
+if [mem] == 0:
+    [mem] = 0
+    ZF = 1
+else:
+    RAX = [mem]
+    [mem] unchanged
+    ZF = 0
+```
+
+Both arms leave the logical value of `conn+0x88` exactly as it was:
+
+```text
+NULL -> NULL
+peer -> peer     (and RAX receives the peer)
+```
+
+```text
+semantic label       = ATOMIC NULL-PROBE / CURRENT-PEER LOAD
+field mutation       = NONE
+raw mechanics        = lock cmpxchg with expected == replacement == 0
+```
+
+Superseded labels, in chronological order:
+
+```text
+"unconditional detach"            SUPERSEDED (first pass)
+"conditional detach"              SUPERSEDED (implies a mutation that cannot happen)
+"atomic probe/classify"           SUPERSEDED (label only; effect correct)
+"conditional compare-and-clear"   SUPERSEDED (still implies a clear)
+```
+
+### B. Server-control status downgraded from an inferred INDIRECT to UNKNOWN
+
+The previous pass classified server control of `peer+0x40` as `INDIRECT`. That
+was an inference, not a proven chain. The proven part is only the peer-to-peer
+inheritance:
+
+```text
+new_peer+0x40 = previous peer's +0x00      CONFIRMED
+```
+
+The unproven part is the wire origin of the upstream name. Corrected:
+
+```text
+SERVER CONTROL of peer+0x40     UNKNOWN
+indirect server influence       HYPOTHESIS
+exact wire field                UNKNOWN
+```
+
+`INDIRECT` must not be used again until a complete chain exists from one specific
+wire field to the p2 of the seeding peer.
+
+### C. The `+0x20` composite is `p3 ":" p2` — the previous formula was transposed
+
+The constructor's local string build, with exact addresses:
+
+```asm
+14041293d  lea  rcx, [rsp+0x50] / call 0x1400b7840   ; init the local builder
+140412948  mov  rax, [rbp+0xd0]                      ; p3
+140412958  cmovne rdx, rax                           ; rdx = p3 or ""
+140412961  call 0x1403fab90                          ; append p3     <-- FIRST
+140412966  mov  edx, [rsp+0x60] / add edx, 2
+140412972  call 0x1403fae70                          ; reserve(len+2)
+140412980  lea  rcx, [0x14156E658]                   ; ":"
+140412990..14041299c                                 ; append ":"    <-- SECOND
+1404129c2  mov  rax, [rbp+0xc8]                      ; p2
+1404129cf  cmovne r13, rax                           ; r13 = p2 or ""
+1404129db  call 0x1403fab90                          ; append p2     <-- THIRD
+1404129e5  lea  rcx, [r15+0x20]
+1404129e9  call 0x14012d1f0                          ; peer+0x20 = the buffer
+```
+
+```text
+peer+0x20 = p3 || ":" || p2
+```
+
+The previous pass printed both `peer+0x20 = p2 ":" p3` and a comment sequence
+appending p3 first. Those cannot both be right, and the witness decides it:
+
+```text
+peerB+0x20 observed = ":castlehilltest"
+
+p3 || ":" || p2   with p3="", p2="castlehilltest"  ->  ":castlehilltest"   MATCH
+p2 || ":" || p3   with p3="", p2="castlehilltest"  ->  "castlehilltest:"   NO MATCH
+```
+
+So in the witness `p3 = ""` and `p2 = "castlehilltest"`. The transposed formula is
+retracted, because a static mapping that cannot reproduce the witness must not be
+kept.
+
+### D. Where the seeding value actually comes from
+
+`0x140411D30` builds the same record shape as `0x140412820` and is reached from
+`0x140412180`; it seeds a routed-peer record's `+0x00` from a name obtained from
+the route/endpoint record:
+
+```asm
+; rcx = connection, rdx = r13 = the introduce/receive route record
+140411dbc  lea  rcx, [rdi + 0x70]
+140411dc7  call 0x1404143d0          ; acquire the route/endpoint record
+140411e21  mov  rax, [rdi + 8]
+140411e25  mov  rcx, [rax + 0xd8]
+140411e2c  mov  rax, [rcx + 8]
+140411e30  mov  rcx, [rax + 0x10]    ; the route's name (char*)
+140411e41  cmovne rdx, rcx           ; else the empty-string singleton
+140411e49  call 0x1403fab90          ; append it
+140411eb5  lea  rcx, [rdi + 0x40]
+140411eb9  call 0x14012d1f0          ; store the composite
+```
+
+The destination offsets were byte-verified against `0x140412820`, so this is the
+same 0x88-byte routed-peer shape, and the p2 route is a **copy** rather than a
+direct read of a previous peer.
+
+### Classification after this pass
+
+```text
+0x14040AEEB = atomic null-probe / current-peer load, mutation NONE        CONFIRMED
+conn+0x88 ever mutated by 0x14040AEC0                                     NEVER
+peer+0x20 = p3 ":" p2                                                     CONFIRMED
+peer+0x20 = p2 ":" p3                                                     DISPROVEN
+p2 is a copy of a route/endpoint record's name field                      HYPOTHESIS
+wire origin of that name field                                            UNKNOWN
+SERVER CONTROL of peer+0x40                                               UNKNOWN
+indirect server influence                                                 HYPOTHESIS
+D4                                                                        UNKNOWN
+```
+
+No server experiment was performed, no D4 was sent, and no client patch beyond
+the existing resolver workaround is in effect.

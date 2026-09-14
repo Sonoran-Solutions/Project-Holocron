@@ -45,25 +45,27 @@ listener = [[event+0x18]+0x100], class omega::Object, vt 0x1414B5C10   CONFIRMED
 listener vtable+0x28 -> 0x14040A970 (releases payload, returns 0)      CONFIRMED
 listener vtable+0x70 -> 0x14040AEC0 (THE DECIDER)                      CONFIRMED
 0x140434430 -> 0x14040AEC0 = direct virtual dispatch (always taken)    CONFIRMED
-0x14040AEEB = CONDITIONAL COMPARE-AND-CLEAR, expected=0 replacement=0  CONFIRMED
-              (clears conn+0x88 ONLY if it is already NULL -- a no-op)
-conn+0x88 changes in this handler                                      NO  CONFIRMED
+0x14040AEEB = ATOMIC NULL-PROBE / CURRENT-PEER LOAD                  CONFIRMED
+              (zero-to-zero compare-exchange; see the operand note below)
+0x14040AEEB mutates conn+0x88                                          NEVER
 the +0x40 test reads the CAS DESTINATION operand, i.e. the peer
-  attached at conn+0x88, NOT the ConnectionOpen payload peer           CONFIRMED
-skip-Close condition = peer+0x40 is exactly the 2-byte string "*"      CONFIRMED
+  currently attached at conn+0x88, NOT the ConnectionOpen payload peer CONFIRMED
+skip-Close condition = current_peer+0x40 is exactly the string "*"     CONFIRMED
 peer+0x40 writer = the peer ctor 0x140412907 (parameter p5, single writer)
                                                                        CONFIRMED
-peer+0x40 source = p5 of 0x140412820 = [4th arg of 0x14042B3D0], i.e. the
-                   StrRef at +0x00 of the peer record the introduce route
-                   holds at +0x18                                      CONFIRMED
-peer+0x20 = derived composite "p4:p3", NOT a constructor argument      CONFIRMED
-why peer+0x40 is "" on the failing path: p5 resolves to the empty
-  string on the observed path                                          CONFIRMED value
+peer+0x40 source = p5 of 0x140412820 = the p2 of the SAME call, one attach
+                   earlier; concretely the name StrRef carried by the
+                   introduce/receive route record                    HYPOTHESIS
+peer+0x20 = derived composite "p3:p2", NOT a constructor argument      CONFIRMED
+why peer+0x40 is "" on the failing path: the previous attach's p2
+  normalised to the empty-string singleton on the observed path        CONFIRMED value
 peer+0x40 semantic role = the routed peer's name string, tested for the
                            exact wildcard "*"                          CONFIRMED
 "*" is a real client-side wildcard name value, not a sentinel          CONFIRMED
 endpoint-wildcard experiment suppresses Close                          DISPROVEN
-server controls peer+0x40                                              INDIRECT (see below)
+server controls peer+0x40                                              UNKNOWN
+indirect server influence over peer+0x40                               HYPOTHESIS
+exact wire field supplying the upstream value                          UNKNOWN
 D4                                                                     UNKNOWN
 ```
 
@@ -83,11 +85,23 @@ are zero (`xor ecx,ecx` / `xor eax,eax`), so the instruction can never change a
 non-NULL `conn+0x88`, and can never change a NULL one either.
 
 ```text
-instruction class   = COMPARE-AND-CLEAR (conditional detach-on-match)
+instruction class   = ATOMIC NULL-PROBE / CURRENT-PEER LOAD
+field mutation      = NONE
 runtime witness     = ZF=0, RAX <- peer B, conn+0x88 unchanged   CONFIRMED
+
+raw mechanics       = lock cmpxchg [rdx+0x88], rcx   with RAX=0, RCX=0
+                      if [mem] == 0: [mem] = 0 ; ZF=1
+                      else:          RAX = [mem] ; [mem] unchanged ; ZF=0
+                      Both arms leave the logical value of conn+0x88
+                      exactly as it was, so the instruction can never
+                      detach, clear, or remove anything.
+
 "unconditional detach"                             SUPERSEDED
-"ATOMIC PROBE/CLASSIFY"                            SUPERSEDED (same effect, but
-   the replacement operand is 0, so the store is a real clear, not a no-op)
+"conditional detach"                               SUPERSEDED
+"compare-and-clear"                                SUPERSEDED -- mechanically it
+   is a zero-to-zero compare-exchange, so describing it as a "clear" implies a
+   mutation that provably cannot happen. Label it ATOMIC NULL-PROBE /
+   CURRENT-PEER LOAD instead, and keep the CMPXCHG mechanics as raw detail.
 ```
 
 ---
@@ -270,8 +284,9 @@ that attaches a routed peer and feeds the element list:
                                                       ; (rdi = 0, eax = 0)
 ```
 
-That instruction is a **compare-and-clear used as an atomic read**, not an
-attach: `rcx`/`rdi` is 0 for the whole function. The attach is at
+That instruction is an **atomic null-probe used as a current-peer load**, not
+an attach: `rcx`/`rdi` is 0 for the whole function, so the compare-exchange can
+never mutate `conn+0x88`. The attach is at
 `0x140412A4F` inside `0x140412820`, reached from the `0x140412180` call at
 `0x14042c782` that immediately follows.
 
@@ -705,7 +720,7 @@ vtable `0x141480E08`, installed by `0x1400B7840` at `0x140412942`):
 ```
 
 ```text
-peer+0x20 = p2 || ":" || p3
+peer+0x20 = p3 || ":" || p2
 ```
 
 and nothing else reads the local builder, so this is its only purpose.
@@ -857,7 +872,7 @@ peer+0x40 semantic role   = the routed peer's name string, tested for the exact
 "*" semantic role         = "this routed peer's name is the wildcard", i.e. a
                             real client-side name value; the Close is skipped
                             for wildcard-named peers                     CONFIRMED
-server controls peer+0x40 INDIRECT -- see the dedicated section below
+server controls peer+0x40 UNKNOWN (indirect influence HYPOTHESIS)
 D4                                                                     UNKNOWN
 ```
 
@@ -1038,7 +1053,7 @@ field   peer A                              peer B
         = [connection+0x88]+0x00, which
         was NULL/"" before it)
 +0x10   p3 (route string)                   p3
-+0x20   p2 ":" p3                           p2 ":" p3
++0x20   p3 ":" p2                           p3 ":" p2
 +0x30   p4 (route string)                   p4   = "localhost:7979"  (witness)
 +0x40   p5 = previous peer's +0x00 = ""     p5 = peerA+0x00 = ""
 ```
@@ -1065,52 +1080,129 @@ operator argument to Close          = that same peer
 So in the captured failing run all three coincide — but the `+0x40` **value**
 originates one peer earlier, in `old_peer+0x00`.
 
+### CORRECTION: the `+0x20` composite is `p3 ":" p2`, and the p2 source is a copy
+
+Two errors from the previous pass, corrected here.
+
+**(1) The composite operand order was transposed.** Re-reading the constructor's
+local string build with exact instruction addresses:
+
+```asm
+140412948  mov  rax, [rbp+0xd0]   ; p3  (the +0x10 argument)
+140412958  cmovne rdx, rax
+140412961  call 0x1403fab90       ; builder.append(p3)
+14041296a  add  edx, 2
+140412972  call 0x1403fae70       ; builder.reserve(len + 2)
+140412980  lea  rcx, [0x14156E658] ; the literal ":"
+140412990..14041299c              ; builder.append(":")
+1404129c2  mov  rax, [rbp+0xc8]   ; p2  (the +0x00 argument)
+1404129cf  cmovne r13, rax
+1404129db  call 0x1403fab90       ; builder.append(p2)
+1404129e5  lea  rcx, [r15+0x20]
+1404129e9  call 0x14012d1f0       ; peer+0x20 = the builder buffer
+```
+
+```text
+peer+0x20 = p3 || ":" || p2
+```
+
+The previous statement `peer+0x20 = p2 ":" p3` was **wrong** and is
+`SUPERSEDED`. The runtime witness is the discriminator, and it selects the new
+formula unambiguously:
+
+```text
+peerB+0x20 observed = ":castlehilltest"
+p3 || ":" || p2  with p3 = ""  and p2 = "castlehilltest"  ->  ":castlehilltest"  MATCH
+p2 || ":" || p3  with p3 = ""  and p2 = "castlehilltest"  ->  "castlehilltest:"  NO MATCH
+```
+
+So **p3 is the empty string and p2 is `"castlehilltest"`** in the witness. The old
+formula could not reproduce the witness, so it is retracted rather than reworded.
+
+**(2) p2 is not the previous peer's `+0x00` directly — it is a copy of a name
+carried by the route record.** `0x140411D30` is the function that seeds it:
+
+```asm
+; rcx = connection (destination), rdx = r13 = the introduce/receive route record
+140411dbc  lea  rcx, [rdi + 0x70]   ; <- destination address
+140411dc0  mov  r8,  r13
+140411dc3  lea  rdx, [rbp - 0x78]
+140411dc7  call 0x1404143d0         ; acquire the route/endpoint record
+...
+140411e21  mov  rax, [rdi + 8]      ; the socket manager
+140411e25  mov  rcx, [rax + 0xd8]   ; the socket
+140411e2c  mov  rax, [rcx + 8]
+140411e30  mov  rcx, [rax + 0x10]   ; the route's name  (char*)
+140411e3b  mov  rdx, rbx            ; default = the empty-string singleton
+140411e41  cmovne rdx, rcx
+140411e49  call 0x1403fab90         ; builder.append(the route's name)
+...
+140411ea5  mov  rdx, rbx            ; (p3-side value)
+140411ea8  call 0x1403fab90         ; builder.append(...)
+140411eb1  mov  rdx, [rbp - 0x48]
+140411eb5  lea  rcx, [rdi + 0x40]
+140411eb9  call 0x14012d1f0         ; peer+0x40 = the builder buffer
+```
+
+The destination offsets (`+0x30`, `+0x50`, `+0x70`, `+0x40`, `+0x28`, `+0x00`,
+`+0x20`) are byte-verified against the constructor at `0x140412820`, so
+`0x140411D30` builds the *same* record shape as `0x140412820` — the connection's
+own routed-peer record.
+
+```text
+the p2 of a new peer is a copy of a name field obtained from the
+route/endpoint record reached through the previous attach                HYPOTHESIS
+the copy's immediate source object is NOT the wire and NOT a constant    CONFIRMED
+```
+
+What remains `UNKNOWN` is the producer of *that* name field, i.e. the wire or
+client-local origin of the first name. That is the single remaining hop, and it
+is why the server-control classification above is `UNKNOWN`.
+
 ---
 
 ## Can the server supply the value? — classification
 
 ```text
-SERVER CONTROLS peer+0x40:  INDIRECT
+SERVER CONTROL of peer+0x40            UNKNOWN
+indirect server influence              HYPOTHESIS
+exact wire field                       UNKNOWN
 ```
 
-The value is **not** taken directly from any inbound message field. It is copied
-out of the previously attached peer's `+0x00`. Therefore:
+**`INDIRECT` is withdrawn as a confirmed classification.** It is not usable until
+a complete, proven chain exists from a specific wire field all the way to the p2
+of the peer that seeds the name. That chain does not exist yet, so the honest
+classification is `UNKNOWN`, with indirect influence no stronger than a
+`HYPOTHESIS`.
+
+What is actually proven about the upstream value:
 
 ```text
-direct   server field -> peer+0x40                     NO
-indirect server field -> previous peer's +0x00 -> peer+0x40   YES
+direct   wire field -> peer+0x40                                NO
+peer-to-peer inheritance  new_peer+0x40 = previous peer's +0x00 CONFIRMED
+the previous peer's +0x00 (p2) is itself a copy                 CONFIRMED
+the copy's origin is a route/endpoint record's name field        HYPOTHESIS
 ```
 
-Exactly one writer of `+0x00` exists — the peer constructor itself
-(`0x1404128D7`) — so the only way a server-supplied value reaches `peer+0x40` is
-by first landing in a `+0x00` of an earlier peer, which means:
+The p2 source, stated without shorthand:
 
 ```text
-server field -> the p2 of the FIRST attach for that connection
-             -> peerA+0x00
-             -> peerB+0x40
+p2 of 0x140412820
+  <- the third argument of 0x140411d30, copied by
+     `mov qword ptr [rdi+0x70], rdx`   at 0x140411dbc
+  <- which on the reply path is  [[connection+0x88] + 0x00]
+     (`cmovne r13, rax` at 0x14042c75d, rax = the attach probe's old value)
+  <- i.e. a routed-peer record the client built
 ```
 
-Two hops from the wire. What is `CONFIRMED` about that first `p2`:
-
-```text
-it is the object at [connection+0x88] when the attach runs, i.e. a peer record
-the client itself built. No inbound ReplyIDSignature or IntroduceConnection
-field was found that is written into a peer record's +0x00 on the observed
-bootstrap path.
-```
-
-What is `UNKNOWN`:
-
-```text
-the concrete type/source of [connection+0x88] at the very first attach
-whether any inbound message field on the bootstrap path ever populates a peer
-   record's +0x00 with a non-empty value
-```
+So calling it "the neighbour object" or "a peer" is still shorthand: the
+**proven** object is a routed-peer record reached through the introduce route
+record, and the wire field that populates *its* name field is `UNKNOWN`.
 
 ```text
 exact message id controlling peer+0x40                     NOT PROVEN
 exact field controlling peer+0x40                          NOT PROVEN
+wire -> client-local-route-metadata boundary               NOT CROSSED
 ```
 
 ### Consequence for the experiment gate
@@ -1283,11 +1375,13 @@ launch context at `+0x90` still outstanding and reports error **1003**.
   `lock cmpxchg [rdx+0x88], rcx` at `0x14040AEEB` has **expected = 0 and
   replacement = 0**, so it clears the field only when the field is already NULL
   — it *cannot* change a non-NULL `conn+0x88`, and it *cannot* change a NULL one
-  either. The instruction is a **compare-and-clear used as an atomic read**.
+  either. The instruction is an **atomic null-probe used as a current-peer load**
+  (`field mutation = NONE`).
   The function then classifies the routed peer thus read by its `+0x40` string
   against `"*"` and terminates the routed connection.
-  `CONFIRMED` (`"unconditional detach"` and `"atomic probe/classify"` are both
-  `SUPERSEDED` — see "The decider, byte-for-byte")
+  `CONFIRMED` (`"unconditional detach"`, `"conditional detach"` and
+  `"conditional compare-and-clear"` are all `SUPERSEDED` — see "The decider,
+  byte-for-byte")
 * At `0x14040AF6A` it releases `[arg2]` — the **connection smart pointer in the
   argument struct**, which is a different lifetime from the peer. `CONFIRMED`
 * **Local contract inside `0x14040AEC0`:** its Close call is skipped when the
@@ -2600,7 +2694,7 @@ tested field = [conn+0x88]+0x40                      CONFIRMED
 that value = the previously attached peer's +0x00    CONFIRMED
 skip condition = exact "*"                           CONFIRMED
 Close argument = the event payload peer              CONFIRMED
-server control of the tested field                   INDIRECT (two hops)
+server control of the tested field                   UNKNOWN
 ```
 
 Known gate inputs of `0x140423DD0` (recovered from full disassembly; semantics
@@ -2697,11 +2791,12 @@ stale `flock`/`bwrap`/`gdb` set makes every later run exit immediately with
 | `App+0x2A` / `0x140406C90` / `0x140446830` / `~ApplicationImpl` caused the reproduced Close | `DISPROVEN` | None of them executed on the reproduced failing run. Structural findings retained. |
 | Peer A replacement/release caused the Close | `DISPROVEN` | Replacement was observed; it is not the cause of this Close. |
 | `0x14040AEEB` clears `conn+0x88` | `DISPROVEN` | `LOCK CMPXCHG` leaves the destination unchanged when the compare fails. Measured `ZF=0`, `RAX` ← peer B, `conn+0x88` byte-identical before and after. |
-| `0x14040AEC0` detaches `conn+0x88` unconditionally | `DISPROVEN` | Operand provenance: `RAX` (expected) and `RCX` (replacement) are **both 0** (`xor eax,eax` at `0x14040AEE9`, `xor ecx,ecx` at `0x14040AEE7`). A zero-to-zero CAS clears only an already-NULL field, so the instruction is a **conditional compare-and-clear**, not an unconditional detach. The field cannot change value on either arm. |
+| `0x14040AEC0` detaches `conn+0x88` unconditionally | `DISPROVEN` | Operand provenance: `RAX` (expected) and `RCX` (replacement) are **both 0** (`xor eax,eax` at `0x14040AEE9`, `xor ecx,ecx` at `0x14040AEE7`). A zero-to-zero CAS clears only an already-NULL field, so the instruction is an **atomic null-probe / current-peer load** with `field mutation = NONE`. |
 | The wildcard test inspects the event payload peer's `+0x40` | `DISPROVEN` | The load at `0x14040AEFD` is guarded by `je 0x14040AF08`, so it runs **only in the CAS-failure arm**, where `RAX` is the CAS *destination* operand `[rdx+0x88]`. The tested peer is the attached peer; the payload peer is only the Close argument (`mov rcx,[rbx]` at `0x14040AF24`). |
-| `0x14040AEC0` "probes and classifies" without a store | `SUPERSEDED` | Same observable effect, but the replacement operand is `0`, so the store is a real clear (compare-and-**clear**), not a no-op probe. Use "conditional compare-and-clear". |
+| `0x14040AEC0` "probes and classifies" without a store | `SUPERSEDED` (label only) | The earlier wording stated the effect correctly but was then replaced by "conditional compare-and-clear", which wrongly implies a mutation. Current label: **atomic null-probe / current-peer load**, `field mutation = NONE`. |
+| `0x14040AEC0` **conditionally detaches** `conn+0x88` | `DISPROVEN` | A zero-to-zero compare-exchange cannot clear a non-NULL field either, because the replacement equals the expected value. `NULL -> NULL` and `peer -> peer`; no arm removes a peer. |
 | `0x14042C300` is the RequestIDSignature handler | `DISPROVEN` | The dispatcher `0x14042B990` calls `0x14042BCA0` for `0xA609E6A7` (RequestIDSignature) and `0x14042C300` for `0x6731C5AF` (ReplyIDSignature). Pre-existing typo in this document, corrected. |
-| The routed peer has "four strings at +00/+10/+30/+40" | `SUPERSEDED` | Five StrRef slots are initialised (`+0x00 +0x10 +0x20 +0x30 +0x40`); only four come from parameters. `+0x20` is the derived composite `p2 ":" p3`. |
+| The routed peer has "four strings at +00/+10/+30/+40" | `SUPERSEDED` | Five StrRef slots are initialised (`+0x00 +0x10 +0x20 +0x30 +0x40`); only four come from parameters. `+0x20` is the derived composite `p3 ":" p2`. |
 | `peer+0x40` = "the 4th argument object of `0x14042B3D0`, i.e. the neighbour object" | `SUPERSEDED` | `p5` is the **qword at `[fourth_argument]`**, and the fourth argument is a *receive-route record* whose `+0x00` is a StrRef, not a whole neighbouring peer. The precise statement is `new_peer+0x40 = old_peer+0x00`. |
 | Peer B is removed before the Close | `DISPROVEN` | Peer B remains attached through the Close. |
 | The empty comparison string came from a NULL connection field | `DISPROVEN` | It came from `peerB+0x40`, which held the empty-string singleton. |
