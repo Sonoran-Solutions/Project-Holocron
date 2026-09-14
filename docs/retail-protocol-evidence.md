@@ -7852,9 +7852,11 @@ AL != 0  the connection state WAS 4, and the route entry was inserted
 AL is literally `(state == 4)` -- it is a state gate, not a generic error flag
 ```
 
-Classification: **lookup-gated insert / route registration**, keyed on the
-connection state being exactly 4. It is not an insert-or-replace and not a
-"claim"; a state other than 4 causes a clean early-out with no mutation.
+Classification: **state-gated route-entry REPLACE (erase + insert)**, keyed on
+the connection state being exactly 4. On the `state == 4` path it first ERASES
+any existing entry (`0x14043FB10` is a hash-table unlink plus `mm_free(node,
+0x18)`) and then inserts the new one (`0x14043FEC0`). On any other state it
+returns immediately with no mutation at all.
 
 ### D. Consequence for event identity
 
@@ -7883,12 +7885,14 @@ event-less.
 ```
 
 ```text
-state 4 is reachable ONLY from state 3, via 0x14041235F inside 0x140412180's
-  success arm                                                      CONFIRMED
-the same success arm is the ONLY place 0x14043D380 is called        CONFIRMED
-so the first attach to reach 0x14041230A while the state is 3 succeeds,
-the next one finds state 4 and fails                               CONFIRMED (rule)
-which of the two historical attaches was which                     UNKNOWN
+state 4 is reachable from state 3, via 0x14041235F                    CONFIRMED
+the only place 0x14043D380 is called                                CONFIRMED
+0x14041235F executes BEFORE 0x14043D380 in every invocation         CONFIRMED
+0x14041235F is reached only via 0x140412354, the `AL != 0` target of
+  `0x14041230C jne 0x140412354`                                     CONFIRMED
+=> 0x14043D380 normally reads state 3, returns AL = 0, and takes
+   0x140412317; the 3 -> 4 transition is in THAT arm                CONFIRMED
+which of the two historical attaches registered                     UNKNOWN
 ```
 
 State 7 is a terminal sentinel: once `0x1404123D0` performs its `-> 7` CAS, no
@@ -7909,3 +7913,139 @@ The route key could not be resolved to concrete peer fields either. What is
 known is that `0x14043D380` inserts a 3-field entry into the map at
 `connection+0x1C8` and derives two u16 values from the peer record at `+0x60`
 and `+0x28`; which of those are wire-supplied is `UNKNOWN`.
+
+## Resolution of the state-4 "chicken-and-egg" contradiction (September 13, eighth pass)
+
+### The apparent contradiction, and what was actually wrong
+
+The previous pass wrote:
+
+```text
+0x14043D380 succeeds only if state == 4
+0x14041235F is the only path that reaches state 4
+=> the first successful attach is impossible
+```
+
+**The contradiction was created by a branch-label error in the prose, not by the
+disassembly.** The previous pass called `0x140412354` "the success arm" of
+`0x14041230C jne 0x140412354`. That label was backwards for the purpose of the
+argument: reaching `0x140412354` requires `AL != 0`, and the state-4 transition
+lives *inside* that target. Nothing reaches state 4 before registering.
+
+### Instruction order, byte-verified
+
+```asm
+1404121b9  cmp qword ptr [rsp + 0x90], 0
+1404121c2  je  0x14041231c              ; slot NULL  -> xor bl,bl ; return FALSE
+1404121d6  call 0x140414cb0             ; (rcx = rdi) newState 3, mask 0x44
+1404121de  je  0x14041231c              ; denied (0xA) -> return FALSE
+140412247  call 0x140412820             ; create + attach the peer at conn+0x88
+140412302  call 0x14043d380             ; <-- the state-gated registration
+14041230a  test al, al
+14041230c  jne 0x140412354              ; AL != 0 -> 0x140412354
+14041230e  mov edx, 2
+140412313  lea r8d, [rdx - 1]
+140412317  call 0x1404123d0             ; AL == 0 -> Close(conn, 2, 1)
+14041231c  xor bl, bl
+...
+140412354  xor r9d, r9d                 ; <-- AL != 0 target
+140412357  lea edx, [r9 + 4]            ; newState 4, mask 8  (state 3 -> 4)
+14041235f  call 0x140414cb0
+14041236d  call 0x140414250
+1404123a5  call 0x140435ce0             ; queue ConnectionOpen
+```
+
+So the true shape is:
+
+```text
+state is 2 or 6  -> 0x1404121D6 makes it 3
+state is 3       -> 0x14043D380 reads 3, returns AL = 0
+                     -> 0x14041230C is NOT taken -> 0x140412317 -> Close(conn,2,1)
+                     -> return FALSE, peer stays attached, NO event
+state is 4       -> 0x14043D380 reads 4, returns AL = 1
+                     -> 0x140412354 -> 0x14041235F (4 -> 7) -> queue ConnectionOpen
+```
+
+```text
+0x14043D380 runs BEFORE the 3 -> 4 transition        CONFIRMED (instruction order)
+it therefore sees 3, not 4, on any attach that has just executed 0x1404121D6
+0x14043D380's AL == 0 arm is 0x140412317 (Close), NOT 0x140412354
+"0x140412354 is the registration-success target"     CONFIRMED
+"AL == 0 means registration failed"                  CONFIRMED
+"the 3 -> 4 transition is in the failure arm"        CONFIRMED
+```
+
+### The full state sequence, with the caveat that the objects are not proven identical
+
+```text
+step   address      state CAS              object
+----   -----------  ---------------------  --------------------------------
+ 1     0x1404121D6  -> 3 (mask 0x44)       rdi = the 0x140412180 connection arg
+ 2     0x14043D380  reads state            [the slot value] = [rsp+0x90]
+ 3     0x14041235F  -> 4 (mask 8)          rdi = the 0x140412180 connection arg
+ 4     0x1404123D0  -> 7 (mask 0x7F)       the connection (on the Close path)
+```
+
+```text
+the state field read by 0x140414BD0 and written by 0x140414CB0 is +0x18 of the
+  receiver                                       CONFIRMED (0x140414bf7, 0x140414ce9)
+0x14043D380's 1st argument is rbx = [rsp+0x90]   CONFIRMED (0x1404122d2 / 0x1404122ff)
+steps 1 and 3 use rdi                            CONFIRMED
+[rsp+0x90] is written by 0x140414250 @ 0x1404121b3, which is called with
+  rcx = rdi + 0x78 and returns rsi = rdx = &[rsp+8]  CONFIRMED
+=> whether [rsp+0x90] ends up equal to the connection pointer is NOT proven
+```
+
+That is the one remaining identity gap. It does **not** affect the ordering
+conclusion above, which is a pure instruction-order fact.
+
+### `0x14043D380` is a lookup keyed on the connection state
+
+Re-read this pass. On the `state == 4` path it does **not** simply insert:
+
+```asm
+14043d3d6  lea rcx, [r14 + 0x1c8]      ; a hash table on the connection
+14043d3dd  mov rax, [rsi]              ; the key object
+14043d3e0  mov rdx, [rax + 0x10]       ; the hash input
+14043d3ec  call 0x14043fb10            ; <- ERASE: unlink the existing entry
+14043d416  movzx ecx, word [rax+0x60]  ; two u16 accessors on the removed object
+14043d41d  movzx ecx, word [rax+0x28]
+14043d468  call 0x14043fec0            ; <- INSERT the new entry
+```
+
+`0x14043FB10` (`0x14043FB10-0x14043FB2D`) is a **hash-table erase**: it computes
+the bucket with `div [table+8]`, walks the chain comparing the stored hash and
+key, unlinks the matching node, decrements `[table+0x10]`, and frees the node
+`mm_free(node, 0x18)`. So:
+
+```text
+0x14043D380 = gated "replace this route entry" = erase-old + insert-new
+AL          = (previous state == 4), i.e. "was the replace allowed"
+```
+
+```text
+"0x14043D380 merely inserts and can never mutate on failure"   CORRECTED:
+    on state != 4 it returns immediately with no mutation, but on state == 4 it
+    ERASES an existing entry before inserting
+```
+
+### Consequence for routability
+
+```text
+an attach that finds state != 4 at 0x140412302
+    -> AL = 0
+    -> no route entry is created or replaced for that peer
+    -> 0x14041230C not taken, so Close(conn,2,1) and no ConnectionOpen event
+an attach that finds state == 4
+    -> AL = 1
+    -> erase+insert on [connection+0x1C8], state -> 7, ConnectionOpen queued
+```
+
+Because step 3 sets state 4 in the AL==0 arm, a later attach can find 4 and take
+the routing arm. So the two historical attaches can legitimately have differed:
+the first (state 3) unregistered and event-less, the second (state 4) registered.
+
+```text
+the historical registration results are still not measured   UNKNOWN
+the ordering that makes them differ is proven                CONFIRMED
+```

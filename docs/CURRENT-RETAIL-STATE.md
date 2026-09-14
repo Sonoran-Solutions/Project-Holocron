@@ -2768,6 +2768,69 @@ happens on **thread 2**. That distinction matters. `CONFIRMED`
 
 ---
 
+## The state-4 "chicken-and-egg" contradiction — RESOLVED, with one identity gap
+
+An earlier claim in this document and the notebook read:
+
+```text
+0x14043D380 succeeds only if state == 4
+0x14041235F is the only path that reaches state 4
+=> the first successful attach is impossible
+```
+
+**The contradiction was a branch-label error, not a real cycle.** Corrected:
+
+```text
+0x14041235F executes BEFORE the 0x14043D380 call           CONFIRMED (order)
+0x14041235F is reached only via 0x140412354, which is the
+  `AL != 0` target of `0x14041230C jne 0x140412354`        CONFIRMED
+=> on any given invocation, 0x14043D380 runs BEFORE the 3 -> 4 transition,
+   so it reads 3 and returns AL = 0, taking 0x140412317     CONFIRMED
+=> the state-4 transition lives in that AL == 0 arm        CONFIRMED
+=> a LATER attach can then find state 4 and take the routing arm
+```
+
+An earlier line here said "the first attach to reach `0x14041230A` while the
+state is 3 succeeds". That is `SUPERSEDED`: registration returns `(state == 4)`,
+so an attach that has just executed `0x1404121D6` (state -> 3) registers nothing.
+
+### `0x14043D380` is a gated REPLACE, not an insert
+
+```asm
+14043d3d6  lea rcx, [r14 + 0x1c8]      ; hash table on the connection
+14043d3ec  call 0x14043fb10            ; ERASE the existing entry
+14043d468  call 0x14043fec0            ; INSERT the new entry
+```
+
+```text
+0x14043FB10 = hash-table unlink + mm_free(node, 0x18)          CONFIRMED
+0x14043D380 = state-gated route-entry REPLACE                  CONFIRMED
+AL          = (previous state == 4) = "was the replace allowed" CONFIRMED
+state != 4  => immediate return, no mutation of any kind       CONFIRMED
+```
+
+### STILL UNDER RECONCILIATION
+
+```text
+0x14043D380's state-gate object == the Connection used by 0x14041235F
+        UNKNOWN / UNDER RECONCILIATION
+```
+
+Proven only:
+
+```text
+0x140414BD0 reads  +0x18 of its argument                    CONFIRMED
+0x140414CB0 writes +0x18 of its argument                    CONFIRMED
+0x14043D380's 1st arg is rbx = [rsp+0x90], NOT rdi          CONFIRMED
+[rsp+0x90] is written by 0x140414250 @ 0x1404121b3, called
+  with rcx = rdi + 0x78, returning rsi = rdx = &[rsp+8]     CONFIRMED
+whether [rsp+0x90] == the connection pointer                NOT PROVEN
+```
+
+The ordering conclusion above does not depend on that identity.
+
+---
+
 ## The two Close producers, and which one the observed Close came from
 
 `0x1404123D0` is called from two different places in this subsystem. They are
