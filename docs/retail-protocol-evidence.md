@@ -5205,3 +5205,106 @@ to `HYPOTHESIS` until `0x140424860` is reversed on its own terms.
 — that conclusion never depended on the `+0x30`/`+0x38` labels. The claim that
 `+0x2C` selects between the two arms of `0x140423DD0` also stands as a statement
 about the branch; only the field's *name* is withdrawn.
+
+---
+
+## `0x140430800`, the 5 ms callable, is a list-steal-and-destroy leaf (September 13)
+
+### The body
+
+`0x140430800` is a 51-byte self-contained function: `.pdata` extends
+`0x140430800`–`0x140430833`, and a full-image scan of every `call`/`jmp` operand
+finds **no branch anywhere targeting the function or its interior**. It is
+reached only as a callback. Full body:
+
+```asm
+140430800  mov  qword ptr [rsp+0x18], rsi
+140430805  push rdi
+140430806  sub  rsp, 0x20
+14043080A  prefetchw byte ptr [rcx+0x260]
+140430811  xor  esi, esi
+140430813  mov  rdi, qword ptr [rcx+0x260]          ; retry label
+14043081A  mov  rax, rdi
+14043081D  lock cmpxchg qword ptr [rcx+0x260], rsi   ; atomically take the list
+140430826  jne  0x140430813
+140430828  test rdi, rdi
+14043082B  je   0x140430874
+14043082D  add  rdi, -0x30
+140430831  je   0x140430874
+140430833  mov  qword ptr [rsp+0x38], rbx
+140430840  mov  rbx, qword ptr [rdi+0x30]            ; next link
+140430844  xor  r8d, r8d
+140430847  mov  rcx, rdi
+14043084A  call 0x14043B5D0                          ; per-element teardown
+14043084F  mov  rax, qword ptr [rdi]
+140430852  mov  rcx, rdi
+140430855  mov  rax, qword ptr [rax+0x30]            ; element vtable+0x30
+140430859  call qword ptr [rip+0xf3a461]             ; via thunk 0x14136ACC0
+14043085F  test rbx, rbx
+140430862  lea  rdi, [rbx-0x30]
+140430866  cmove rdi, rsi
+14043086A  test rdi, rdi
+14043086D  jne  0x140430840
+14043086F  mov  rbx, qword ptr [rsp+0x38]
+140430874  mov  rsi, qword ptr [rsp+0x40]
+140430879  add  rsp, 0x20
+14043087D  pop  rdi
+14043087E  ret                                       ; epilogue shared with 0x140430833
+```
+
+Semantics:
+
+```text
+atomically detach the intrusive singly-linked list at boundobj+0x260 (→ NULL),
+then for each element:
+    teardown_element(element, 0)          # 0x14043B5D0
+    (*element->vtable[0x30])(element)     # virtual destructor
+```
+
+The `-0x30` / `+0x30` pair is the standard MSVC intrusive-list idiom: the link is
+embedded at offset `0x30` of the element, so the stored node pointer is
+`&element->link` and the element base is `link - 0x30`.
+
+### It is a leaf, and it does not reach the historical teardown
+
+```text
+direct callees    = 0x14043B5D0 only
+indirect callees  = element vtable+0x30 only
+0x140430800 -> 0x1404245F0 = NO
+```
+
+There is no path from `0x140430800` to `0x1404245F0`, `0x140434430`,
+`0x14040AEC0` or the Close producer. The historical runtime chain therefore does
+**not** pass through this callable, and the earlier hypothesis that
+`0x1404245F0` might be reached from inside the 5 ms callable is refuted for this
+callable.
+
+### It does not rearm itself
+
+Nothing in the body reschedules, re-registers or re-arms anything. It steals a
+list, destroys it, and returns. Whether the surrounding framework re-arms the
+operation is a separate question and is `UNKNOWN`; the callable itself is
+one-shot.
+
+### Naming note
+
+`0x140430800` is "the 5 ms callable" in the sense that it is what the 5 ms
+registration binds — not in the sense that it runs every 5 ms. The previous
+pass's phrase "the 5 ms closure that reaches 0x140423DD0" conflated the two and
+is `SUPERSEDED`: this function is a teardown of an intrusive list, not a polling
+loop, and it does not reach `0x140423DD0` either.
+
+### Updated open list
+
+```text
+0x140430800 complete body                      CONFIRMED
+0x140430800 -> 0x1404245F0                      DISPROVEN (leaf)
+0x140430800 rearms itself                       DISPROVEN
+which operation reaches 0x140423DD0             UNKNOWN
+what wires 0x140430800's list (boundobj+0x260)  UNKNOWN
+0x1404245F0 registration site                   UNKNOWN
+0x140424860 semantics                           UNKNOWN (label withdrawn)
+"connection"/"signature" effects                UNKNOWN
+```
+
+**No server behaviour was changed and D4 was not sent.**

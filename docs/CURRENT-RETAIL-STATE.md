@@ -435,6 +435,117 @@ callable whose body is **`0x1404305D0`**, `fntable = 0x1414B6771`, timeout
 `DISPROVEN` by the `lea` above. It is a closure body (zero xrefs, allocates two
 `0x320`-byte buffers) bound somewhere else; where is `UNKNOWN`.
 
+### `0x140430800` — the 5 ms callable — complete body
+
+`0x140430800` is a **51-byte, self-contained leaf function** (`.pdata` extent
+`0x140430800`–`0x140430833`; no branch anywhere in the image targets it or its
+interior). Full body (`CONFIRMED`):
+
+```asm
+140430800  mov  qword ptr [rsp+0x18], rsi
+140430805  push rdi
+140430806  sub  rsp, 0x20
+14043080A  prefetchw byte ptr [rcx+0x260]
+140430811  xor  esi, esi
+140430813  mov  rdi, qword ptr [rcx+0x260]        ; <-- retry label
+14043081A  mov  rax, rdi
+14043081D  lock cmpxchg qword ptr [rcx+0x260], rsi ; atomically take the list
+140430826  jne  0x140430813                        ; CAS retry
+140430828  test rdi, rdi
+14043082B  je   0x140430874                        ; nothing to do -> return
+14043082D  add  rdi, -0x30                         ; node -> element base
+140430831  je   0x140430874
+140430833  mov  qword ptr [rsp+0x38], rbx          ; loop: save rbx
+140430840  mov  rbx, qword ptr [rdi+0x30]          ; next link
+140430844  xor  r8d, r8d
+140430847  mov  rcx, rdi
+14043084A  call 0x14043B5D0                        ; per-element teardown
+14043084F  mov  rax, qword ptr [rdi]
+140430852  mov  rcx, rdi
+140430855  mov  rax, qword ptr [rax+0x30]          ; vtable slot +0x30
+140430859  call qword ptr [rip+0xf3a461]           ; thunk 0x14136ACC0
+14043085F  test rbx, rbx
+140430862  lea  rdi, [rbx-0x30]
+140430866  cmove rdi, rsi
+14043086A  test rdi, rdi
+14043086D  jne  0x140430840                        ; next element
+14043086F  mov  rbx, qword ptr [rsp+0x38]
+140430874  mov  rsi, qword ptr [rsp+0x40]          ; epilogue (shared tail)
+140430879  add  rsp, 0x20
+14043087D  pop  rdi
+14043087E  ret
+```
+
+Pseudocode:
+
+```text
+0x140430800(this /* the bound obj, rcx */):
+    esi = 0
+retry:
+    rdi = this->[0x260]
+    if !CAS(&this->[0x260], rdi, 0):  goto retry     # steal the whole list
+    if rdi == 0:                      goto done
+    rdi -= 0x30
+    if rdi == 0:                      goto done
+    loop:
+        rbx = rdi->[0x30]                            # next link
+        teardown_element(rdi, 0)                     # 0x14043B5D0
+        (*(this = rdi)->vtable[0x30])(rdi)           # virtual destructor
+        rdi = rbx ? rbx - 0x30 : NULL
+        if rdi: goto loop
+done:
+    return
+```
+
+Semantic reading (`CONFIRMED` from the code shape):
+
+* The function **atomically detaches an intrusive singly-linked list** from
+  `boundobj+0x260` using `lock cmpxchg` in a retry loop, storing `NULL`.
+* It then **destroys every element** of the stolen list: one non-virtual
+  teardown call (`0x14043B5D0`) followed by a virtual call through the element's
+  own `vtable+0x30`.
+* The `-0x30` / `+0x30` pair is the standard MSVC intrusive-list idiom: the link
+  is embedded at offset `0x30`, so the node pointer is `&element->link` and the
+  element base is `node - 0x30`.
+* It is a **leaf** function.
+
+Answering the phase questions:
+
+```text
+return value      = none (void); the ret is shared with 0x140430833
+callees           = 0x14043B5D0 (direct), element vtable+0x30 (indirect)
+mutation          = boundobj+0x260 := NULL
+locks             = one lock-prefixed CAS, no acquired lock held across calls
+container traverse= yes: intrusive singly-linked list at boundobj+0x260
+destruction       = yes: every stolen element is torn down and its virtual
+                    destructor invoked
+fields read       = boundobj+0x260; per element +0x30 and element vtable
+fields written    = boundobj+0x260 := 0
+```
+
+`CONFIRMED`
+
+### `0x140430800` does NOT reach `0x1404245F0`
+
+`0x140430800` is a leaf. Its only direct callee is `0x14043B5D0` and its only
+indirect callee is the element's `vtable+0x30`. There is no path from it to
+`0x1404245F0`, `0x140434430`, `0x14040AEC0` or the Close producer.
+
+```text
+0x140430800 -> 0x1404245F0   = NO     CONFIRMED (leaf function; no such callee)
+```
+
+The historical runtime chain remains separate and unexplained by this function.
+`CONFIRMED` for the absence of the edge; the mechanism producing the historical
+chain is `UNKNOWN`.
+
+### `0x140430800` does not rearm itself
+
+The operation is **one-shot** per invocation of this callable. Nothing in the
+body re-registers, re-arms or reschedules anything: it only steals and destroys
+a list and returns. Whether the *framework* re-arms the operation around it is
+`UNKNOWN`, but the callable itself does not. `CONFIRMED` for the callable.
+
 ### The operation object produced by the factory, byte-for-byte
 
 `0x1404595E0` allocates **`0x78`** bytes and constructs the operation
