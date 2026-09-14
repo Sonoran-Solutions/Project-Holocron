@@ -6720,10 +6720,12 @@ xref_indexed(0x140434430) = []              (no lea, no direct call)
 The containing table resolves cleanly:
 
 ```text
-vtable base      0x1414B6938
 COL              0x1417029F8   (self-pointer verified)
+vtable base      0x1414B6938   (COL at vtable-0x08, same convention as the
+                                proven PacketSocket vtable 0x1414B6968)
 class            omega::ObjectSurrogateEventConnectionOpen
-slot             0x140434430 sits at vtable+0x08
+slot             vtable+0x00 = 0x1404344F0 (scalar deleting destructor)
+                 vtable+0x08 = 0x140434430  <-- our function
 bases            ObjectSurrogateEventConnectionOpen
                  ObjectSurrogateEvent
                  ApartmentEvent

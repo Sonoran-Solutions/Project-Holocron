@@ -178,14 +178,75 @@ so the element list is fed from the **inbound RequestIDSignature and
 IntroduceConnection paths**, and the same `0x140412180` is what calls
 `0x140435CE0` → `0x1403FC0B0` (add + arm).
 
+### `0x140434430` is a vtable slot of `omega::ObjectSurrogateEventConnectionOpen`
+
+It materialises in a **different shape** from `0x1404245F0`, which matters for
+how it must be searched:
+
+```text
+xref_indexed(0x140434430) = []            no lea, no direct call
+xref_le64(0x140434430)    = [0x1414B6940] one raw pointer, and it is in a vtable
+```
+
+The containing table resolves cleanly (`CONFIRMED`):
+
+```text
+COL              0x1417029F8   signature 1, self-pointer verified
+vtable base      0x1414B6938   (COL sits at vtable-0x08, same convention as the
+                                proven PacketSocket vtable 0x1414B6968)
+class            omega::ObjectSurrogateEventConnectionOpen
+slot             vtable+0x00 = 0x1404344F0 (scalar deleting destructor, size 0x28)
+                 vtable+0x08 = 0x140434430  <-- our function
+```
+
+Base-class list of that class (from its Class Hierarchy Descriptor):
+
+```text
+.?AVObjectSurrogateEventConnectionOpen@omega@@
+.?AVObjectSurrogateEvent@omega@@
+.?AVApartmentEvent@omega@@
+.?AUintrusive_list_node@eastl@@          (mdisp 0, pdisp 8)
+```
+
+`0x140434430` reads `[this+0x18]` and `[this+0x20]`, takes the object at
+`[[this+0x18]+0x100]`, and notifies it twice, each time passing a copy of the
+`[this+0x20]` intrusive pointer:
+
+```text
+1. (*obj)->vtable[0x28](obj, &copy_of_[this+0x20])
+   if that returns non-zero -> skip step 2
+2. (*obj)->vtable[0x70](obj, &copy_of_[this+0x20])
+```
+
+Its sibling `0x1404344F0` is the scalar deleting destructor: it releases
+`[this+0x20]` and `[this+0x18]` through their `vtable+0x30`, installs the vtable,
+and calls `operator delete` with `edx = 0x28`.
+
+```text
+0x140434430 identity   a virtual method of
+                       omega::ObjectSurrogateEventConnectionOpen that notifies
+                       the listener at [[this+0x18]+0x100] with the captured
+                       value at [this+0x20]                          CONFIRMED
+semantics of the two notified slots (vtable+0x28, vtable+0x70)      UNKNOWN
+dispatch relationship 0x140434430 -> 0x14040AEC0                    UNKNOWN
+```
+
+It is an **event/notification object** whose class also derives from
+`eastl::intrusive_list_node`, so instances can live in an intrusive collection —
+but it is not itself the owner of the `0x1404245F0` collection.
+
 ### What this changes about the boundary
 
 ```text
 0x1404245F0      = per-owner deferred element drain (destroys list elements)
                    CONFIRMED
-0x140434430      NOT yet reversed
-0x14040AEC0      still the routed-peer classifier that can call 0x1404123D0
+0x140434430      = vtable+0x08 of omega::ObjectSurrogateEventConnectionOpen,
+                   a notifier that calls [[this+0x18]+0x100] via vtable+0x28
+                   then vtable+0x70                                CONFIRMED identity
+0x14040AEC0      = routed-peer classifier that can call 0x1404123D0
+0x140434430 -> 0x14040AEC0 dispatch                                UNKNOWN
 primary failure decision   still UPSTREAM / UNKNOWN
+primary failure vs secondary cleanup                               UNKNOWN
 ```
 
 The old label "collection teardown" for `0x1404245F0` is **narrowed**: it is the
