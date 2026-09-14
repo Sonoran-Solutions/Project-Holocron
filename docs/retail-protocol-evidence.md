@@ -6912,8 +6912,21 @@ different class.)
 
 ### Where the fourth string argument comes from
 
-The peer is created on the **IntroduceConnection** path
-(`0x14042C910`, dispatcher arm `0x8B0D492F` at `0x14042BA77`) via `0x14042B3D0`:
+The constructor assigns its parameters positionally, so `peer+0x40` is `p5`:
+
+```asm
+1404128d7  rdx = [rbp+0xC8] -> peer+0x00     (p2)
+1404128e7  rdx = [rbp+0xD0] -> peer+0x10     (p3)
+1404128f7  rdx = [rbp+0xD8] -> peer+0x30     (p4)
+140412907  rdx = [rbp+0xE0] -> peer+0x40     (p5)   <-- the tested field
+```
+
+On the **IntroduceConnection** path (`0x14042C910`, arm `0x8B0D492F` at
+`0x14042BA77`) `p5` traces to `[rbp-0x48]` of `0x14042B3D0`, which is written
+from `[r12]` with `r12 = [rbp+0xD8]` — the **fourth parameter** of that function,
+and the same object the ReplyIDSignature path stores at `conn+0x88`. So `p5` is a
+**neighbouring peer object of the same kind** on this path, not the new peer's own
+name. The handler separately derives a name of its own:
 
 ```asm
 14042b62d  lea  rdx,[rip+..]     ; 0x14157C690 = "localhost"

@@ -498,35 +498,52 @@ operates on a different class, so the peer's `+0x40` has a single producer.
 
 ### Where the fourth string argument comes from
 
-The peer is constructed from the **IntroduceConnection** handler
-(`0x14042C910`, dispatcher arm `0x8B0D492F`) via `0x14042B3D0`, which calls the
-peer creator `0x140411D30` at `0x14042B721` with the stack arguments:
+The peer constructor assigns its four string parameters positionally:
 
 ```asm
-14042b62d  lea  rdx,[rip+..]            ; 0x14157C690 = "localhost"
-14042b63b  call 0x1411C8EF0             ; compare the peer-name argument
+1404128d7  rcx = new_peer          rdx = [rbp+0xC8]  -> peer+0x00
+1404128e7  rcx = new_peer + 0x10   rdx = [rbp+0xD0]  -> peer+0x10
+1404128f7  rcx = new_peer + 0x30   rdx = [rbp+0xD8]  -> peer+0x30
+140412907  rcx = new_peer + 0x40   rdx = [rbp+0xE0]  -> peer+0x40   <-- p5
+```
+
+So `peer+0x40` is the constructor's **fifth argument**. On the
+**IntroduceConnection** path (`0x14042C910` -> `0x14042B3D0` -> `0x140411D30`,
+call site `0x14042B721`) that fifth argument traces back to `[rbp-0x48]` of
+`0x14042B3D0`, and `[rbp-0x48]` is written at `0x14042B619` from `[r12]`, where
+`r12 = [rbp+0xD8]` — the **fourth parameter of `0x14042B3D0`**:
+
+```asm
+14042b60c  lea  rax,[rbp-0x48]
+14042b615  mov  rax,[r12]              ; r12 = [rbp+0xD8] = the 4th argument
+14042b619  mov  [rbp-0x48], rax
 ...
-14042b683  lea  r14,[rip+..]            ; 0x14156BD60 = ""  (empty singleton)
-14042b68a  mov  [rsp+0x60], r14         ; -> the name argument becomes ""
-14042b6e5  lea  rax,[rbp-0x48]
-14042b6e9  mov  [rsp+0x40], rax         ; arg5 = &{name-ish object}
-14042b6f5  ...
-14042b721  call 0x140411D30
+14042b6e9  mov  [rsp+0x40], rax        ; -> arg5 of the peer creator
+```
+
+That fourth argument is the object that the ReplyIDSignature path also stores at
+`conn+0x88`, i.e. the **object wrapped by the "peer" event payload** — so on this
+path `peer+0x40` is sourced from a **different, neighbouring object of the same
+kind** rather than from the new peer's own name.
+
+The IntroduceConnection handler also derives a peer-name string of its own, and
+falls back to the empty string when the override is absent:
+
+```asm
+14042b62d  lea  rdx,[rip+..]           ; 0x14157C690 = "localhost"
+14042b63b  call 0x1411C8EF0            ; compare the name argument
+14042b683  lea  r14,[rip+..]           ; 0x14156BD60 = ""
+14042b68a  mov  [rsp+0x60], r14        ; the name argument becomes ""
 ```
 
 ```text
-the peer-name string is "localhost", OR an override;
-when the override is absent/empty the name argument is set to the EMPTY STRING
-the empty-string singleton 0x14156BD60 is both the "no name" sentinel and the
-value written into the fresh peer's string fields
-```
-
-```text
-peer+0x40 writer            = the peer constructor 0x1404128A0/0x140412907
-peer+0x40 source            = the 4th string argument of 0x140412820,
-                              supplied by the IntroduceConnection path
-failing value               = "" (the empty-string singleton)   CONFIRMED observed
-required-to-skip value      = the exact two-byte string "*"     CONFIRMED in code
+peer+0x40 writer       = the peer ctor 0x140412907 (parameter p5), after the
+                         constructor's own empty default at 0x1404128A0  CONFIRMED
+peer+0x40 source       = p5 of 0x140412820 = the 4th argument of 0x14042B3D0,
+                         i.e. the neighbour object also stored at conn+0x88 HYPOTHESIS
+failing value          = "" (the empty-string singleton)             CONFIRMED observed
+required-to-skip value = the exact two-byte string "*"               CONFIRMED in code
+which argument is empty on the failing path                          UNKNOWN
 ```
 
 ### Correct classification of the old wildcard experiment
