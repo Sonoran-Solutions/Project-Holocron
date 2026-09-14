@@ -4627,3 +4627,221 @@ D4 causality                                    UNKNOWN (not sent)
 
 **No server behaviour was changed and D4 was not sent.** The private client and
 the platform fixture were restored byte-exactly after every run.
+
+---
+
+## The 5 ms poll is an operation-completion wait, and `0x140423A70` is its completion routine (September 13)
+
+This section is **static reconstruction** plus the runtime facts already recorded
+in the previous checkpoint. No new debugger instrumentation of the 5 ms loop was
+used, per the standing constraint that WineDbg's GDB stub perturbs the client.
+
+### `0x140423B50` is the single operation/timer factory
+
+Every timer-like registration in the image goes through `0x140423B50`. Argument
+roles, recovered from the body and confirmed against the runtime witnesses of
+the previous checkpoint:
+
+```text
+rcx          = operation owner object      (0x14B3DA0, 0x14B3C90, 0x14B3EB0, ...)
+rdx          = out shared_ptr slot (two qwords cleared then filled)
+r8           = pointer to a materialised callable (function-object table)
+r9d          = timeout in milliseconds
+[stack+0x20] = byte flag forwarded to 0x1404595E0
+```
+
+It takes the owner's spinlock, builds the callable, links it into the owner's
+structure at `owner+0x90`, and finishes by starting the timer:
+
+```asm
+140423ba2  lock cmpxchg dword ptr [rcx+0xa8], r13d    ; owner spinlock
+140423bf6  call 0x1404595e0                            ; build callable
+140423c0d  call 0x140425600                            ; shared_ptr control block
+140423ccf  ...               mov  rax, [rbx]           ; operation object
+140423d06                    mov  rax, [rcx]           ; its function table
+140423d09                    mov  r8d, dword ptr [rax+0x28]   ; timeout
+140423d33                    call 0x140423FF0          ; start the timer
+```
+
+That tail call is the key: **`0x140423FF0` is the timer/operation start entry**
+and `0x140423DD0` is the wait it runs. The previous checkpoint's `CONFIRMED`
+values now have roles:
+
+```text
+0x1523E58 + 0x28 = 5     wait quantum, read at 0x140423EEC, clamped to >= 1 ms
+0x1523E58 + 0x2C = 1     wait-mode selector (cmp byte ptr [rax+0x2c],0)
+0x1523E58 + 0x2D = 0     FINISHED flag
+```
+
+### Correction: `+0x2D` is the finish flag, and it has exactly one writer
+
+The previous checkpoint recorded `+0x2C`/`+0x2D` as `UNKNOWN` semantics with no
+observed writer. The writer exists and was found statically. `0x140423A70` is
+the **completion routine**, and its body is:
+
+```asm
+140423a70  mov  [rsp+0x10], rdx
+140423a93  cmp  qword ptr [rdx], 0        ; target present?
+140423a99  lea  rcx, [rdx+8]              ; else just release the refcount
+140423af2  mov  rax, [rdi]
+140423af5  mov  rsi, [rax]                ; rsi = the target
+140423af8  cmp  byte ptr [rsi+0x2d], 0
+140423afc  jne  0x140423b19               ; already finished -> skip
+140423afe  call 0x140fdb1c0               ; clock read
+140423b03  lea  rdx, [rsi+0x38]           ; result slot
+140423b07  lea  r8,  [rsp+0x28]
+140423b0c  mov  rcx, [rsi+0x30]           ; owner-visible context
+140423b10  call 0x140424860               ; publish the result / signal
+140423b15  mov  byte ptr [rsi+0x2d], 1    ; <-- the only writer
+```
+
+So `target+0x2D` means **"this operation is finished"**, and its readers are:
+
+```text
+0x140423e0d  cmp byte ptr [r8+0x2d], 0   ; non-zero -> exit, no wait, no teardown
+0x140423af8  cmp byte ptr [rsi+0x2d], 0  ; non-zero -> nothing left to do
+```
+
+The previous statement "semantics UNKNOWN, no runtime writer was observed" is
+now `SUPERSEDED` for `+0x2D`: the writer is static, in the completion routine,
+and was simply never executed in the instrumented windows.
+
+`target+0x2C` selects the wait mode. `0x140423DD0` tests it directly
+(`cmp byte ptr [rax+0x2c],0`), and with the measured value `1` the timed-wait arm
+runs (`0x140423FF0` with `r8d = [target+0x28] = 5`). What the two modes *mean* is
+still `HYPOTHESIS`; which arm each value selects is `CONFIRMED`.
+
+### `0x1403FC050` is why both the timeout and the owner-cancel reach the same place
+
+`0x1403FC050` is the shared cancel helper, and its body ends in a direct call to
+the completion routine:
+
+```asm
+1403fc050  ...
+1403fc063  mov  rcx, [rcx]
+1403fc070  mov  rax, [rdx]
+1403fc078  lea  rbx, [rdx+8]
+1403fc08e  lock xadd dword ptr [rdx+8], eax      ; intrusive refcount
+1403fc098  call 0x140423a70                      ; <-- completion routine
+```
+
+Ten call sites. Three are inside `0x14042FBA0` — the operation teardown that runs
+when an operation is **replaced**:
+
+```asm
+14042fba0  ...
+14042fbd7  mov  rcx, [rdi+0x220]        ; the registered operation
+14042fc25  call 0x1403fc050             ; cancel it
+14042fc32  mov  rax, [rdi+0x248]        ; second slot
+14042fcaa  ...
+14042fc9d  call 0x1403fc050             ; cancel it
+14042fcd7  mov  rax, [rdi+0x238]        ; third slot
+14042fd13  call 0x1403fc050             ; cancel it
+```
+
+and one is inside the polling body `0x140430620` (`0x140430798`).
+
+This is the substantive result of this pass: **the timed-wait arm and the
+owner-cancel path converge on the same completion routine.** "The wait did not
+finish in time" and "the owner stopped the operation" are therefore not
+distinguishable downstream from the call graph alone. Which one runs in the
+failing run is `UNKNOWN`.
+
+### Correction: every closure body here has zero xrefs
+
+`0x140423DD0`, `0x14042FD80` and `0x1404305D0` all have zero direct branches and
+zero 8-byte image references. They are function objects whose addresses are
+materialised at runtime. The earlier "no callers, therefore dispatched by
+something not yet localized" reading was correct but under-stated: *any* function
+in this binary with no xrefs must first be suspected of being a closure body.
+
+### The poller thread and its callback
+
+`0x140430620` opens with `cmp byte ptr [rdi+0x258],0 / je 0x140430757` and then
+`cmp qword ptr [rdi+0x248],0`. If the second check passes it takes
+`[rdi+0x220]`, builds a refcounted callable, calls the shared cancel helper
+`0x1403FC050`, clears `[rdi+0x248]`/`[rdi+0x250]`, and **registers a 1000 ms
+timer** (`r9d = 0x3E8` at `0x1404306F4`) into `[rdi+0x238]`.
+
+The callback slot `app+0x228` — armed with **500 ms** by `0x14042F960`
+(`r9d = 0x1F4` at `0x14042FA39`) — holds a closure whose body is `0x1404305D0`:
+
+```asm
+1404305d0  mov  rbx, rcx                  ; ClientApplicationImpl*
+1404305d9  call 0x140431030               ; per-tick connection walk
+1404305de  mov  rcx, [rbx+8]
+1404305e2  lea  rdx, [rip+0x114e2e7] "connection"
+1404305e9  mov  rcx, [rcx+0xe8]
+1404305f0  call 0x1403FC4C0
+1404305f5  mov  rcx, [rbx+8]
+1404305f9  lea  rdx, [rip+0x114e330] "signature"
+140430600  mov  rcx, [rcx+0xe8]
+140430607  jmp  0x1403FC4C0               ; tail call: its result is the return
+```
+
+`"signature"` at `0x14157E930` is referenced from **exactly one** code site in
+the whole image: `0x1404305FA`. `"connection"` at `0x14157E8D0` is referenced
+from `0x1400279EB`, `0x140409241`, `0x140409369`, `0x14040948E`, `0x1404095AE`,
+`0x1404096CF`, `0x1404097F3` and `0x1404305E3`.
+
+### The per-tick work is a connection-list walk
+
+`0x140431030` takes a critical section on `owner+0x268` and walks two ordered
+collections of intrusive-pointer elements:
+
+```asm
+14043105a  cmp qword ptr [rsi+0x2a8], 0
+140431064  mov rax, [rsi+0x2a0]            ; index
+14043106b  mov rbx, [rsi+0x2c0]            ; pointer array
+140431072  mov rbx, [rbx+rax*8]            ; element
+140431098  call 0x140409a60                ; virtual dispatch on the element
+1404310d9  cmp qword ptr [rsi+0x2e0], 0
+140431122  call 0x140409c50                ; second collection
+```
+
+and `0x140431180` shows the same owner gaining a new **0x88-byte** element that
+is inserted into a `std::map` at `owner+0x298`:
+
+```asm
+1404311b3  mov ecx, 0x88
+1404311bb  call mm_alloc
+1404311dd  call 0x140408f00               ; build the element name/state
+1404311e9  mov [rdi], rax                 ; return an intrusive pointer
+14043121d  lea rcx, [rsi+0x298]           ; std::map
+140431228  call 0x140432670               ; map::operator[]
+```
+
+The 0x88 size matches the routed-peer record recorded earlier in this notebook,
+but establishing that these are the same object is `UNKNOWN` and is not claimed
+here.
+
+### What was established, and what was not
+
+```text
+0x140423B50 is the operation/timer factory                       CONFIRMED
+its r9d is the timeout in ms; tail-calls 0x140423FF0             CONFIRMED
+target+0x28 is the wait quantum (5), clamped to >= 1 ms          CONFIRMED
+target+0x2C selects the wait mode                                CONFIRMED
+target+0x2D is the FINISHED flag, written only in 0x140423A70    CONFIRMED
+0x140423A70 is the completion routine                            CONFIRMED
+0x1403FC050 (cancel) calls 0x140423A70, so timeout and owner
+  cancel converge on the same routine                            CONFIRMED
+0x140430620 walks connection collections and arms 1000 ms        CONFIRMED
+app+0x228 closure body is 0x1404305D0, armed at 500 ms           CONFIRMED
+0x1404305D0 looks up "connection" then "signature"               CONFIRMED
+what the two lookups return and which branch consumes them       UNKNOWN
+whether "connection"/"signature" are settings, interfaces or
+  named content                                                  UNKNOWN
+which of timeout vs owner-cancel fires in the failing run        UNKNOWN
+concrete identity of the 0x1404245F0 collection                  UNKNOWN
+whether the failed operation is local or peer-visible            UNKNOWN
+D4 causality                                                     UNKNOWN (not sent)
+```
+
+The historical teardown chain
+`0x140423DD0 -> 0x1404245F0 -> 0x140434430 -> 0x14040AEC0` is **retained as
+previously captured evidence**. It was not re-observed in this pass, and no new
+instrumentation was introduced to try, per the constraint that WineDbg's stub
+perturbs the 5 ms loop and prevents the normal login path.
+
+**No server behaviour was changed and D4 was not sent.**

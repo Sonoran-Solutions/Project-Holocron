@@ -202,9 +202,9 @@ Runtime gate values at the first entry of the failing-direction run
 
 ```text
 [r8]            = 0x00000000        (the dword the entry compare reads)
-0x1523E58+0x28  = 0x00000005        (dword)
-0x1523E58+0x2C  = 0x01              (byte)
-0x1523E58+0x2D  = 0x00              (byte)
+0x1523E58+0x28  = 0x00000005        (dword: wait quantum in ms)
+0x1523E58+0x2C  = 0x01              (byte: wait-mode selector)
+0x1523E58+0x2D  = 0x00              (byte: FINISHED flag, 0 = not finished)
 0x1523E58+0x00  = 0x1414B6761       (function table pointer, low bit set)
 0x1523E58+0x08  = 0x140430800
 0x1523E58+0x28  = 0x0000000100000005 (refcount pair: strong 5, weak 1)
@@ -262,7 +262,97 @@ object registered at site `0x140446693` (a 60 s registration); the 5 ms closure
 that reaches `0x140423DD0` belongs to `0x14B3DA0`. **Do not treat either address
 as identity**; the type is the identity. `CONFIRMED`
 
-### Owner teardown chain (all on thread 2)
+### `0x140423B50` is the operation/timer factory, and `0x140423A70` is its completion routine
+
+`0x140423B50` is the single registration entrypoint used by every timer-like
+site in the image. Its arguments (`CONFIRMED` from disassembly plus the runtime
+witnesses in the previous checkpoint):
+
+```text
+rcx       = operation/timer owner object   (e.g. 0x14B3DA0, 0x14B3EB0)
+rdx       = out shared_ptr slot (two qwords written at 0x140423B8F/0x140423B92)
+r8        = pointer to a materialised callable (function-object pointer table)
+r9d       = timeout in milliseconds        (500, 5, 60000, 1000, ...)
+[stack+0x20] = a byte flag passed through to 0x1404595E0
+```
+
+It acquires the owner's spinlock at `owner+0xA8` (`lock cmpxchg dword ptr
+[rcx+0xA8]`), allocates the callable, inserts it into the owner's structure at
+`owner+0x90`, and at its tail calls the **timer-start** entry:
+
+```text
+140423d03  mov  rcx, [rbx]                  ; operation object
+140423d06  mov  rax, [rcx]                  ; its function table
+140423d09  mov  r8d, [rax+0x28]             ; timeout carried in the callable
+140423d33  call 0x140423FF0
+```
+
+`CONFIRMED`
+
+`0x140423FF0` is therefore **the timer/operation start entry**, and
+`0x140423DD0` is the wait it runs. The two callbacks are not symmetric peers:
+
+* `0x140423FF0` — runs the wait (`0x140423DD0` inline, or the
+  `condition_variable`-style helper `0x140424860`).
+* `0x140423A70` — the **completion routine**. `CONFIRMED` from its body:
+
+```asm
+140423af2  mov  rax, [rdi]           ; [rdi] = operation target
+140423af5  mov  rsi, [rax]           ; rsi  = the target
+140423af8  cmp  byte ptr [rsi+0x2d], 0
+140423afc  jne  0x140423b19          ; already finished -> skip
+140423afe  call 0x140fdb1c0          ; clock read
+140423b03  lea  rdx, [rsi+0x38]      ; result slot
+140423b07  lea  r8,  [rsp+0x28]
+140423b0c  mov  rcx, [rsi+0x30]      ; owner-visible context
+140423b10  call 0x140424860          ; publish the result
+140423b15  mov  byte ptr [rsi+0x2d], 1   ; <-- the finish flag
+```
+
+So:
+
+* **`target+0x2D` is the operation's "finished" byte.** It is written only here.
+  Its read site is the entry guard of `0x140423DD0`
+  (`cmp byte ptr [r8+0x2d],0 / jne 0x140423FA9`) and its own guard at
+  `0x140423af8`. When it is 0 the operation has not finished. `CONFIRMED`
+  (writer + reader + effect); the earlier "semantics UNKNOWN" is superseded.
+* **`target+0x2C` selects the wait mode.** `0x140423DD0` tests it with
+  `cmp byte ptr [rax+0x2c],0`; non-zero takes the timed-wait arm that calls
+  `0x140423FF0` with `r8d = [target+0x28]`, zero takes the arm that calls
+  `0x140423A70` directly. What the two modes *mean* is `HYPOTHESIS`; that it
+  selects between those two arms is `CONFIRMED`.
+* **`target+0x28` is the wait quantum in milliseconds** (measured 5), read at
+  `0x140423EEC` and clamped to a 1 ms floor. `CONFIRMED`
+
+`0x1404245F0` is reached from **`0x1403FC050`**, the shared cancel helper:
+
+```asm
+1403fc063  mov  rcx, [rcx]        ; operation context
+1403fc070  mov  rax, [rdx]        ; the callable
+1403fc078  lea  rbx, [rdx+8]
+1403fc08e  lock xadd dword ptr [rdx+8], eax   ; intrusive refcount
+1403fc098  call 0x140423a70       ; <-- completion routine
+```
+
+`0x1403FC050` is called from exactly ten sites; three are inside
+`0x14042FBA0` (the operation teardown used when an operation is replaced) and
+one is inside the polling body `0x140430620`. `CONFIRMED`
+
+**Consequence:** both the timed-wait arm and the cancel path converge on the
+same completion routine `0x140423A70`, and the polling body's own cleanup
+reaches `0x140423A70` through `0x1403FC050`. This is the mechanism by which
+"the wait did not finish in time" and "the owner decided to stop the operation"
+produce the same downstream behaviour. `CONFIRMED` for the call graph;
+`UNKNOWN` for which one runs in the failing run.
+
+### All closure bodies reached this way have no static xrefs
+
+`0x140423DD0`, `0x14042FD80` and `0x1404305D0` share the same property: zero
+direct branches, zero 8-byte image pointers. They are all function objects whose
+addresses are materialised at runtime. Any future "this function has no callers"
+observation must be treated as "this is a closure", not as "unreachable".
+`CONFIRMED`
+
 
 ```text
 0x140423DD0  timed / conditional wait logic
@@ -302,10 +392,10 @@ then:       [target+0x2C] == 0           ; -> completion arm (0x140423A70)
 Open inputs, still `UNKNOWN`:
 
 * meaning of `[r8]` (a stack slot holding 0 in every observed iteration);
-* the writer of `[target+0x2C]` and `[target+0x2D]`, and what logical state each
-  byte represents. They were **`0x01`/`0x00` at every observed entry and never
-  changed** across thousands of iterations of the 5 ms loop;
-* which event sets `[target+0x2D]` to 1 so the predicate can succeed;
+* the writer of `[target+0x2C]`; it was **`0x01` at every observed entry and
+  never changed** across thousands of iterations of the 5 ms loop;
+* which code path sets `[target+0x2D]` to 1 in the *failing* run, and whether the
+  timeout arm or the owner-cancel arm got there first;
 * identity and contents of the `0x1404245F0` collection;
 * whether the observed **~83 ms** is itself a timeout. It is only the broad
   `CS_LOGGING_IN` → `HandleLaunchFailure` interval and was never isolated to
