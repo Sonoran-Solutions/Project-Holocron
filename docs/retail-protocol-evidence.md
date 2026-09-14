@@ -3288,3 +3288,213 @@ by previous sessions (`/opt/holocron-test`, a `bwrap` namespace built by
 `tools/launch-isolated-client.sh`) requires the private Proton tree to start a
 WineDbg proxy, and it did not come up in this environment, so no witness value
 was obtained. **No server behaviour was changed.**
+
+## Which ApplicationImpl release site drops the TimeRequester (September 13)
+
+This section answers the question left open by the previous one: which of the
+three `App+0x1A8` release sites drops the final `omega::TimeRequester`
+reference, and what decides it. The result is that the teardown is cleanup
+driven by the application object's **one-shot teardown latch `App+0x2A`**
+(`0x140406C90` → `0x140446830`), and that the real failure boundary is *above*
+it, in the client's own login-transport initialisation `0x140427F10`. The three
+release sites are classified below against a real captured run.
+
+### Phase 1 — the three release sites
+
+```text
+A  0x1404467C1  inside 0x140446490..0x14044682D  (the ApplicationImpl owner method)
+B  0x140446830  inside 0x140446830..0x14044689F  (dedicated clear, 0x6F bytes)
+C  0x140445B2E  inside 0x140445A60..0x1404463AA  (~ApplicationImpl)
+```
+
+All three zero the `{ptr, control block}` pair at `App+0x1A8`/`App+0x1B0` and
+then call the shared-pointer release primitive `0x1400B79F0`:
+
+```text
+A  1404467b5  mov rax,[rbx+0x1a8]     ; old value
+   1404467c1  mov [rbx+0x1a8],rcx     ; install the new TimeRequester
+   1404467e5  call 0x1400b79f0        ; release the old pair
+B  140446852  mov rax,[rcx+0x1a8]
+   140446860  mov qword ptr [rbx+0x1a8],0
+   14044686e  mov qword ptr [rbx+0x1b0],0
+   14044687f  call 0x1400b79f0
+C  140445b14  mov rax,[r15]           ; r15 = &App+0x1A8
+   140445b1b  mov qword ptr [r15],0
+   140445b22  mov qword ptr [r15+8],0
+   140445b2e  call 0x1400b79f0
+```
+
+**Site B is the only one reachable while the application stays alive.** Its
+containing function is reachable by exactly one edge in the whole image — a tail
+`jmp` from `0x140406F54` inside `0x140406C90` — and `0x140406C90` stores the
+one-shot shutdown byte `App+0x2A`:
+
+```text
+140406ccf  cmp byte ptr [rax+0x2a],0     ; App = [this+8]
+140406cd3  jne 0x140406ef5               ; already shut down -> skip everything
+140406cd9  mov byte ptr [rax+0x2a],1     ; latch
+140406ce7  call qword ptr [rax+0x20]     ; one virtual "stop" step
+140406cf1  mov rcx,[r14+0x1a8]           ; the TimeRequester
+140406cfd  call 0x140467a40              ; deactivate it (clears TR+0x40)
+...
+140406f54  jmp 0x140446830               ; -> the clear (site B)
+```
+
+`App+0x2A` is read or written in only three places, all inside the
+`0x140406B20..0x140406F49` vtable cluster, so it is a private one-shot latch for
+this teardown pair and nothing else consumes it.
+
+### Runtime witness — CONFIRMED, read-only, no client bytes patched
+
+The isolated private client was run under the existing WineDbg GDB proxy with
+hardware breakpoints only. The client executable was never modified:
+
+```text
+before 47d8c8f03242606819fe7afe711bfd8186e83811a178613a89f944ccb1ac4f14
+after  47d8c8f03242606819fe7afe711bfd8186e83811a178613a89f944ccb1ac4f14
+```
+
+Captured at the owner's constructor call:
+
+```text
+### REPLACE-CREATE 0x14044672c  App=0x14b3e00  old App+1A8=(nil)
+```
+
+**Site A fired exactly once and with `App+0x1A8 == NULL`.** The replacement path
+is a *first-time creation*, not a replacement: there was no previous
+`TimeRequester` reference to drop, so site A cannot be the release that produced
+the observed teardown.
+
+Captured on a later, independent login attempt in the same instrumented run:
+
+```text
+[A] launch name=local-test
+    sp+0x38=(nil) +0x48=(nil) +0x78=0x14afd80 +0x80=(nil) +0x88=(nil) +0x90=(nil)
+[B] after first check al=1
+[C] after get-or-create rax=0x69cb9f8  +0x80=(nil)
+[D] check +0x80 rcx=(nil)  +0x80=(nil) +0x90=(nil)
+[H] *** 1003 REPORT SITE REACHED ***
+```
+
+`ServerProxy+0x80` — the auth transport — is **null**, so the report came from
+the `0x1404280E0` arm of `0x140427F10`, not from `OnDisconnect`. The teardown
+breakpoint at `0x140468D40` never fired in that run, i.e. `TimeRequester`
+remained owned.
+
+### Phase 2 — replacement is startup-only, formally
+
+Site A is reached only from `0x1404058F0`, which is reached only from
+`0x140120DF0`, which is the client-startup singleton step reached only from
+`0x14010C070` ← `0x1400BBE40`, gated at `0x1400BBE75` by an already-initialized
+test. It installs a *new* `TimeRequester` and **requires `App+0x1A8` to be
+NULL**: the witness shows exactly that, and the containing call cannot succeed a
+second time because nothing between the two states clears `App+0x1A8`. It is
+**IMPOSSIBLE FOR OBSERVED RUN** as the release.
+
+### Phase 3/4 — the explicit clear and its upstream event
+
+Site B is **POSSIBLE FOR OBSERVED RUN** and is the only candidate that survives.
+Its upstream is the one-shot application-level teardown `0x140406C90`, which
+latches `App+0x2A`, deactivates the `TimeRequester` (`0x140467A40`), performs the
+remaining game-level teardown (`0x140408190`, `0x1404084A0`, `0x14042B1F0`,
+`0x140424550`), and then tail-calls the clear. The clear additionally hands the
+`ServerProxy` to the bounded spin/settle helper `0x1404411F0`:
+
+```text
+140446889  mov rcx,[rbx+0x1d8]    ; ServerProxy
+14044689a  jmp 0x1404411f0        ; (ServerProxy, edx = arg2, r8b = 1)
+```
+
+`0x1404411F0` is called from exactly two places in the whole image: inside
+`~ApplicationImpl` at `0x140445D8E`, and from this clear at `0x14044689A`. That
+shared tail is the decisive discriminator — **the clear is a bounded
+deactivation of the running application, not a destruction of it.**
+
+### Phase 5/6 — causal order, and the 45 ms
+
+```text
+TimeRequester teardown is NOT the root failure.  It is cleanup.
+
+root decision  : the application object enters its one-shot teardown
+                 (App+0x2A 0 -> 1) during the login attempt
+                 -> 0x140406C90 deactivates the TimeRequester (0x140467A40)
+                 -> clears App+0x1A8/App+0x1B0 (0x140446830)
+                 -> 0x1400B79F0 drops the last reference
+                 -> 0x14011D7C0 control-block Destroy
+                 -> 0x140468D40 TimeRequester vtable slot +0x00
+                 -> 0x1404123D0(connection, 0, 0)  ->  Close 0x43DB3479
+                 -> ServerProxy::OnDisconnect (0x14042718E) still sees the
+                    launch context at +0x90 and reports 1003
+```
+
+The 45 ms is **not a network timeout**. There is no timer, queued task or
+failed future in this chain: `0x140406C90` is a straight-line synchronous
+teardown and every step is an ordinary call. The latency is simply the cost of
+the steps above, which is exactly the order of magnitude observed. The chain is
+entered from an immediate application-level decision, so it is a correct
+inference that a local condition present at the start of the attempt caused it.
+`Close` and `1003` are both *after* that decision.
+
+### Phase 7 — what the runtime witness resolved, and what it could not
+
+Resolved: site A is a first-time creation with a null old value; site D
+(there is no site D) — the teardown is a released reference and not a direct
+call; the `TimeRequester` is still owned in a modern failing attempt.
+
+Not resolved: the exact dispatch of `0x140406C90`. Its vtable cluster
+(`0x1414B5A00`, `0x1414B5B50`, `0x141483378`) is referenced by **zero**
+rip-relative loads in `.text` and by zero 8-byte data pointers, so the
+`this` object is not built by a direct vtable store anywhere in the image; it is
+installed through the interface machinery. The upstream event is therefore
+**documented as a remaining ambiguity** rather than guessed.
+
+### Phase 8/9 — the true root condition, and D4
+
+The earliest non-cleanup failing condition found in this pass is in the client's
+own login-transport initialisation, `0x140427F10` (reached from
+`ConnectionObject::beginConnection` at `0x140135AE2`, immediately after
+`setState CS_LOGGING_IN`). It hard-gates the attempt on prerequisites that are
+all **local**, before any socket exists:
+
+```text
+0x14042803A  call 0x140407000   ; name/pattern pre-check
+0x140428041  jne  ok
+0x140428043  ... mov dword [..],0x3EB ; jmp 0x140428327   -> 1003
+0x140428077  call 0x1404061E0   ; build/find the auth transport
+0x1404280C2  test rcx,rcx
+0x1404280CC  jne  ok
+0x1404280CE  ... mov dword [..],0x3EB ; jmp 0x140428327   -> 1003
+0x1404280E8  call 0x14043E2D0   ; transport handshake setup + open
+0x1404280ED  test al,al
+0x1404280EF  jne  ok
+0x1404280F1  ... mov dword [..],0x3EB ; jmp 0x140428327   -> 1003
+```
+
+All three report through `[App_vtable+0x98]` = `HandleLaunchFailure`
+(`0x140122480`, reached in the trace from `0x140428334`). The capture shows the
+`+0x80` precondition absent, so the client reports 1003 to itself without ever
+opening a socket.
+
+**Would receiving D4 before this condition fires prevent the clear?
+UNKNOWN, leaning NO.** D4 (`LoginRequestIFace::slot0`) can only be delivered
+over an already-established routed connection; all three gates above run before
+the transport exists, and the capture shows them failing with
+`ServerProxy+0x80 == NULL`. D4 does *replace* the launch context at
+`ServerProxy+0x90` (`0x14042827C`), which is why a pending D4 exchange is
+plausibly what the *historical* run was waiting for — but nothing in this pass
+proves that a peer message is what was missing in the observed historical run,
+and the historical run's exact failing arm could not be reproduced because it
+depended on an auth exchange that this environment no longer completes.
+
+### NEW FAILURE BOUNDARY
+
+The `Close` this run observes is emitted by the `TimeRequester` teardown, which
+is cleanup triggered by the application object's one-shot teardown
+(`App+0x2A 0 -> 1`, `0x140406C90` → `0x140446830`). The real boundary is *above*
+that: the client's login-transport initialisation `0x140427F10` refunds the
+attempt with a locally synthesised 1003 when one of its prerequisites is absent,
+and it does so before any network I/O.
+
+**No server behaviour was changed.** No peer-visible missing action was proven,
+so no falsifiable experiment was justified: the three gates are local
+prerequisites, and their inputs are not something Holocron currently sends.
