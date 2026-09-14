@@ -7605,3 +7605,153 @@ The previous pass's claim that `0x140412317` is a `call 0x140411D30` is wrong; i
 is a `call 0x1404123d0` (the Close verb), verified by disassembling
 `0x1404122F0-0x140412320` directly. `0x140412180` has exactly two callers,
 `0x14042c782` and `0x14042d15a`, and never calls `0x140411D30`.
+
+## The two Close paths, and the stale-event discriminator (September 13, sixth pass)
+
+### A. Path A vs Path B
+
+`0x1404123D0` has two distinct upstream callers in this subsystem. They must not
+be conflated.
+
+```text
+Path A  route-registration-failure Close
+        0x140412180 at 0x140412317   -> 0x1404123D0(conn, 2, 1)
+        taken when 0x14043D380 reports failure
+        emits NO ConnectionOpen event
+
+Path B  ConnectionOpen-handler Close
+        ObjectSurrogateEventConnectionOpen -> 0x140434430
+          -> listener+0x28 (0x14040A970, returns 0)
+          -> listener+0x70 (0x14040AEC0)
+          -> 0x1404123D0 at 0x14040AF27
+```
+
+The historical first-Close witness returned into `0x14040AF2C`, i.e. the
+instruction immediately after the `call` at `0x14040AF27`. That is **Path B**.
+
+```text
+historical observed first Close caller = 0x14040AEC0 (1 byte past 0x14040AF27)
+0x140412317 Path A failure arm         = alternate Close path
+                                       = NOT the recorded first Close
+```
+
+Neither path is named "the root cause". They are simply two producers.
+
+### B. The success branch of `0x140412180` — where the event comes from
+
+Full success path, `0x140412354` onward:
+
+```asm
+14041231c  xor bl, bl                 ; (failure arm) return FALSE
+...
+140412354  xor r9d, r9d               ; success arm
+140412357  lea edx, [r9 + 4]          ; newState = 4
+14041235b  lea r8d, [r9 + 8]          ; allowedMask = 8
+14041235f  call 0x140414cb0           ; connection state CAS
+140412364  lea rcx, [rdi + 0x70]      ; the connection's notification slot
+140412368  lea rdx, [rsp + 0x58]
+14041236d  call 0x140414250           ; acquire the notify object
+140412373  mov rbx, [rsp + 0x58]
+140412378  test rbx, rbx
+14041237b  je 0x1404123aa             ; no notify object -> still returns TRUE
+14041237d  lea rax, [rsp + 0x50]      ; build the wrapper for the payload
+140412382  mov [rsp + 0x48], rax
+140412387  mov [rsp + 0x50], rdi      ; wrapper[0] = rdi  <-- rdi = the CONNECTION
+14041238c  mov rax, [rdi]
+14041238f  mov rcx, rdi
+140412392  mov rax, [rax + 0x28]      ; vtable+0x28 = retain
+140412396  call rax
+14041239d  lea rdx, [rsp + 0x50]
+1404123a2  mov rcx, rbx
+1404123a5  call 0x140435ce0           ; QUEUE omega::ObjectSurrogateEventConnectionOpen
+1404123aa  mov bl, 1                  ; return TRUE
+```
+
+`rdi` is set once at `0x1404121a8` (`mov rdi, rcx`) and is the **connection**
+argument for the whole function. So the payload handed to the event constructor
+is the connection, and `0x140435CE0` then:
+
+```asm
+140435f97  lea rax, [0x1414b6938]
+140435f9e  mov [rbx], rax             ; install the ConnectionOpen vtable
+140435fa1  mov rcx, [rbp + 0x7f]      ; the event constructor's peer argument
+140435fa5  mov [rbx + 0x20], rcx      ; event+0x20 = that peer, with a retain
+140435fea  mov rdx, rbx
+140435fed  mov rcx, rsi
+140435ff0  call 0x1403fc0b0           ; enqueue into the owner's event queue
+```
+
+`event+0x20` is therefore an **intrusive-pointer copy of the peer captured at
+queue time**, not a live read of `connection+0x88`.
+
+### C. The discriminator: event A is dispatched AFTER peer B replaces it
+
+Static ordering:
+
+```text
+0x140412247  call 0x140412820     ; CREATE + ATTACH the new peer at conn+0x88
+0x140412302  call 0x14043d380     ; register the receive route
+0x14041230c  jne 0x140412354      ; success
+0x1404123a5  call 0x140435ce0     ; QUEUE the ConnectionOpen event
+```
+
+The event is queued **after** the attach, and it captures that peer. Nothing
+serialises the queue against a later `0x140412180` invocation, so:
+
+```text
+invocation #1  attach P1, queue event(P1)
+invocation #2  attach P2 over P1, queue event(P2)
+drain          event(P1) fires while conn+0x88 == P2
+```
+
+At the decider this is exactly the state that makes the two pointers differ:
+
+```asm
+14040aedb  mov rdx, [rdx]         ; rdx = wrapper[0] = the EVENT payload peer
+14040aeeb  lock cmpxchg [rdx+0x88], rcx   ; probe the CURRENT conn+0x88
+14040aefd  mov rax, [rax+0x40]    ; RAX = the CURRENT peer (CAS destination)
+14040af24  mov rcx, [rbx]         ; Close argument = the EVENT payload peer
+```
+
+The order in the recorded evidence is decisive:
+
+```text
+T0  thread 2   NULL    -> peer A  (0x140412A4F)   first attach
+T2  thread 58  peer A  -> peer B  (0x140412A4F)   Introduce attach
+T3/T4 thread 2 0x140423DD0 -> 0x1404245F0 -> 0x140434430 -> 0x14040AEC0
+```
+
+The dispatch at T3/T4 runs on **thread 2**, on a **deferred, coalesced** queue,
+after T2 already replaced the peer. The event being dispatched is the one queued
+by the T0 attach, and its payload is the peer that T2 replaced — not the peer
+sitting in `conn+0x88`.
+
+```text
+EVENT A CAN BE DISPATCHED AFTER PEER B REPLACES A:  YES
+```
+
+### D. Classification
+
+```text
+the ConnectionOpen event dispatched at the Close is a STALE event
+its payload peer is the peer that was already replaced
+conn+0x88 at that moment holds the replacement peer
+the +0x40 test reads the REPLACEMENT peer
+the Close is addressed to the STALE payload peer
+```
+
+Consequence for the historical Close:
+
+```text
+stale-event / replacement explanation for the captured Close   CONFIRMED
+the captured Close is a CURRENT-peer rejection                 DISPROVEN
+```
+
+### Phase 7 target check (not yet proven)
+
+The pointer at `0x14040AF24` is unambiguously `wrapper[0]`, the event payload
+peer, and *not* `conn+0x88`. What is **not** yet proven at runtime is whether
+`wrapper[0]` differs from `conn+0x88` in the captured run — the notebook recorded
+`conn+0x88 = peer B` at dispatch but never recorded the event payload pointer.
+The static analysis above says they must differ on that ordering; the runtime
+tuple remains to be captured.

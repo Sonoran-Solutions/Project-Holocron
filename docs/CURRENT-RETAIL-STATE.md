@@ -2768,6 +2768,103 @@ happens on **thread 2**. That distinction matters. `CONFIRMED`
 
 ---
 
+## The two Close producers, and which one the observed Close came from
+
+`0x1404123D0` is called from two different places in this subsystem. They are
+separate mechanisms and must not be merged.
+
+```text
+Path A   route-registration-failure Close                       CONFIRMED
+         0x140412180 @ 0x140412317 -> 0x1404123D0(conn, 2, 1)
+         taken only when 0x14043D380 reports failure
+         emits NO ConnectionOpen event
+         returns with the peer still attached at conn+0x88
+
+Path B   ConnectionOpen-handler Close                           CONFIRMED
+         ObjectSurrogateEventConnectionOpen -> 0x140434430
+           -> listener vtable+0x28 (0x14040A970, returns 0)
+           -> listener vtable+0x70 (0x14040AEC0)
+           -> 0x1404123D0 @ 0x14040AF27
+```
+
+```text
+historical first-Close witness returned to 0x14040AF2C
+  = the instruction after the call at 0x14040AF27
+  => the recorded Close is Path B                             CONFIRMED
+0x140412317 failure arm = an ALTERNATE Close path,
+                          NOT the recorded first Close       CONFIRMED
+```
+
+Neither path is labelled the root cause.
+
+### The three pointers at the decider, and why they differ
+
+```text
+event payload peer  = wrapper[0]        = rdx entry value   -> CAS destination
+                                                             AND Close argument
+current peer        = [conn+0x88]       = the CAS result    -> the +0x40 test
+listener            = [event+0x18]+0x100= rcx               -> the receiver
+```
+
+The ConnectionOpen event captures its payload **at queue time**:
+
+```asm
+140435fa1  mov rcx, [rbp + 0x7f]     ; the constructor's peer argument
+140435fa5  mov [rbx + 0x20], rcx     ; event+0x20 = that peer (+ intrusive retain)
+140435ff0  call 0x1403fc0b0          ; enqueue
+```
+
+so `event+0x20` is a captured reference, **not** a live read of `conn+0x88`.
+
+### Discriminator: can event A dispatch after peer B replaces A?
+
+```text
+EVENT A CAN BE DISPATCHED AFTER PEER B REPLACES A:  YES   CONFIRMED
+```
+
+Static ordering inside one `0x140412180` invocation:
+
+```text
+0x140412247  create + attach the new peer at conn+0x88
+0x140412302  register the receive route (0x14043d380)
+0x1404123a5  queue the ConnectionOpen event, capturing that peer
+```
+
+Nothing serialises the deferred queue against a later invocation, and the
+recorded ordering puts the replacement **before** the dispatch:
+
+```text
+T0  thread 2   NULL   -> peer A   (0x140412A4F)
+T2  thread 58  peer A -> peer B   (0x140412A4F)
+T3  thread 2   0x140423DD0 -> 0x1404245F0 -> 0x140434430 -> 0x14040AEC0
+```
+
+```text
+the dispatched event is the one queued at T0 (the T2 attach queued none)
+its payload peer is the peer that T2 already replaced
+the +0x40 test therefore reads the REPLACEMENT peer
+the Close is addressed to the STALE payload peer
+```
+
+```text
+stale-event / replacement explanation for the captured Close   CONFIRMED
+captured Close is a CURRENT-peer rejection                     DISPROVEN
+```
+
+### What is still open
+
+```text
+event payload peer != conn+0x88 in the captured run            NOT yet captured
+    (the notebook recorded conn+0x88 = peer B at dispatch but never
+     recorded the event payload pointer; the static analysis above requires
+     them to differ given the recorded ordering)
+0x14043D380 return contract (what AL==0 vs AL!=0 mean)         UNKNOWN
+which invocation's attach queued the dispatched event           INFERRED from timing
+Connection+0x50 name producer                                   UNKNOWN
+```
+
+---
+
 ## Current failure boundary
 
 > **The Close at `0x14040AEC0` is decided by one field: the `+0x40` string of the
