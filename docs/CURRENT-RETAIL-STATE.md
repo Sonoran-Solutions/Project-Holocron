@@ -1210,8 +1210,17 @@ carried by the route record.** `0x140411D30` is the function that seeds it:
 The destination offsets used by `0x140411D30` (`+0x28`, `+0x30`, `+0x50`,
 `+0x00`, `+0x40`, `+0x20`) are byte-verified and coincide with the constructor
 `0x140412820`'s offsets. **Offset coincidence is not identity.** The object at
-`rdi` in `0x140411D30` has not been classified, so calling it "the connection's
-own routed-peer record" is withdrawn (`UNKNOWN`).
+**RESOLVED (later pass).** `rdi` in `0x140411D30` **is an `omega::Connection`**:
+the function installs vtable `0x1414B5E20`, and
+`rtti_for_vtable(0x1414B5E20)` = `.?AVConnection@omega@@`. An intervening pass
+labelled it `omega::Component`; that label is **wrong** — `.?AVComponent@omega@@`
+belongs to vtable `0x1414B5E90`. The raw instruction facts are unchanged.
+
+```text
+object at rdi in 0x140411D30 = omega::Connection (vt 0x1414B5E20)   CONFIRMED
+that object is a routed peer                                        DISPROVEN
+that object is omega::Component                                     DISPROVEN
+```
 
 ```text
 the p2 of a routed peer is a copy of a name field obtained from a

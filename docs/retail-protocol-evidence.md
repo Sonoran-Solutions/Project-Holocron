@@ -7432,7 +7432,14 @@ that object is `UNKNOWN` until its allocation site and vtable are found.
 
 ## Object identity of 0x140411D30's receiver, and the p2/p5 equality (September 13, fifth pass)
 
-### A. The object at `rdi` in `0x140411D30` is an `omega::Component`
+### A. The object at `rdi` in `0x140411D30` is an `omega::Connection`
+
+> **CORRECTED.** This section originally said `omega::Component`. That was a
+> mislabel: `tk.rtti_for_vtable(0x1414B5E20)` resolves to
+> `.?AVConnection@omega@@`, not `.?AVComponent@omega@@`. The `.?AVComponent@omega@@`
+> name belongs to a *different* vtable (`0x1414B5E90`). Everything below that
+> depended on the old name is corrected inline; the raw instruction facts are
+> unchanged.
 
 Not a routed peer. Evidence:
 
@@ -7440,13 +7447,13 @@ Not a routed peer. Evidence:
 `0x140411D30` writes a vtable  -> the object has a vtable, so it CANNOT be the
                                   routed peer, whose constructor never writes one
 vtable value                   = 0x1414B5E20, installed at 0x1404118B1
-RTTI at 0x1414B5E18            = .?AVComponent@omega@@
+RTTI at 0x1414B5E18            = .?AVConnection@omega@@
 constructor                    = 0x140411890 (base ctor 0x140414a50 at 0x1404118ab)
 destructor                     = 0x140411a90 (reinstalls 0x1414B5E20)
 child destructor               = 0x140411c20, frees 0x88 bytes
 ```
 
-`omega::Component` layout, from `0x140411890`:
+`omega::Connection` layout, from `0x140411890` (0x88 bytes):
 
 ```text
 +0x00  vtable (0x1414B5E20)
@@ -7465,7 +7472,7 @@ child destructor               = 0x140411c20, frees 0x88 bytes
 ```
 
 ```text
-classification: omega::Component, a DIFFERENT class from the routed peer
+classification: omega::Connection, a DIFFERENT class from the routed peer
 routed peer   : 0x88 bytes, NO vtable, StrRefs at +0x00 +0x10 +0x20 +0x30 +0x40
 Component     : >=0x100 bytes, vtable at +0x00, StrRefs at +0x30 +0x40 +0x50
 => the two classes are NOT the same, and offset coincidence between the two
@@ -7556,7 +7563,11 @@ the mechanism, not the value. The value must be re-measured.
 ### Classification
 
 ```text
-object at rdi in 0x140411D30 = omega::Component (vt 0x1414B5E20)          CONFIRMED
+object at rdi in 0x140411D30 = omega::Connection (vt 0x1414B5E20)         CONFIRMED
+object at rdi in 0x140411D30 = omega::Component                            DISPROVEN
+                                                                 (mislabel;
+                                                                  that name is
+                                                                  vt 0x1414B5E90)
 that object is a routed peer                                              DISPROVEN
 p2 == p5 == first qword of the record argument                            CONFIRMED
 new_peer+0x00 receives name text                                          CONFIRMED
@@ -8056,3 +8067,121 @@ the first (state 3) unregistered and event-less, the second (state 4) registered
 the historical registration results are still not measured   UNKNOWN
 the ordering that makes them differ is proven                CONFIRMED
 ```
+
+## `0x140414250` semantics recovered; the `[rsp+0x90]` identity question narrowed (September 13, ninth pass)
+
+### A. `0x140414250` is a lock-free slot acquire, and the slot holds the pointer
+
+Extent `0x140414250 - 0x1404143CB`. Signature:
+
+```text
+0x140414250(rcx = slot, rdx = out)   -> returns rax = out (rdx)
+```
+
+The first 8 bytes of `slot` are a **lock-free pointer word with a transient lock
+marker**, not a plain field:
+
+```asm
+1404142a0  mov rax, [rdi]           ; load current
+1404142a6  lock cmpxchg [rdi], r14  ; try to install 1  (r14 = 1)
+1404142ab  jne 0x1404142a0          ; retry up to 10 times
+1404142ad  cmp rbx, r14
+1404142b0  jne 0x140414367          ; rbx != 1  -> the real path
+; rbx == 1: the slot is LOCKED by someone else -> timed backoff
+1404142bf..14041433b               ; QueryPerformanceCounter ratio -> sleep
+140414340  add rax, 0xf4240         ; +1,000,000
+14041435d  call 0x140fd9490         ; sleep, then retry from 0x140414290
+```
+
+The real path, with `rsi = out`:
+
+```asm
+; case rbx == 0  (slot empty)
+14041436c  prefetchw [rdi]
+140414370  mov rax, [rdi]
+140414373  lock cmpxchg [rdi], rbp   ; rbp = 0  -> release the lock marker
+140414378  jne 0x140414370
+14041437a  mov [rsi], rbp            ; out = NULL
+; case rbx != 0  (slot holds a pointer)
+140414384  mov [rsp+0x28], rbx
+140414389  mov rax, [rbx]
+14041438f  mov rax, [rax + 0x28]
+140414393  call rax                  ; vtable+0x28 = RETAIN  (interlocked inc)
+1404143a0  mov rax, [rdi]
+1404143a3  lock cmpxchg [rdi], rbx   ; re-install the pointer, clearing the marker
+1404143a8  jne 0x1404143a0
+1404143aa  mov [rsi], rbx            ; out = the pointer
+1404143b7  mov rax, rsi
+1404143c9  ret
+```
+
+```text
+slot word   0  = empty
+slot word   1  = LOCKED (transient)
+slot word   p  = a live reference-counted object at p
+out (rsi)   = the slot's pointer, retained, or NULL when the slot was empty
+```
+
+**So `[rsp+0x90]` is literally the pointer stored at `slot+0x00`**, where `slot`
+is the address passed as `rcx`. It is not a container, not a subobject address,
+and not an iterator.
+
+### B. Which slot is read at `0x1404121b3`
+
+```asm
+1404121a8  mov rdi, rcx          ; rdi = the function's object
+1404121ab  add rcx, 0x78         ; slot = rdi + 0x78
+1404121af  lea rdx, [rax + 8]    ; out  = &[rsp+8]
+1404121b3  call 0x140414250
+1404121b9  cmp qword [rsp + 0x90], 0   ; <-- equal to &[rsp+8]
+1404122d2  mov rbx, [rsp + 0x90]       ; -> rcx of 0x14043D380
+```
+
+```text
+[rsp+0x90] = *[rdi + 0x78]  (retained), or NULL
+=> 0x14043D380 receives the object POINTED TO by [rdi+0x78], not rdi itself
+=> if [rdi+0x78] == 0, the function returns FALSE early at 0x1404121c2 and
+   never reaches 0x14043D380 at all
+```
+
+### C. What `+0x78` is
+
+`+0x78` is written by `0x140411890` (the `omega::Connection` constructor) at
+`0x1404118e9`:
+
+```asm
+1404118e9  mov qword ptr [rdi + 0x78], rbx    ; rbx == 0 -> initialised to NULL
+```
+
+Across the whole image the only writers of a `+0x78` field in these tiles are
+that constructor (NULL) and the maker-vtable constructor; the other `+0x78`
+sites are `lea rcx,[X+0x78]`, i.e. address-of, passing the same slot to
+`0x140414250`. So `+0x78` is a **pointer slot that starts NULL and is filled at
+runtime by an object that is not the containing object**.
+
+### D. What is still NOT proven
+
+```text
+which object is stored into [outer+0x78]                     UNKNOWN
+therefore whether [rsp+0x90] == rdi                          UNKNOWN
+the class of that object                                     UNKNOWN
+```
+
+The store is not a compile-time constant and not a `mov [X+0x78], <imm>`; it is
+made through the slot-acquire/release protocol. No direct `mov [reg+0x78], reg`
+store into a Connection's own `+0x78` exists anywhere in the image outside the
+constructor's NULL initialisation and the maker path.
+
+### E. Consequence for the state-cycle question
+
+The state-cycle question reduces to that one pointer:
+
+```text
+if [rsp+0x90] == rdi  -> 0x14043D380 demands state 4 from the very object that
+                          was just moved to 3 and only reaches 4 afterwards
+                          => a real, unresolved cycle
+if [rsp+0x90] != rdi  -> two distinct objects, no cycle
+```
+
+`0x1414B5E20` was resolved this pass and the earlier `omega::Component` label for
+the `0x140411D30` receiver is **DISPROVEN**; it is `omega::Connection`.
