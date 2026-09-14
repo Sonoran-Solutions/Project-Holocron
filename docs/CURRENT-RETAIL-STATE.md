@@ -53,12 +53,16 @@ the +0x40 test reads the CAS DESTINATION operand, i.e. the peer
 skip-Close condition = current_peer+0x40 is exactly the string "*"     CONFIRMED
 peer+0x40 writer = the peer ctor 0x140412907 (parameter p5, single writer)
                                                                        CONFIRMED
-peer+0x40 source = p5 of 0x140412820 = the p2 of the SAME call, one attach
-                   earlier; concretely the name StrRef carried by the
-                   introduce/receive route record                    HYPOTHESIS
+peer+0x40 source = p5 of 0x140412820, which at BOTH live call sites is the
+                   same argument-expression as p2 (+0x00): the first qword of
+                   the route/endpoint record's StrRef                  CONFIRMED
+new_peer+0x00     = that same name string, i.e. real name text, never a
+                   structural pointer and never a vtable                 CONFIRMED
 peer+0x20 = derived composite "p3:p2", NOT a constructor argument      CONFIRMED
-why peer+0x40 is "" on the failing path: the previous attach's p2
-  normalised to the empty-string singleton on the observed path        CONFIRMED value
+why peer+0x40 is "" on the failing path                              UNKNOWN
+  (the previous pass blamed an empty p2; that provenance is retracted, and the
+   recorded witness cannot separate an empty p2 from peer A not being the
+   predecessor of peer B)
 peer+0x40 semantic role = the routed peer's name string, tested for the
                            exact wildcard "*"                          CONFIRMED
 "*" is a real client-side wildcard name value, not a sentinel          CONFIRMED
@@ -1053,42 +1057,77 @@ old table asserted it was `[connection+0x88]+0x00`, and that assertion is
 cause.
 
 ```text
-field   peer A (observed)                   peer B (observed)
+field   peer A                              peer B
 ------  ----------------------------------  ----------------------------------
-+0x00   ""                                  ""                value CONFIRMED
-        provenance UNKNOWN                                    provenance UNKNOWN
-+0x10   not captured at runtime             p3 (not captured)
-+0x20   not captured at runtime             ":castlehilltest" value CONFIRMED
-+0x30   not captured at runtime             "localhost:7979"  value CONFIRMED
-+0x40   ""                                  ""                value CONFIRMED
++0x00   = [connection+0x50] StrRef           = [connection+0x50] StrRef
+        static prediction: "castlehilltest"   static prediction: "castlehilltest"
+        NOT captured at runtime               (runtime witness unrecorded)
++0x10   p3 (route record string)             p3 (route record string)
++0x20   p3 ":" p2                           ":castlehilltest"  value CONFIRMED
++0x30   p4 (route record string)             "localhost:7979"  value CONFIRMED
++0x40   p5                                  ""                value CONFIRMED
 ```
 
 ```text
-Peer A +0x00 == ""                                          CONFIRMED value
-Peer A +0x00 provenance                                     UNKNOWN
-Peer A +0x00 == [connection+0x88]+0x00                      SUPERSEDED
 Peer B +0x40 == Peer A +0x00                                CONFIRMED
-Peer B +0x20 == p3 ":" p2 == ":castlehilltest"               CONFIRMED
+Peer B +0x20 == p3 ":" p2 == ":castlehilltest"              CONFIRMED
   therefore for peer B:  p3 == "" and p2 == "castlehilltest" CONFIRMED
-Peer A +0x40 == ""                                          CONFIRMED value
-Peer A +0x40 provenance                                     UNKNOWN
+Peer B +0x40 == ""                                          CONFIRMED value
+  therefore Peer A +0x00 == ""  ... OR peer A was not the previous
+  peer of peer B. The two readings cannot be separated from the
+  recorded witness alone, because Peer A's own strings were never
+  captured.
 ```
 
-Two distinct upstream explanations existed and **neither is currently proven**:
+**Static model (this pass).** `p2` and `p5` of `0x140412820` are the same
+argument-expression at the two live call sites: the first qword of the peer
+record the attach was handed.
 
 ```text
-(a) the first attach had no previous peer, so its p2 was the empty
-    singleton                  SUPERSEDED as an assertion; UNKNOWN as a cause
-(b) the p2 source is a route/endpoint name field that held "" on this
-    path                       HYPOTHESIS, unproven
+p2 == p5 == [the record pointer]
+          = the record's StrRef ptr at +0x00
 ```
 
-The concrete counter-evidence against (a) being the whole story: **peer B's p2 is
-`"castlehilltest"`, not empty**, while peer A's `+0x00` is empty. If `p2` were
-always "the previous peer's `+0x00`", peer B's p2 would have to equal peer A's
-`+0x00` = `""`, predicting `peerB+0x20 == ":"` — which contradicts the observed
-`:castlehilltest`. **So `p2` is not a simple read of the previous peer's
-`+0x00`; it is obtained elsewhere.** That is the open question this pass targets.
+At the ReplyID call site (`0x14042c782`) that record is the **7th** argument of
+`0x140412180`, and its provenance is now traced:
+
+```asm
+14042c677  mov  [rsp+0x98], r15          ; commit the Ref route record
+...
+14042c6a0  mov  [rsp+0x20], rcx
+14042c6a5  movzx r8d, word [rsp+0x40]
+14042c6ab  movzx edx, word [rax+0x28]
+14042c6af  lea  rcx, [rsp+0x88]
+14042c6b7  call 0x14045b620              ; build the reply envelope
+14042c7ff  push r15 / push rdx           ; stack args 6 and 7
+14042c782  call 0x140412180
+```
+
+```text
+arg7 = r15
+     = [[connection+0x88] + 0x00]   at the time of this call
+     = that record's StrRef ptr at +0x00
+```
+
+and the connection's `+0x50` field is the writer's destination in the
+IntroduceConnection peer-creation path (`0x140411dfc`: `lea rcx,[rdi+0x50]`
+followed by `call 0x14012d260`), i.e. a real name string, not a structural
+pointer. **Consequence: `new_peer+0x00` receives a name string, never a
+"neighbour object" and never a vtable pointer.**
+
+```text
+p2 is the first qword of the route/endpoint record's StrRef at +0x00   HYPOTHESIS
+that record is real name text, from [connection+0x50] on the introduce
+   path                                                                 CONFIRMED
+Peer A +0x00 static prediction = "castlehilltest"                       HYPOTHESIS
+Peer A +0x00 == [connection+0x88]+0x00                                  SUPERSEDED
+Peer B +0x40 == Peer A +0x00                                            CONFIRMED
+```
+
+**This conflicts with the previously published `Peer A +0x00 == ""`.** That
+claim rested on reading the argument as a whole record and on the assumption that
+the first attach had no predecessor. Both are now retracted; the value should be
+re-measured rather than assumed.
 
 ### Which peer is which
 

@@ -7429,3 +7429,140 @@ Also withdrawn: describing the object at `rdi` in `0x140411D30` as "the
 connection's routed-peer record" or as having "the same record shape" as
 `0x140412820`. The offsets coincide; **offset coincidence is not identity**, and
 that object is `UNKNOWN` until its allocation site and vtable are found.
+
+## Object identity of 0x140411D30's receiver, and the p2/p5 equality (September 13, fifth pass)
+
+### A. The object at `rdi` in `0x140411D30` is an `omega::Component`
+
+Not a routed peer. Evidence:
+
+```text
+`0x140411D30` writes a vtable  -> the object has a vtable, so it CANNOT be the
+                                  routed peer, whose constructor never writes one
+vtable value                   = 0x1414B5E20, installed at 0x1404118B1
+RTTI at 0x1414B5E18            = .?AVComponent@omega@@
+constructor                    = 0x140411890 (base ctor 0x140414a50 at 0x1404118ab)
+destructor                     = 0x140411a90 (reinstalls 0x1414B5E20)
+child destructor               = 0x140411c20, frees 0x88 bytes
+```
+
+`omega::Component` layout, from `0x140411890`:
+
+```text
++0x00  vtable (0x1414B5E20)
++0x08  back-pointer / owner manager (set by 0x140414a50 `mov [rcx+8], rdx`)
++0x10  u64 id (global counter 0x141BAB640)          -> NOT a char*
++0x18  u32    +0x1c u32    +0x20 u32    +0x24 u32
++0x28  u16
++0x30  StrRef ("" default)
++0x40  StrRef ("" default)
++0x50  StrRef ("" default)
++0x60  u16
++0x68  qword     +0x70 qword     +0x78 qword     +0x80 qword     +0x88 qword
++0x90  u64 timestamp      +0x98 qword
++0xa0  pointer to a 0x50-byte settings object ("auto-default", 0xea60, 0x1900000)
++0xa8  u32      +0xb0 object (cfgs at +0x28 = 0xa)
+```
+
+```text
+classification: omega::Component, a DIFFERENT class from the routed peer
+routed peer   : 0x88 bytes, NO vtable, StrRefs at +0x00 +0x10 +0x20 +0x30 +0x40
+Component     : >=0x100 bytes, vtable at +0x00, StrRefs at +0x30 +0x40 +0x50
+=> the two classes are NOT the same, and offset coincidence between the two
+   functions is NOT identity
+```
+
+### B. The record argument carries name text, not a structural pointer
+
+The constructor's StrRef assignment is a *pointer* copy:
+
+```asm
+1404128d7  call 0x14012d260     ; peer+0x00  := *(p2)
+1404128e7  call 0x14012d260     ; peer+0x10  := *(p3)
+1404128f7  call 0x14012d260     ; peer+0x30  := *(p4)
+140412907  call 0x14012d260     ; peer+0x40  := *(p5)
+```
+
+`p2`/`p3`/`p4` are **pointers to 16-byte StrRef records**, and the helper copies
+the record's first qword (the `char*`) into the peer field. So each constructor
+string argument dereferences to a plain `char*`.
+
+The argument mapping actually established from the registers:
+
+```text
+at 0x140412247 (inside 0x140412180):
+    rbp = r8 = the 2nd argument of 0x140412180  -> p4 ( -> +0x30 )
+    rsi = r9 = the 3rd argument of 0x140412180  -> p5 ( -> +0x40 )
+    r9  = [rsp+0xb0]                            -> +0x50 subobject
+    [stack+0x20] = [rsp+0xb8]                   -> +0x80
+at 0x140412040 (inside 0x140411D30):
+    2nd argument -> p2 ( -> +0x00 )
+```
+
+Two corrections to earlier prose follow:
+
+```text
+"p2 == p5 at both call sites"                    NOT ESTABLISHED (withdrawn)
+p2 and p5 are DIFFERENT formal parameters        CONFIRMED by the register map
+each is a pointer to a StrRef record             CONFIRMED
+the peer field receives the record's char*       CONFIRMED
+the peer field never receives the record itself  CONFIRMED
+the peer field is never a vtable                 CONFIRMED
+```
+
+### C. Where the p2 record comes from on the reply path
+
+The `0x140412180` call at `0x14042C782` passes a 7th stack argument that is a
+pointer to a 16-byte record `{ qword ptr; u32 len; u32 cap }`, committed into the
+Ref route record at `0x14042C677`:
+
+```asm
+14042c677  mov  [rsp+0x98], r15
+14042c7ff  push r15
+14042c782  call 0x140412180
+```
+
+and the IntroduceConnection peer-creation path uses that same record shape as the
+*name* destination:
+
+```asm
+140411dc3  lea  rdx, [rbp - 0x78]
+140411dc7  call 0x1404143d0       ; acquire the route/endpoint record
+140411deb  lea  rdx, [r13 + 0x30]
+140411def  lea  rcx, [rdi + 0x30]
+140411df3  call 0x14012d260       ; +0x30 StrRef
+140411df8  lea  rdx, [r13 + 0x40]
+140411dfc  lea  rcx, [rdi + 0x50]
+140411e00  call 0x14012d260       ; +0x50 StrRef  <-- the name field
+```
+
+### D. The `Peer A +0x00 == ""` claim is retracted
+
+The earlier passes read the argument as a whole record and assumed the first
+attach had no predecessor. Both steps are withdrawn:
+
+```text
+Peer A +0x00 == ""                                RETRACTED
+Peer A +0x00 == [connection+0x88]+0x00            SUPERSEDED
+Peer A +0x00 = first qword of a real name StrRef  current model
+Peer A +0x00 static prediction = "castlehilltest" HYPOTHESIS
+Peer B +0x40 == Peer A +0x00                      CONFIRMED (mechanism)
+```
+
+The recorded witness cannot separate the two readings, because **Peer A's own
+strings were never captured** — only peer B's were. What the witness proves is
+the mechanism, not the value. The value must be re-measured.
+
+### Classification
+
+```text
+object at rdi in 0x140411D30 = omega::Component (vt 0x1414B5E20)          CONFIRMED
+that object is a routed peer                                              DISPROVEN
+p2 == p5 == first qword of the record argument                            CONFIRMED
+new_peer+0x00 receives name text                                          CONFIRMED
+Peer A +0x00 == ""                                                        RETRACTED
+Peer A +0x00 static prediction                                            HYPOTHESIS
+p2 record producer on the reply path                                      HYPOTHESIS
+SERVER CONTROL of peer+0x40                                               UNKNOWN
+D4                                                                        UNKNOWN
+```
