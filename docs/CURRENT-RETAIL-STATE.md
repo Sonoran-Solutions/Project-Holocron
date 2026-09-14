@@ -38,6 +38,22 @@ Close verb 0x1404123D0 uses this same service path                     CONFIRMED
 other message types use the same service path                          CONFIRMED
 PacketSocket state field semantics (4, 7, ...)                         UNKNOWN
 transitive path to 0x1404245F0 / 0x140434430                           UNKNOWN
+-- ConnectionOpen causal chain (this pass) --
+event class = omega::ObjectSurrogateEventConnectionOpen (size 0x38)    CONFIRMED
+event+0x18 = the connection, event+0x20 = the routed-peer object       CONFIRMED
+listener = [[event+0x18]+0x100], class omega::Object, vt 0x1414B5C10   CONFIRMED
+listener vtable+0x28 -> 0x14040A970 (releases payload, returns 0)      CONFIRMED
+listener vtable+0x70 -> 0x14040AEC0 (THE DECIDER)                      CONFIRMED
+0x140434430 -> 0x14040AEC0 = direct virtual dispatch (always taken)    CONFIRMED
+0x14040AEC0 detaches conn+0x88 unconditionally, THEN tests the name    CONFIRMED
+skip-Close condition = peer+0x40 is exactly the 2-byte string "*"      CONFIRMED
+peer+0x40 writer = the peer ctor 0x140412907 (4th string argument)     CONFIRMED
+peer+0x40 source = the IntroduceConnection peer-creation path          HYPOTHESIS
+why peer+0x40 is "" on the failing path (which argument)               UNKNOWN
+peer+0x40 semantic role = the peer's name/id string                    HYPOTHESIS
+endpoint-wildcard experiment suppresses Close                          DISPROVEN
+server controls the decision input                                     YES (hypothesis)
+D4                                                                     UNKNOWN
 ```
 
 ---
@@ -288,6 +304,269 @@ primary failure vs secondary cleanup                               UNKNOWN
 
 The old label "collection teardown" for `0x1404245F0` is **narrowed**: it is the
 drain of a *pending-element* list, whose element type is not yet named.
+
+## The ConnectionOpen subscriber chain — recovered (this pass)
+
+This pass closed the causal question from `ObjectSurrogateEventConnectionOpen`
+through to the Close verb. The chain is now complete and **direct**:
+
+```text
+omega::ObjectSurrogateEventConnectionOpen  (a queued event, one of 8 kinds)
+  event+0x18 = the connection object        (intrusive_ptr)
+  event+0x20 = the routed-peer object       (intrusive_ptr)
+        |
+        v  0x140434430 = vtable+0x08, the event's notification method
+  listener = [ [event+0x18] + 0x100 ]       (an omega::Object)
+        |
+        +-- listener->vtable+0x28  ->  0x14040A970   returns 0, so...
+        +-- listener->vtable+0x70  ->  0x14040AEC0   <-- THE DECIDER
+                    |
+                    +-- lock cmpxchg [peer+0x88], 0     (detach, UNCONDITIONAL)
+                    +-- if peer+0x40 == "*" exactly:  skip
+                    +-- else:  0x1404123D0(peer, 0, 0)  <-- Close envelope
+```
+
+### The event and its two payloads
+
+`0x140435CE0` (`0x140435CE0 - 0x14043609F`) builds
+`omega::ObjectSurrogateEventConnectionOpen`:
+
+```asm
+140435e64  mov  rax,[rip+..] / mov ecx,0x38 / call .. ; mm_alloc(0x38)
+140435f8e  mov  rcx, rbx                              ; rbx = the 0x38-byte object
+140435f91  call 0x140434110        ; base ctor -> installs 0x1414B6950 then 0x1414B68F0
+140435f97  lea  rax,[rip+..]       ; 0x1414B6938
+140435f9e  mov  [rbx], rax         ; install ObjectSurrogateEventConnectionOpen vtable
+140435fa1  mov  rcx,[rbp+0x7f]
+140435fa5  mov  [rbx+0x20], rcx    ; event+0x20 = the captured object
+...
+140435fea  mov  rdx, rbx
+140435fed  mov  rcx, rsi           ; rsi = the queue owner
+140435ff0  call 0x1403FC0B0        ; enqueue the event
+```
+
+```text
+event size            0x38                                          CONFIRMED
+event vtable          0x1414B6938, COL 0x1417029F8                  CONFIRMED
+class                 omega::ObjectSurrogateEventConnectionOpen    CONFIRMED
+event+0x18            the connection object (intrusive_ptr to it)   CONFIRMED
+event+0x20            the routed-peer object (intrusive_ptr to it)  CONFIRMED
+queue owner           the object at [connection+0x68]               CONFIRMED
+```
+
+The two payloads come from the peer-attach path `0x140412180`, called by the
+**ReplyIDSignature** handler (`0x14042C300`, dispatcher arm `0xA609E6A7`):
+
+```asm
+14042c754  lock cmpxchg qword ptr [rdx + 0x88], rdi   ; attach the peer to conn+0x88
+14042c77f  mov  rcx, r10                              ; the connection
+14042c782  call 0x140412180                           ; -> 0x140435CE0 -> 0x1403FC0B0
+```
+
+### The listener object and the two dispatched slots
+
+`[connection+0x100]` is the listener, and it is an **`omega::Object`** — the same
+object that `0x14040A9A0` and `0x14040AB60` install:
+
+```text
+listener class   omega::Object                 CONFIRMED
+listener vtable  0x1414B5C10, COL 0x141700940  CONFIRMED
+  vtable+0x28 -> 0x14040A970    CONFIRMED
+  vtable+0x70 -> 0x14040AEC0    CONFIRMED   <-- the decider
+```
+
+`0x140434430` dispatches with the payload **by pointer**:
+
+```asm
+14043444c  mov  rax,[rcx+0x18]        ; event+0x18 = the connection
+140434450  mov  rbx,[rax+0x100]       ; listener
+140434460  mov  rax,[rbx]             ; listener vtable
+140434463  mov  rsi,[rax+0x28]        ; slot +0x28
+140434471  mov  rcx,[rcx+0x20]        ; event+0x20 = the peer
+140434475  mov  [rsp+0x40], rcx       ; a one-word ref wrapper {ptr, NULL}
+140434492  mov  rcx, rbx
+140434498  call rsi                   ; listener->vtable+0x28(listener, &wrapper)
+14043449e  test al, al
+1404344a0  jne  0x1404344e0           ; non-zero would suppress the next call
+1404344a5  mov  rsi,[rax+0x70]        ; else slot +0x70
+1404344da  call rsi                   ; listener->vtable+0x70(listener, &wrapper)
+```
+
+**Which branch runs for ConnectionOpen (`CONFIRMED`):** `+0x28` is `0x14040A970`,
+whose whole body is 12 instructions and always returns `al = 0`:
+
+```asm
+14040a970  mov  [rsp+0x10], rdx
+14040a982  mov  rcx, [rdx]            ; the wrapped pointer
+14040a988  je   0x14040a997           ; NULL -> skip
+14040a98a  mov  rax,[rcx] / mov rax,[rax+0x30] / call rax   ; release
+14040a997  xor  al, al                ; <-- always 0
+14040a99d  ret
+```
+
+```text
+listener vtable+0x28 = 0x14040A970 = a release/drop of the wrapper payload,
+                                     returning 0 unconditionally  CONFIRMED
+=> the +0x70 branch ALWAYS executes for ConnectionOpen            CONFIRMED
+listener vtable+0x70 = 0x14040AEC0 = the decider                   CONFIRMED
+```
+
+So `0x140434430 → 0x14040AEC0` is one **direct virtual dispatch**:
+`ObjectSurrogateEventConnectionOpen` notification → `listener->vtable+0x70`.
+The old "(0x1404245F0 → 0x140434430) is collection teardown" phrasing is
+`SUPERSEDED`: it is generic deferred event delivery followed by event dispatch.
+
+### `0x14040AEC0` — the decider, in full
+
+```c
+// rcx = listener (omega::Object), rdx -> ref-wrapper holding the peer
+void Object::on_connection_open(Wrapper* w) {
+    Peer* p = w->[0];                          // event+0x20 payload
+    if (!p) goto done;
+
+    // 1. detach the routed peer from the connection -- UNCONDITIONAL
+    long prev = 0;
+    lock cmpxchg(&conn->[0x88], prev /*=0*/, 0);
+
+    // 2. wildcard test on the peer's own string
+    const char* name = &empty_string_singleton;  // 0x14156BD60
+    if (prev != 0 && p->[0x40] != NULL) name = p->[0x40];
+    if (name[0] == '*' && name[1] == '\0')      // exact string "*"
+        goto done;                               //   -> SKIP the Close
+
+    // 3. otherwise send the Close envelope
+    0x1404123D0(/*connection*/ p, /*arg2*/ 0, /*arg3*/ 0);
+
+done:
+    release the wrapper payload;
+}
+```
+
+Two facts worth stating precisely:
+
+```text
+the wildcard test is a full two-byte string equality with "*"
+    peer+0x40[0]=='*' && peer+0x40[1]=='\0'          CONFIRMED
+    (the compared bytes are 0x14156E2D0='*' and 0x14156E2D1=0)
+
+the detach of conn+0x88 happens BEFORE and INDEPENDENTLY of the wildcard test
+    the CAS is at 0x14040AEEB, the test only decides the Close  CONFIRMED
+```
+
+So a wildcard `peer+0x40` suppresses the **Close envelope**, not the detach. Both
+paths leave `conn+0x88` cleared.
+
+### The routed-peer object and `peer+0x40`
+
+The rendered peer is built by `0x140412820` (`0x140412820 - 0x140412B1B`):
+
+```asm
+14041285d  mov  ecx, 0x88 / call ..    ; mm_alloc(0x88)
+14041287c  lea  r13, [rip + 0x11594dd] ; r13 = 0x14156BD60 = the EMPTY string
+140412883  mov  [rax], r13             ; peer+0x00 = ""  (char*)
+14041288b  mov  [rax+0x10], r13        ; peer+0x10 = ""
+140412892  mov  [rax+0x20], r13        ; peer+0x20 = ""
+140412899  mov  [rax+0x30], r13        ; peer+0x30 = ""
+1404128a0  mov  [rax+0x40], r13        ; peer+0x40 = ""   <-- the tested field
+1404128d7  call 0x14012D260            ; assign string -> peer+0x00
+1404128e7  call 0x14012D260            ; assign string -> peer+0x10
+1404128f7  call 0x14012D260            ; assign string -> peer+0x30
+140412907  call 0x14012D260            ; assign string -> peer+0x40  <-- 4th string arg
+14041290f..14041292a  call 0x140403F80 x4  ; normalise each of the four strings
+```
+
+```text
+peer size      0x88                                              CONFIRMED
+peer layout    four string fields at +0x00, +0x10, +0x30, +0x40   CONFIRMED
+               each is {char* at +0, uint32 cap at +8, uint32 refs at +0xC}
+string assign  0x14012D260 = COW pointer copy, capacity 0       CONFIRMED
+string norm    0x140403F80 = if the string is NULL or empty, point it at the
+               empty-string singleton 0x14156BD60               CONFIRMED
+NOTE           the peer has NO vtable; r13 is a data pointer to the empty
+               string, not a class vtable. It is a plain metadata record.
+```
+
+`0x14040AEC0`'s fallback `lea rcx,[0x14156BD60]` is therefore just "the empty
+string", which is exactly why an unset `peer+0x40` reads as `""`.
+
+**Every writer of `peer+0x40` (`CONFIRMED`, image-wide)**: exactly one, the
+constructor `0x1404128A0`, which writes the empty-string singleton and is then
+immediately overwritten by the **fourth string argument** at `0x140412907`.
+
+A second string field-writer exists at `0x140434DE1` (fn `0x140434DA0`) but
+operates on a different class, so the peer's `+0x40` has a single producer.
+
+### Where the fourth string argument comes from
+
+The peer is constructed from the **IntroduceConnection** handler
+(`0x14042C910`, dispatcher arm `0x8B0D492F`) via `0x14042B3D0`, which calls the
+peer creator `0x140411D30` at `0x14042B721` with the stack arguments:
+
+```asm
+14042b62d  lea  rdx,[rip+..]            ; 0x14157C690 = "localhost"
+14042b63b  call 0x1411C8EF0             ; compare the peer-name argument
+...
+14042b683  lea  r14,[rip+..]            ; 0x14156BD60 = ""  (empty singleton)
+14042b68a  mov  [rsp+0x60], r14         ; -> the name argument becomes ""
+14042b6e5  lea  rax,[rbp-0x48]
+14042b6e9  mov  [rsp+0x40], rax         ; arg5 = &{name-ish object}
+14042b6f5  ...
+14042b721  call 0x140411D30
+```
+
+```text
+the peer-name string is "localhost", OR an override;
+when the override is absent/empty the name argument is set to the EMPTY STRING
+the empty-string singleton 0x14156BD60 is both the "no name" sentinel and the
+value written into the fresh peer's string fields
+```
+
+```text
+peer+0x40 writer            = the peer constructor 0x1404128A0/0x140412907
+peer+0x40 source            = the 4th string argument of 0x140412820,
+                              supplied by the IntroduceConnection path
+failing value               = "" (the empty-string singleton)   CONFIRMED observed
+required-to-skip value      = the exact two-byte string "*"     CONFIRMED in code
+```
+
+### Correct classification of the old wildcard experiment
+
+```text
+"changing the endpoint/shard to localhost:7979:* prevents the Close"
+                                                            DISPROVEN (as before)
+"peer+0x40 == '*' is irrelevant"
+                                                            NOT CLAIMED — the
+    code proves peer+0x40 == "*" is exactly the skip condition, so this field is
+    causally live; the earlier experiment simply never wrote it              CONFIRMED
+```
+
+The experiment changed the endpoint/shard identity surfaced elsewhere on the peer;
+it did not set `peer+0x40`. The two are distinct fields, which is why the
+experiment failed to suppress the Close while the code path still expects `"*"`.
+
+### Classification of the Close decision
+
+```text
+0x1404245F0       per-owner deferred event drain (generic delivery)   CONFIRMED
+0x140434430       ObjectSurrogateEventConnectionOpen notification      CONFIRMED
+0x14040A970       listener vtable+0x28, releases the payload, ret 0    CONFIRMED
+0x14040AEC0       listener vtable+0x70, THE DECIDER                    CONFIRMED
+Close verb usage  NORMAL ConnectionOpen handling with a metadata test,
+                  not a dedicated failure path                         HYPOTHESIS
+primary failure vs secondary cleanup: the Close *decision* is here, but it is
+                  driven by peer metadata produced earlier, so this is a
+                  PRIMARY DECISION POINT whose input is a missing/incorrect
+                  peer name; still UNKNOWN which producer should have set it
+peer+0x40 semantic role   = the peer's name/id string, tested for the exact
+                            wildcard "*"                                HYPOTHESIS
+"*" semantic role         = "do not send the Close envelope for this peer"
+                            (the detach still happens)                  CONFIRMED
+peer-visible control of the decision                                    YES
+    the 4th string argument is supplied by the IntroduceConnection handling path,
+    i.e. from peer/connection metadata, so a server-side value reaches it.
+    The exact message field is not yet traced.                         HYPOTHESIS
+D4                                                                      UNKNOWN
+```
 
 ## Authority / how to use this file
 
