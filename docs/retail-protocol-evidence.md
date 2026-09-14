@@ -2991,3 +2991,300 @@ task is to localize which manager constructs and destroys the `TimeRequester` on
 this connection, and what peer-visible condition makes its `*:timesource` lookup
 fail — that is the decision point in front of the teardown. Only then is a server
 action justified.
+
+## `omega::TimeRequester` owner, teardown dispatch and the `*:timesource` question (September 13)
+
+This section continues "Close producer identified: `omega::TimeRequester`
+teardown". It **resolves the owning manager** and the virtual dispatch that
+reaches `0x140468D40`, **corrects** two claims of the previous section, and
+**answers** the `*:timesource` causality question in the negative.
+
+Binary identity: `.text`, `.rdata`, `.data`, `.pdata`, `.reloc` and `.rsrc` of
+the prepared private client are **bit-identical** to the retail copy whose
+SHA-256 is recorded at the top of this document; the only difference in the whole
+file is 256 bytes at file offset `0x1AB50D1`–`0x1AB51D0`, which is the installed
+RSA test key. Every address below is consequently valid for the retail
+executable.
+
+### CORRECTION 1 — `0x1414B7CC8` is the `omega::TimeRequester` vtable at mdisp 0x18
+
+The class hierarchy was re-derived with a validated RTTI reader. The x64 layout
+this image uses is:
+
+```text
+vtable[-1]    : 8-byte VA of the Complete Object Locator (COL)
+COL : +00 signature = 1   +04 moffset   +08 cd_offset
+      +0C pTD (rva)       +10 pCD (rva) +14 pSelf (rva)
+TD  : inline decorated name at TD + 0x10
+CHD : +00 sig = 0  +04 attributes  +08 numBaseClasses  +0C pBaseClassArray (rva)
+BCD (0x1C bytes): +00 pTD +04 numContainedBases +08 mdisp +0C pdisp
+                  +10 vdisp +14 attributes +18 pCD
+```
+
+Note the two traps: the COL **signature is 1**, not 0 (requiring 0 finds no COL
+in this image at all), and a `BaseClassDescriptor` is **0x1C** bytes, not 0x18.
+
+```text
+COL 0x1417047C8  signature=1  moffset=0x18  pTD=0x141B67700  pCD=0x141704A00
+TD  0x141B67700  name at +0x10 = ".?AVTimeRequester@omega@@"
+CHD 0x141704A00  attributes=1  numBaseClasses=7  pBaseClassArray=0x141704878
+```
+
+The seven base-class descriptors, in `pBaseClassArray` order:
+
+```text
+mdisp 0x00  omega::TimeRequester            vtable 0x1414B7C28  (moffset 0x00)
+mdisp 0x00  omega::TimeRequesterBase
+mdisp 0x00  omega::Object
+mdisp 0x08  omega::ComponentConsumer
+mdisp 0x18  TimeSourceReplyIFace            vtable 0x1414B7CC8  (moffset 0x18)
+mdisp 0x20  omega::SocketObserver           vtable 0x1414B7CD8  (moffset 0x20)
+mdisp 0x20  omega::Interface
+```
+
+`omega::TimeRequesterBase` is a separate four-entry hierarchy by the same
+readers. So `0x1414B7CC8` is one of `omega::TimeRequester`'s own vtables — the
+one its `TimeSourceReplyIFace` base subobject occupies at object offset `0x18`.
+
+This **supersedes** the previous section's reading that the object was
+`omega::TimeRequesterBase`. The class name was right; the *subobject* was wrong.
+
+### CORRECTION 2 — object layout; the teardown's `this` is not the object base
+
+The constructor `0x140467600` installs **exactly three** vtable pointers
+(`0x1404676fc`–`0x14046772d`):
+
+```text
+1404676fc  lea rax,[rip+0x1050795]  ; 0x1414B7E98  TimeRequesterBase vtable
+140467703  mov [rsi],rax
+140467706  lea rax,[rip+0x105077b]  ; 0x1414B7E88
+14046770d  mov [rsi+0x18],rax
+140467711  lea rax,[rip+0x1050510]  ; 0x1414B7C28  TimeRequester PRIMARY
+140467718  mov [rsi],rax
+14046771b  lea rax,[rip+0x10505a6]  ; 0x1414B7CC8  TimeSourceReplyIFace @0x18
+140467722  mov [rsi+0x18],rax
+140467726  lea rax,[rip+0x10505ab]  ; 0x1414B7CD8  SocketObserver @0x20
+14046772d  mov [rsi+0x20],rax
+```
+
+```text
+omega::TimeRequester, size 0x158 (the deleting destructor frees 0x158 at
+0x1404677d9), constructor 0x140467600
+
+  +0x000  vptr  omega::TimeRequester primary   0x1414B7C28
+  +0x008  ptr   context/session object         (base ctor 0x14040a9a0)
+  +0x010  ptr   this object's ObjectSurrogate  (0x14040aae5)
+  +0x018  vptr  TimeSourceReplyIFace           0x1414B7CC8  <-- teardown slot +0x00
+  +0x020  vptr  SocketObserver / Interface     0x1414B7CD8
+  +0x028  0        +0x030 dword 0   +0x038 0   +0x040 byte 0   (active flag)
+  +0x048  {ptr,len}  "Client" identity string
+  +0x058  {ptr,len}  stream buffer (cleared by teardown)
+  +0x068  0
+  +0x070  subobject built by 0x140469670
+  +0x098  qword last synced timestamp     (callback 0x140467DD0)
+  +0x0A0  qword clock correction, atomic  (callback 0x140467DD0)
+  +0x0A8  dword 0
+  +0x140 / +0x148 / +0x150  cleared by the 0x140467BD0 activation path
+```
+
+Because `vtable 0x1414B7CC8` belongs at object offset `0x18`, `0x140468D40` is
+entered with `this = TimeRequester + 0x18`. That is why it reads `[rbx-0x10]` and
+`[rbx-0x18]` (real TimeRequester fields `+0x08` and `+0x00`) and why its
+`lea rcx,[rbx-0x18]` calls `0x140468B50` on the object base.
+
+### The owning manager — `omega::ApplicationImpl`, not a TimeRequester-internal manager
+
+The creators are found by relative-call scanning (an earlier helper omitted the
+section `VirtualAddress` and therefore reported no callers for anything; that bug
+is fixed):
+
+```text
+0x140467600  omega::TimeRequester::TimeRequester(size 0x158)
+             sole caller 0x14044672c, inside 0x140446490
+0x140446490  sole caller 0x140405a4c, inside 0x1404058f0
+0x1404058f0  sole caller 0x140120e4b, inside 0x140120df0
+0x140120df0  sole caller 0x14010c0ab, inside 0x14010c070
+0x14010c070  sole caller 0x1400bc065, inside 0x1400bbe40  ("Client startup detected existing instance")
+```
+
+`0x1400bbe40` is the client-startup singleton initializer. Its
+`0x140120df0` step allocates a `0x178` object, assigns it to a global at
+`0x141bab520`, and calls it. Walking into `0x140446490`, `rdi+8`/`rdi+0x10` are
+the freshly built `App`:
+
+```text
+1404464e4  mov rax,[rbx+0x1d8]        ; App -> ServerProxy
+140446520  lea rdi,[rbx+0x18]         ; rdi = the TimeSourceReplyIFace slot
+14044658b  mov [rax+0xe0],rdi         ; register the interface with ServerProxy
+14044659  mov rax,[App+0x1D8]         ; App -> ServerProxy
+            mov rcx,[rax+0xd8]        ;   -> connection slot
+1404465a7  call 0x14042f960           ; bind the requester to that slot
+1404466f9  mov rax,[0x141369df8]      ; operator new
+140446700  mov ecx,0x158
+140446708  call [0x14136acc0]         ; allocate 0x158
+14044672c  call 0x140467600           ; construct the TimeRequester
+140446745  call 0x14044c220           ; build refcount control block
+1404467b5  mov rax,[rbx+0x1a8]        ; old App+0x1A8
+1404467c1  mov [rbx+0x1a8],rcx        ; install the new one
+1404467e5  call 0x1400b79f0           ; release the old one
+```
+
+`0x140446490` is a method of `omega::ApplicationImpl` (its vtable is
+`0x1414B7170`), and it also stores the result at `App+0x1A8`. **So the object
+that constructs, activates and destroys the `TimeRequester` is
+`omega::ApplicationImpl`**, and `App+0x1A8`/`App+0x1B0` is a refcounted pair
+holding the **TimeSourceReplyIFace subobject** (`TimeRequester + 0x18`) and its
+control block.
+
+### The virtual destruction dispatch — proven end to end
+
+`0x140468D40` has no direct caller and exactly one materialization in the image:
+slot `+0x00` of `0x1414B7CC8`. The control block created for it at `0x14044c220`
+installs `0x1414b7040` (whose first entry is `0x14011d7c0`):
+
+```text
+14044c25  lea rcx,[rip+0xf5a280]   ; 0x1413a64e0  base control-block vtable
+14044c260 mov [rax],rcx
+14044c263 mov dword [rax+8],1      ; strong count
+14044c26a mov dword [rax+0xc],1    ; weak count
+14044c271 lea rcx,[rip+0x106adc8]  ; 0x1414b7040  specialised control-block vtable
+14044c278 mov [rax],rcx
+14044c27b mov [rax+0x10],rdi       ; the TimeSourceReplyIFace pointer
+```
+
+The shared-pointer release primitive `0x1400b79f0` drops the strong count and,
+at zero, dispatches virtually:
+
+```text
+1400b79f0  mov rbx,[rcx]
+1400b7a13  lock xadd [rbx+8],eax        ; strong count - 1
+1400b7a18  cmp eax,1 / jne 0x1400b7a49
+1400b7a1d  mov rax,[rbx]
+1400b7a23  mov rax,[rax+8]              ; >> specialised control-block slot +0x08
+1400b7a27  call qword [0x14136acc0]     ; == 0x14011d7c0
+```
+
+and `0x14011d7c0` is the control block's `Destroy`, which immediately invokes the
+**object's own** vtable slot `+0x00`:
+
+```text
+14011d7c0  mov [rsp+8],rcx
+14011d7d3  mov rbx,rcx
+14011d7d6  lea rax,[rip+0x1288d03]      ; 0x1413a64e0  reset to the BASE vtable
+14011d7dd  mov [rcx],rax
+14011d7e0  test dl,1 / je 0x14011d7f0
+14011d7e5  mov edx,0x18
+14011d7ea  call 0x140fd7090             ; operator delete(block, 0x18)
+```
+
+so the object's vtable slot `+0x00` is `0x140468D40` — the deleting destructor of
+the `TimeSourceReplyIFace` subobject. **The dispatch site is `0x14011d7c0`'s
+`mov rax,[rbx]; mov rax,[rax]` sequence, reached from `0x1400b79f0`, reached from
+whichever owner dropped the last reference.**
+
+### The argument structure passed to the teardown
+
+`0x140468D40(this /*TimeSourceReplyIFace*/, arg2, arg3, arg4)`:
+
+```text
+140468d40  mov [rsp+8],rbx / mov [rsp+0x10],rsi / push rdi / sub rsp,0x20
+140468d4f  mov rbx,rcx                  ; this = TR+0x18
+140468d52  mov esi,r9d                  ; arg4
+140468d55  mov rcx,[rdx+8]              ; >>> the connection comes from arg2+8
+140468d59  mov rdi,r8                   ; arg3 = pointer to the timesource name
+140468d5c  test rcx,rcx / je 0x140468d6b
+140468d61  xor r8d,r8d
+140468d64  xor edx,edx
+140468d66  call 0x1404123d0             ; (connection, 0, 0)  -> Close 0x43DB3479
+```
+
+`arg2` is therefore a struct whose `+0x08` is the connection; `arg3` points at the
+name used for the unbind comparison. Both are supplied by the caller of the
+virtual slot, not stored on the object.
+
+### The `*:timesource` lookup — and the answer to the causal question
+
+`0x140468B50` is the only code in the image that references the literal
+`"*:timesource"` (`0x1415803D0`; exactly one RIP-relative reference, at
+`0x140468b99`). It resolves through `0x14040ac70`, whose effective scope object is
+`owner->[0x10]` — for the TimeRequester, its own `omega::ObjectSurrogate`, and
+thence the omega **object directory** (intrusive list at `directory+0x130`,
+critical section at `+0x28`, entries matched by type at `+0x10` and name at
+`+0x30`). Full CFG in `scratch/tr/TIMESOURCE_CFG.md`.
+
+```text
+success: *out = the AddRef'd directory entry; 0x140468B50 then Releases it
+         (slot +0x30) and returns true.  No TimeRequester field is written.
+failure: 0x140435b59  mov qword [rbx],r15   (r15 = 0)  ->  *out = 0
+         the guarded release at 0x140468c1a is SKIPPED; return false.
+```
+
+**Does a failed `*:timesource` lookup cause `0x140468D40` to be invoked? NO.**
+The causal direction in the previous section was inverted:
+
+```text
+0x140468D40 is the handler that CALLS the lookup, at 0x140468de6, LAST.
+It emits the Close FIRST, at 0x140468d66, before any lookup happens.
+It can also return without any lookup: empty name (0x140468d8b / 0x140468d71),
+name already equal to the current source (0x140468dc8), or 0x140467ec0
+succeeded (0x140468de0).
+And within 0x140468B50 the only indirect call is guarded by `handle != 0`,
+i.e. success only (0x140468c0b / 0x140468c1a).
+```
+
+The lookup is part of the teardown's *unbind* work, not its cause.
+
+### The `D4` / `useSyncClock` contradiction — resolved
+
+There is **one** creator and **one** owner, so there is no second instance and no
+provisional bootstrap object. The resolution is:
+
+```text
+0x140446490 (omega::ApplicationImpl method) creates the TimeRequester during
+client startup, at the 0x140120df0 step, and installs it at App+0x1A8.
+0x140467BD0(App+0x1A8) does NOT create it -- it ACTIVATES the already-existing
+object: it calls 0x140468B50, and only on success sets [TR+0x40] = 1 and clears
+TR+0x98 / TR+0xA0 / TR+0x140 / TR+0x148 / TR+0x150.
+```
+
+`App+0x1A8` is written at exactly two places — `0x1404467c1` (owner installation)
+and `0x140446860` (explicit clear) — and read by `0x140405b0d`, `0x140406cf1`,
+`0x140427b74` (`0x140427b7b` calls `0x140467BD0`), `0x14043a591`, `0x14044a1f4`
+(the clock read guarded by the `useSyncClock` byte at `App+0x1A0`) and
+`0x140446852` (the clear). It is **non-null before D4**: the object exists, is
+owned, and merely awaits activation. Option A of the open question holds
+("created before D4, activated/configured by `useSyncClock`"); the previous
+section's implication that the object is created by that path is **DISPROVEN**.
+
+### Three proven ways `App+0x1A8` is released
+
+```text
+1. 0x1404467c1 (owner, replacement)      releases the OLD value at 0x1404467e5
+2. 0x140446830 (explicit clear)          zeroes App+0x1A8 / App+0x1B0, then
+                                         calls 0x1400b79f0
+3. 0x140445b2e (ApplicationImpl dtor)    releases App+0xF0, App+0x100, App+0x1A8
+```
+
+Entry point 2 is reached by a tail `jmp` from `0x140406f54` inside the
+application-level shutdown `0x140406c90`, which first observes and then sets the
+`App+0x2A` shutdown byte (`0x140406ccf` / `0x140406cd9`), walks the connection map,
+and performs the remaining game-level teardown before clearing the requester.
+
+### NEW FAILURE BOUNDARY
+
+The `Close` this run observes is emitted by the **`omega::ApplicationImpl`-owned
+`omega::TimeRequester`'s `TimeSourceReplyIFace` deleting destructor
+(`0x140468D40`)** when the last reference on `App+0x1A8` is dropped. That happens
+by construction in exactly three places: replacement by the owner, the explicit
+application-level clear at `0x140446830`, or `~ApplicationImpl`. The
+`*:timesource` lookup is **not** an input to that decision — it runs after the
+Close, inside the same teardown.
+
+What remains **UNRESOLVED** is which of the three release sites fires in the
+retail run, because that depends on runtime state (whether the application enters
+its shutdown path) rather than on any single static branch. Discriminating them
+needs a runtime observable; a witness was attempted but the isolated runtime used
+by previous sessions (`/opt/holocron-test`, a `bwrap` namespace built by
+`tools/launch-isolated-client.sh`) requires the private Proton tree to start a
+WineDbg proxy, and it did not come up in this environment, so no witness value
+was obtained. **No server behaviour was changed.**
