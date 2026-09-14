@@ -6426,3 +6426,61 @@ After fixing both, `0x140414BD0` returns its input field exactly for every value
 carries the fixes and a comment explaining them.
 
 **No server behaviour was changed, no breakpoint was placed, and D4 was not sent.**
+
+### The 0x20-byte record is an `omega::Frame` reference, and the chain reaches a write dispatch
+
+`0x14043F9F0` builds the record and `0x1403FA990` builds what it points at. The
+vtable installed by `0x1403FA990` is `0x141480E08`, which resolves by RTTI:
+
+```text
+omega::Frame       vtable 0x141480E08      CONFIRMED
+```
+
+```c
+// 0x14043F9F0(rec, ctx, arg3, arg4)
+rec->[0x00] = NULL;                              // intrusive-list next
+rec->[0x08] = ctx->[0x00];                       // move an intrusive ref
+if (rec->[0x08]) rec->[0x08]->vtable[0x28]();    // addref
+rec->[0x10] = omega_Frame_copy(arg3);            // 0x1403FA990 -> new Frame
+rec->[0x18] = arg4;                              // uint32 size
+if (ctx->[0x00]) ctx->[0x00]->vtable[0x30]();    // release the moved-from ref
+
+// 0x1403FA990(src)  -- src is the PacketSocket's frame at [socket+0x38]
+Frame* f = mm_alloc(0x28);
+f->[0x00] = &omega::Frame_vtable;
+f->[0x08] = src->[0x10];                         // length
+f->[0x18] = mm_alloc(f->[0x08]);                 // data buffer sized from src
+f->[0x20] = 5; f->[0x24] = 0x101;
+```
+
+So the record is a **reference-counted `omega::Frame` plus a 32-bit size** -- not
+a raw scatter/gather segment and not a bare serialized frame.
+
+Full chain, as far as it is proven:
+
+```text
+logical queued object  omega::PacketSocket
+record                 0x20 bytes: next, omega::Frame ref, size, 32-bit payload
+queue                  PacketSocket+0x168 (lock-free LIFO)
+accounting             PacketSocket+0x170 (added on queue, subtracted on service)
+trigger                PacketSocket+0x164 gate -> ObjectManagerImpl+0x260 ->
+                       the 5 ms callable 0x140430800
+flush                  0x14043B5D0 (mode 0; mode 1 on the >= 1 MiB threshold)
+hand-off               0x140452360(socket+0x38, records, count, total_bytes)
+dispatch               [[socket+0xd8]]->vtable[8](buffer, size)   <-- write entry
+```
+
+The last hop is a virtual write on the object at `PacketSocket+0xd8`. The real
+Winsock boundary in this image is `0x140A82CB0` (two `WSASend` calls in a
+partial-write loop, returning -1 on failure). The hop from
+`[[socket+0xd8]]->vtable[8]` to `0x140A82CB0` was **not** resolved this pass, so:
+
+```text
+record -> PacketSocket queue -> service -> flush -> hand-off -> write dispatch
+                                                                      CONFIRMED
+write dispatch -> WSASend 0x140A82CB0                                 UNKNOWN
+```
+
+That single unresolvable hop does not change the classification: every layer that
+*was* resolved is a transmit path, and the Close envelope is produced upstream of
+all of it.

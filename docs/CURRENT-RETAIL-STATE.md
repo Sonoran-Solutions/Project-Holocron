@@ -8,6 +8,15 @@ runtime witness at the checkpoint recorded at the bottom.
 
 ## `+0x260` deferred PacketSocket service queue — current verdict
 
+**Causality answer (this pass).** The `+0x260` / 5 ms / `0x14043B5D0` mechanism is
+**downstream transport servicing, not the cause of any failure.** It carries an
+already-produced message. The confirmed Close verb `0x1404123D0` serializes its
+`0x43DB3479` envelope and then calls the same `0x14043B460` service function that
+IntroduceConnection and both ID-signature messages use, so the 5 ms path delivers
+a Close that has already been decided. It is removed from the causal failure
+boundary; the decision point is upstream, at whatever decides to invoke
+`0x1404123D0`.
+
 ```text
 ObjectManagerImpl+0x260 = lock-free intrusive LIFO                     CONFIRMED
 queue element class = omega::PacketSocket                              CONFIRMED
@@ -859,6 +868,75 @@ length to `+0x170`, and (on the first outstanding pass) flag `+0x164` and enqueu
 the socket for service. Flushing then happens either immediately when the queued
 byte total crosses 1 MiB *and* the socket is service-enabled, or later in the
 5 ms pass. `+0x180` gates both.
+
+### The 0x20-byte record is a reference-counted `omega::Frame` + size
+
+`0x14043F9F0(rec, ctx, arg3, arg4)` builds the record; `0x1403FA990` builds the
+object it points at, and that object's vtable resolves the whole picture:
+
+```c
+// 0x14043F9F0
+Record* build(Record* rec, Ctx* ctx, A3* arg3, uint32_t arg4) {
+    rec->[0x00] = NULL;                       // intrusive-list next
+    rec->[0x08] = ctx->[0x00];                // move an intrusive ref out of ctx
+    if (rec->[0x08]) rec->[0x08]->vtable[0x28]();   // addref
+    rec->[0x10] = omega_Frame_copy(arg3);     // 0x1403FA990 -> a new omega::Frame
+    rec->[0x18] = arg4;                       // uint32 payload (the size)
+    if (ctx->[0x00]) ctx->[0x00]->vtable[0x30]();   // release the original ref
+    return rec;                               // ctx->[0x00] now NULL (move)
+}
+
+// 0x1403FA990(arg3)  -- arg3 is the PacketSocket's frame at [socket+0x38]
+Frame* omega_Frame_copy(Source* src) {
+    Frame* f = mm_alloc(0x28);
+    f->[0x00] = &omega::Frame_vtable;         // 0x141480E08
+    f->[0x08] = src->[0x10];                  // length/count
+    f->[0x0c] = f->[0x18] = 0;
+    f->[0x20] = 5; f->[0x24] = 0x101; f->[0x26] = 0;
+    f->[0x18] = mm_alloc(f->[0x08]);          // data buffer, sized from src
+    f->[0x20] = src->[0x20]; f->[0x22] = src->[0x22];   // capacity/state words
+    ...
+}
+```
+
+The vtable installed at `0x141480E08` resolves by RTTI to:
+
+```text
+omega::Frame        vtable 0x141480E08      CONFIRMED
+```
+
+So the record is not a raw buffer or a scatter/gather segment: it is a
+**reference-counted `omega::Frame` plus a 32-bit size**. A `Frame` is an
+`omega`-level buffer object (length at `+0x08`, data pointer at `+0x18`).
+
+Consumers of the record, all consistent with that:
+
+```text
+0x14043B5D0   reads [record+0x10] (the Frame), then [Frame+0x10] as a length, and
+              subtracts it from socket+0x170 when draining the queue
+0x140452360   reads [record+0x10] as a size and [record+0x18] as a pointer, then
+              invokes [[socket+0xd8]]->vtable[8](buf, size)
+```
+
+### Record -> write chain
+
+```text
+logical queued object   omega::PacketSocket
+record                 0x20 bytes: next, omega::Frame ref, size, 32-bit payload
+queue                  PacketSocket+0x168 (lock-free LIFO)
+byte accounting        PacketSocket+0x170 (added on queue, subtracted on service)
+service trigger        PacketSocket+0x164 gate -> ObjectManagerImpl+0x260 ->
+                       the 5 ms callable 0x140430800
+flush                  0x14043B5D0 (mode 0); mode 1 on the >= 1 MiB threshold
+hand-off               0x140452360(socket+0x38, records, count, total_bytes)
+dispatch               [[socket+0xd8]]->vtable[8](buffer, size)   <-- write entry
+```
+
+The final hop is a virtual write on the object at `PacketSocket+0xd8`; the real
+Winsock boundary in this image is `0x140A82CB0` (`WSASend` twice in a
+partial-write loop, returns -1 on failure). The exact hop from
+`[[socket+0xd8]]->vtable[8]` to `0x140A82CB0` was not resolved this pass, so the
+chain is proven down to a write-dispatch virtual and `UNKNOWN` for that one hop.
 
 ### The service path is generic, and the Close verb uses it
 
