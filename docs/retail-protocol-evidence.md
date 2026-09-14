@@ -7887,11 +7887,14 @@ event-less.
 ```text
 state 4 is reachable from state 3, via 0x14041235F                    CONFIRMED
 the only place 0x14043D380 is called                                CONFIRMED
-0x14041235F executes BEFORE 0x14043D380 in every invocation         CONFIRMED
-0x14041235F is reached only via 0x140412354, the `AL != 0` target of
-  `0x14041230C jne 0x140412354`                                     CONFIRMED
-=> 0x14043D380 normally reads state 3, returns AL = 0, and takes
-   0x140412317; the 3 -> 4 transition is in THAT arm                CONFIRMED
+0x14041235F is reached ONLY from 0x14041230C `jne 0x140412354`, so it
+  belongs to the AL != 0 arm                                        CONFIRMED
+AL == 0 -> 0x140412317 Close -> 0x14041231C return FALSE            CONFIRMED
+AL != 0 -> 0x140412354 -> 0x14041235F -> 0x1404123A5 event          CONFIRMED
+"the 3 -> 4 transition is in the AL == 0 arm"                       DISPROVEN
+=> 0x14043D380 must see state 4 to allow the transition that sets 4,
+   which is only self-consistent if [rsp+0x90] is NOT the same object
+   as rdi (which is at 3).  Identity UNKNOWN.
 which of the two historical attaches registered                     UNKNOWN
 ```
 
@@ -7967,13 +7970,17 @@ state is 4       -> 0x14043D380 reads 4, returns AL = 1
 ```
 
 ```text
-0x14043D380 runs BEFORE the 3 -> 4 transition        CONFIRMED (instruction order)
-it therefore sees 3, not 4, on any attach that has just executed 0x1404121D6
-0x14043D380's AL == 0 arm is 0x140412317 (Close), NOT 0x140412354
-"0x140412354 is the registration-success target"     CONFIRMED
-"AL == 0 means registration failed"                  CONFIRMED
-"the 3 -> 4 transition is in the failure arm"        CONFIRMED
+0x140412354 is reached ONLY from 0x14041230C jne 0x140412354     CONFIRMED
+0x140412354 is the AL != 0 target                                CONFIRMED
+0x14041235F (3 -> 4) sits in that AL != 0 arm                    CONFIRMED
+0x14043D380's AL == 0 arm is 0x140412317 (Close) + return FALSE   CONFIRMED
+"the 3 -> 4 transition is in the failure/AL==0 arm"              DISPROVEN
 ```
+
+**The following paragraph of this section is retracted.** It claimed the
+transition lives in the `AL == 0` arm; the CFG above shows the opposite. The
+state-cycle question therefore remains OPEN, and hinges entirely on whether
+`[rsp+0x90]` is the same object as `rdi`.
 
 ### The full state sequence, with the caveat that the objects are not proven identical
 

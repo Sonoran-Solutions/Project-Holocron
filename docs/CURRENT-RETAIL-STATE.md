@@ -2778,21 +2778,55 @@ An earlier claim in this document and the notebook read:
 => the first successful attach is impossible
 ```
 
-**The contradiction was a branch-label error, not a real cycle.** Corrected:
+**CORRECTED AGAIN (evidence correction).** The previous pass claimed the
+`3 -> 4` transition lives in the `AL == 0` arm. That is **`DISPROVEN`** by the
+recorded CFG. The byte-verified control flow is:
 
-```text
-0x14041235F executes BEFORE the 0x14043D380 call           CONFIRMED (order)
-0x14041235F is reached only via 0x140412354, which is the
-  `AL != 0` target of `0x14041230C jne 0x140412354`        CONFIRMED
-=> on any given invocation, 0x14043D380 runs BEFORE the 3 -> 4 transition,
-   so it reads 3 and returns AL = 0, taking 0x140412317     CONFIRMED
-=> the state-4 transition lives in that AL == 0 arm        CONFIRMED
-=> a LATER attach can then find state 4 and take the routing arm
+```asm
+14041230a  test al, al                  ; 84c0
+14041230c  jne  0x140412354             ; 7546   AL != 0 -> 0x140412354
+
+; AL == 0 arm
+140412317  call 0x1404123d0             ; Close(conn, 2, 1)
+14041231c  xor bl, bl                   ; return FALSE
+
+; AL != 0 arm  (0x140412354 is ONLY reached from 0x14041230C)
+140412354  xor r9d, r9d
+140412357  lea edx, [r9 + 4]            ; newState 4, mask 8
+14041235f  call 0x140414cb0             ; <-- 3 -> 4 transition is HERE
+1404123a5  call 0x140435ce0             ; queue ConnectionOpen
 ```
 
-An earlier line here said "the first attach to reach `0x14041230A` while the
-state is 3 succeeds". That is `SUPERSEDED`: registration returns `(state == 4)`,
-so an attach that has just executed `0x1404121D6` (state -> 3) registers nothing.
+```text
+AL == 0  ->  0x140412317 Close -> 0x14041231c return FALSE
+AL != 0  ->  0x140412354 -> 0x14041235F state transition -> ConnectionOpen
+0x14041235F belongs to the AL != 0 path               CONFIRMED
+"the 3 -> 4 transition lives in the AL == 0 arm"      DISPROVEN
+"a later attach benefits from the failure arm"        DISPROVEN / UNSUPPORTED
+"the state-cycle contradiction is resolved"           SUPERSEDED
+```
+
+`0x140412354` has exactly one predecessor, `0x14041230C`, so the two arms are
+disjoint and the transition cannot be reached from the `AL == 0` path.
+
+**Authoritative status now:**
+
+```text
+state-cycle contradiction:
+    UNRESOLVED until the identity of the object at [rsp+0x90] is known
+```
+
+```text
+0x14043D380's first argument = [rsp+0x90]                 CONFIRMED
+0x14041235F's first argument = rdi                        CONFIRMED
+[rsp+0x90] == rdi                                          UNKNOWN
+```
+
+If those two are the same object, then `0x14043D380` demands state 4 on a path
+where state has just been set to 3 and only becomes 4 *after* the demand — an
+unresolved cycle. If they are different objects, the cycle disappears (one object
+is at 4 while the other is being moved 3 -> 4). That identity is the open
+question and the target of the current pass.
 
 ### `0x14043D380` is a gated REPLACE, not an insert
 
@@ -3070,6 +3104,8 @@ stale `flock`/`bwrap`/`gdb` set makes every later run exit immediately with
 | The wildcard test inspects the event payload peer's `+0x40` | `DISPROVEN` | The load at `0x14040AEFD` is guarded by `je 0x14040AF08`, so it runs **only in the CAS-failure arm**, where `RAX` is the CAS *destination* operand `[rdx+0x88]`. The tested peer is the attached peer; the payload peer is only the Close argument (`mov rcx,[rbx]` at `0x14040AF24`). |
 | `0x14040AEC0` "probes and classifies" without a store | `SUPERSEDED` (label only) | The earlier wording stated the effect correctly but was then replaced by "conditional compare-and-clear", which wrongly implies a mutation. Current label: **atomic null-probe / current-peer load**, `field mutation = NONE`. |
 | `0x14040AEC0` **conditionally detaches** `conn+0x88` | `DISPROVEN` | A zero-to-zero compare-exchange cannot clear a non-NULL field either, because the replacement equals the expected value. `NULL -> NULL` and `peer -> peer`; no arm removes a peer. |
+| The `3 -> 4` state transition lives in the `AL == 0` arm of `0x14041230C` | `DISPROVEN` | `jne 0x140412354` sends `AL != 0` to `0x140412354`, and `0x140412354`'s only predecessor is `0x14041230C`. So `0x14041235F` is in the `AL != 0` arm; the `AL == 0` arm is `0x140412317` (Close) + `0x14041231C` (return FALSE). |
+| `[rsp+0x90] == rdi` at `0x140412302` | `UNKNOWN` | The two arguments are different expressions (`rbx = [rsp+0x90]` vs `rdi`); their equality is unproven. The state-cycle question is unresolved until it is settled. |
 | `0x14042C300` is the RequestIDSignature handler | `DISPROVEN` | The dispatcher `0x14042B990` calls `0x14042BCA0` for `0xA609E6A7` (RequestIDSignature) and `0x14042C300` for `0x6731C5AF` (ReplyIDSignature). Pre-existing typo in this document, corrected. |
 | The routed peer has "four strings at +00/+10/+30/+40" | `SUPERSEDED` | Five StrRef slots are initialised (`+0x00 +0x10 +0x20 +0x30 +0x40`); only four come from parameters. `+0x20` is the derived composite `p3 ":" p2`. |
 | `peer+0x40` = "the 4th argument object of `0x14042B3D0`, i.e. the neighbour object" | `SUPERSEDED` | `p5` is the **qword at `[fourth_argument]`**, and the fourth argument is a *receive-route record* whose `+0x00` is a StrRef, not a whole neighbouring peer. The precise statement is `new_peer+0x40 = old_peer+0x00`. |
