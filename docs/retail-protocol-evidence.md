@@ -6856,6 +6856,14 @@ dispatch.
 
 ### `0x14040AEC0` in full
 
+> **SUPERSEDED — see "Phase 0 corrections: CMPXCHG class, ReplyID opcode, peer
+> layout (September 13, later pass)" at the end of this file.** The pseudocode
+> below was written before the operand provenance was recovered. Two things in it
+> are wrong: the CAS is a **conditional compare-and-clear** (expected = 0,
+> replacement = 0), so it never detaches anything; and the `+0x40` load is
+> guarded so that it reads the **CAS destination** peer, not `p` (the payload
+> peer). Retained for chronology.
+
 ```c
 // rcx = listener (omega::Object), rdx -> wrapper holding the peer
 void Object::on_connection_open(Wrapper* w) {
@@ -6864,9 +6872,12 @@ void Object::on_connection_open(Wrapper* w) {
 
     long prev = 0;
     lock cmpxchg(&conn->[0x88], prev, 0);        // 0x14040AEEB : detach, UNCONDITIONAL
+                                                 //   ^^^ WRONG, see above
 
     const char* s = (const char*)0x14156BD60;    // the empty string
     if (prev != 0 && p->[0x40] != NULL) s = p->[0x40];
+                                                 //   ^^^ reads the CAS destination
+                                                 //   peer, not p
     if (s[0] == '*' && s[1] == '\0') goto done;  // exact "*" -> SKIP the Close
 
     0x1404123D0(p, 0, 0);                        // 0x14040AF27 : send the Close
@@ -6966,3 +6977,228 @@ D4                                                                   UNKNOWN
 ```
 
 **No server behaviour was changed, no breakpoint was placed, and D4 was not sent.**
+
+## Phase 0 corrections: CMPXCHG class, ReplyID opcode, peer layout (September 13, later pass)
+
+Three canonical statements in `docs/CURRENT-RETAIL-STATE.md` were re-derived from
+the image and found wrong. All three are corrected above in the state document;
+the raw evidence is recorded here.
+
+### A. `0x14040AEEB` is a COMPARE-AND-CLEAR, and the tested peer is the CAS destination
+
+Instruction bytes re-read from the image (`f0 48 0f b1 8a 88 00 00 00`):
+
+```asm
+14040aee7  xor  ecx, ecx                 ; RCX = REPLACEMENT = 0
+14040aee9  xor  eax, eax                 ; RAX = EXPECTED    = 0
+14040aeeb  lock cmpxchg [rdx+0x88], rcx
+14040aef4  lea  rcx, [rip+0x1160e65]     ; 0x14156BD60 = the EMPTY string
+14040aefb  je   0x14040af08              ; CAS SUCCEEDED -> rcx keeps the empty string
+14040aefd  mov  rax, [rax+0x40]          ; CAS FAILED -> RAX = [rdx+0x88] (old peer)
+14040af01  test rax, rax
+14040af04  cmovne rcx, rax
+```
+
+x86-64 semantics, stated explicitly:
+
+```text
+if [mem] == RAX:
+    [mem] = RCX
+    ZF = 1
+else:
+    RAX = [mem]
+    [mem] unchanged
+    ZF = 0
+```
+
+Operand provenance (`reachprov.py 0x14040AEC0 0x14040AEEB`, and by inspection —
+neither register has any earlier writer in the function):
+
+```text
+RAX = expected    = 0    (0x14040AEE9)
+RCX = replacement = 0    (0x14040AEE7)
+RDX = [rdx_entry]  = the ConnectionOpen event payload peer (survives the CAS,
+                     because cmpxchg never writes the destination operand)
+```
+
+Classification:
+
+```text
+UNCONDITIONAL DETACH   NO
+CONDITIONAL DETACH     NO -- the replacement is 0, so "detach" only matches a
+                            field that is already NULL
+ATOMIC PROBE/CLASSIFY  partially -- same observable effect, but the replacement
+                            operand is a real 0, so the store is a genuine clear
+COMPARE-AND-CLEAR      YES
+OTHER                  NO
+```
+
+Reconciliation with the captured witness is exact rather than merely compatible:
+
+```text
+conn+0x88 = peer B before, peer B after, ZF=0, RAX <- peer B
+  -> the CAS did not match RAX=0, so it did not store, and the destination
+     operand RDX (the payload peer) is untouched
+  -> RAX now holds the destination OPERAND's value, so the +0x40 load reads
+     the ATTACHED peer, not the payload peer
+```
+
+The last point is the substantive discovery: the `+0x40` test is reachable
+**only in the CAS-failure arm**, because `0x14040AEFB` jumps over it on success.
+So:
+
+```text
+0x14040AEC0 detaches conn+0x88 unconditionally            SUPERSEDED
+the +0x40 test inspects the payload peer                  DISPROVEN
+the +0x40 test inspects [conn+0x88]'s peer                CONFIRMED
+```
+
+### B. ReplyID dispatcher opcode typo
+
+The image's `cmp r9d, <imm>` chain in `0x14042B990` pairs opcodes with call
+targets as follows (`CONFIRMED` from the `call` instructions at `0x14042B9F2`,
+`0x14042BA70`, `0x14042BAB2`):
+
+```text
+0xA609E6A7 -> 0x14042BCA0  RequestIDSignature
+0x6731C5AF -> 0x14042C300  ReplyIDSignature
+0x8B0D492F -> 0x14042C910  IntroduceConnection
+0x43DB3479 -> 0x14042BAC5 edx=1 r8d=0 -> 0x1404123D0  Close
+0x598D9A7  -> 0x14042BAD5 edx=0 r8d=0 -> 0x1404123D0  RequestClose
+```
+
+The detailed section of the state document had associated `0x14042C300` with
+`0xA609E6A7`. That was a typo and is corrected. Handler identities are unchanged:
+`0x14042C300` was always the ReplyIDSignature handler.
+
+### C. The routed peer has five string slots, and `+0x20` is derived
+
+The constructor `0x140412820` initialises **five** StrRef slots with the
+empty-string singleton, then performs **four** parameter assignments:
+
+```asm
+140412883  mov [rax+0x00], r13     ; five initial stores, r13 = 0x14156BD60
+14041288b  mov [rax+0x10], r13
+140412892  mov [rax+0x20], r13
+140412899  mov [rax+0x30], r13
+1404128a0  mov [rax+0x40], r13
+1404128d7  rcx=rax        rdx=[rbp+0xc8]=p2  -> +0x00   ; four assignments
+1404128e7  rcx=rax+0x10   rdx=[rbp+0xd0]=p3  -> +0x10
+1404128f7  rcx=rax+0x30   rdx=[rbp+0xd8]=p4  -> +0x30
+140412907  rcx=rax+0x40   rdx=[rbp+0xe0]=p5  -> +0x40
+```
+
+`+0x20` has no parameter. It is built by a local string object at `[rsp+0x50]`
+(initialised by `0x1400B7840` at `0x140412942`, using the `omega::Frame` vtable
+`0x141480E08`):
+
+```asm
+140412948..140412961  append p3   (cmovne from [rbp+0xd0] onto the "" default)
+140412966..14041299c  append the literal ':'  (0x14156E658)
+1404129c2..1404129db  append p2   (cmovne from [rbp+0xc8] onto the "" default)
+1404129e0..1404129e9  peer+0x20 := the builder's buffer (0x14012D1F0)
+1404129ee            normalise
+```
+
+```text
+peer+0x20 = p2 || ":" || p3
+```
+
+Runtime agreement is exact: the captured `peerB+0x20 = ":castlehilltest"` is
+`"" + ":" + "castlehilltest"`. StrRef slots are 16 bytes
+(`char* +0x00`, `u32 len +0x08`, `u32 cap +0x0C`); the peer is 0x88 bytes and has
+no vtable.
+
+### D. p5 is `[fourth_argument]`, not "the fourth argument object"
+
+Current code, re-read:
+
+```asm
+; 0x14042B3D0
+14042b60c  lea  rax, [rbp-0x48]
+14042b610  mov  [rsp+0x70], rax
+14042b615  mov  rax, [r12]            ; r12 = [rbp+0xd8] = the 4th formal arg
+14042b619  mov  [rbp-0x48], rax       ; <- the qword AT that object
+14042b61d/620  lock inc [rax+8]       ; retain, so it is a reference-counted object
+14042b6e9  mov  [rsp+0x40], rax       ; -> 5th arg of 0x140411D30
+```
+
+So p5 is the **qword stored at offset 0 of the fourth argument**, and that qword
+is a refcounted pointer. The fourth argument's concrete type is the
+**introduce/receive route record**: the same object also supplies the third
+formal argument of `0x14042B3D0` (the local name, compared against `"localhost"`
+at `0x14042B63B`), stored as `[rbp-0x78]`.
+
+On the failing ReplyID path, the value that the *peer-attach* path copies into a
+new peer's `+0x40` is the one passed as the **sixth argument of `0x140412180`**,
+and that is `[[connection+0x88]+0x00]`:
+
+```asm
+14042c74a  mov  rdx, [rsp+0x128]      ; the omega::Connection
+14042c752  xor  eax, eax
+14042c754  lock cmpxchg [rdx+0x88], rdi   ; probe (rdi = 0)
+14042c75d  cmovne r8, rax             ; r8 = [old_peer+0x00]
+14042c77f  mov  rcx, r10
+14042c782  call 0x140412180           ; arg6 = [old_peer+0x00]
+```
+
+and inside `0x140412180`:
+
+```asm
+1404121e8  mov  rdx, [rsp+0xc0]       ; the sixth argument
+140412236  mov  r9, [rsp+0xb0]        ; fifth ctor arg = [sixth argument]
+140412247  call 0x140412820
+```
+
+```text
+new_peer+0x40 = p5 = [sixth arg of 0x140412180] = [[connection+0x88]+0x00]
+```
+
+### E. `"*"` is a real wildcard name, not a bespoke sentinel
+
+`0x140407000` materialises `"*"` as a string **value** and resolves names against
+it:
+
+```asm
+140407084  lea r9, [rip+0x1167245]    ; 0x14156E2D0 "*"
+14040708b..140407096                  ; strlen it
+1404070fd  call 0x140ff97c0           ; copy it into the local string object
+```
+
+It is called from `0x140435B50`, inside the IntroduceConnection outbound path
+`0x140435AE0 -> 0x140435C30 -> 0x14042B3D0`. The address `0x14156E2D0` has 113
+image-wide references, all of them the two-byte string `"*"`. A peer named `"*"`
+is therefore a wildcard-named peer, and the skip at `0x14040AEC0` reads as "do
+not Close a wildcard-named routed peer".
+
+### F. What was NOT done
+
+```text
+server experiment:      NOT PERFORMED (the exact controlling field is not proven)
+D4:                     NOT SENT (still UNKNOWN)
+client patch:           none beyond the existing resolver workaround
+Runtime instrumentation: none this pass; all findings are static plus the
+                        previously captured witnesses in this notebook
+```
+
+The experiment gate required one **exact** server field proven to control the
+value tested at `peer+0x40`. The proven chain reaches
+`[[connection+0x88]+0x00]` on the previous attach, which is a client-built peer
+record; no inbound bootstrap message field was found writing a peer record's
+`+0x00`. Guessing between the candidate ReplyID strings would have violated the
+task's explicit prohibition, so no experiment was run.
+
+### Classification
+
+```text
+0x14040AEEB = conditional compare-and-clear (expected 0, replacement 0)  CONFIRMED
+conn+0x88 changes in 0x14040AEC0:                                         NO
++0x40 test base = the CAS destination operand (= attached peer)           CONFIRMED
+0x6731C5AF -> 0x14042C300 ReplyIDSignature                                CONFIRMED
+peer has five StrRef slots; +0x20 = p2 ":" p3                             CONFIRMED
+new_peer+0x40 = old_peer+0x00                                             CONFIRMED
+"*" is a real client-side wildcard name value                             CONFIRMED
+server controls peer+0x40 directly                                        DISPROVEN
+server controls peer+0x40 indirectly (two hops)                           YES
+D4                                                                        UNKNOWN
+```
