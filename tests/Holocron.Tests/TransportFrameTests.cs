@@ -2,11 +2,17 @@ using Holocron.Common.Protocol;
 
 namespace Holocron.Tests;
 
+/// <summary>
+/// Provenance: STATIC-CONTRACT DERIVED. The frame header layout and checksum are
+/// taken from the disassembled retail transport, so these vectors pin the
+/// implementation to that contract. They do not prove end-to-end interoperability.
+/// </summary>
 public class TransportFrameTests
 {
     [Fact]
-    public void EncryptedTransportTypeUsesComplementedChecksum()
+    public void CompressionFlagTransportTypeUsesComplementedChecksum()
     {
+        // 0x10 is the Zstandard compression flag, not an encryption class.
         byte[] frame = TransportFrame.Encode(0x10, new byte[40]);
         Assert.Equal("102E000000C1", Convert.ToHexString(frame.AsSpan(0, TransportFrame.HeaderSize)));
     }

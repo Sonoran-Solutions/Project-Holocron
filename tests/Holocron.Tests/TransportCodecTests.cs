@@ -3,16 +3,23 @@ using Holocron.Common.Protocol;
 
 namespace Holocron.Tests;
 
-public class EncryptedTransportTests
+/// <summary>
+/// Transport codec provenance: the payload vectors are REAL captured client
+/// bytes (a fixed retail vector), and the 0x10 bit they exercise is the
+/// Zstandard COMPRESSION flag -- not an encryption class. Salsa20 is session
+/// state established by the RSA exchange, not a per-frame property.
+/// </summary>
+public class TransportCodecTests
 {
     [Fact]
-    public async Task EncryptedType10EnvelopeRoundTripsAndDecompressesToItsDispatchFields()
+    public async Task CompressedRoutedEnvelopeRoundTripsAndDecompressesToItsDispatchFields()
     {
         byte[] key = Enumerable.Range(0, 32).Select(i => (byte)i).ToArray();
         byte[] iv = new byte[8];
-        // A real client logical envelope: message, wildcard route pair, a
-        // length-prefixed string and two trailing fields. It exceeds the retail
-        // 0x20-byte threshold, so the transport compresses it and sets bit 0x10.
+        // A real captured client logical envelope: message 0xA609E6A7,
+        // wildcard route pair, a length-prefixed string and two trailing fields.
+        // It exceeds the retail 0x20-byte threshold, so the transport compresses
+        // it and sets bit 0x10 -- the Zstandard flag, NOT an encryption class.
         byte[] envelope = Convert.FromHexString(
             "A7E609A6FFFFFFFF0F000000636173746C6568696C6C74657374000E0000000000000000000000");
 

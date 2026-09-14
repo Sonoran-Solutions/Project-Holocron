@@ -12,15 +12,29 @@ namespace Holocron.Tests;
 
 public class LoginExchangeTests
 {
+    /// <summary>
+    /// HISTORICAL EXPERIMENT — NOT RETAIL SEQUENCING.
+    ///
+    /// This test exercises the <c>--historical-invalid-direct-login-probe</c>
+    /// mode, which answers the client's first global message
+    /// (<c>0xA609E6A7 RequestIDSignature</c>) directly with D4
+    /// (<c>0xD4BA5CCD</c>). That is <b>not</b> valid retail sequencing: the
+    /// proven reply to <c>0xA609E6A7</c> is <c>0x6731C5AF ReplyIDSignature</c>,
+    /// after which the client sends <c>0x8B0D492F
+    /// IntroduceConnectionSignature</c>.
+    ///
+    /// What it <i>does</i> prove, against a synthetic peer: the exact byte shape
+    /// of the D4 initialization document, the immediate game-launch reply, and
+    /// the transport time-sync contract. It proves nothing about whether a
+    /// retail client accepts them, and nothing about message ordering.
+    /// </summary>
     [Fact]
-    public async Task ProbePreservesD4ConfigurationAndEncryptedTimeSyncContract()
+    public async Task HistoricalInvalidDirectLoginProbe_EmitsD4EnvelopeShapeAndTimeSyncContract()
     {
-        // Synthetic peer only: this verifies the actual server wire output, not
-        // acceptance of the XML or launch reply by the retail client.
         using RSA rsa = RSA.Create(2048);
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var server = new AuthServer(0, testKey: rsa, handshakeOnly: true,
-            probeLoginReplyEnvelope: true);
+            historicalInvalidDirectLoginProbe: true);
         Task serverTask = server.StartAsync(cancellation.Token);
         try
         {
@@ -35,8 +49,10 @@ public class LoginExchangeTests
             using var codec = new TransportCodec(network,
                 new Salsa20(clear[8..40], clear[72..80]),
                 new Salsa20(clear[40..72], clear[80..88]));
-            // A real client request, exactly as recovered after transport
-            // decompression: message 0xA609E6A7 on the wildcard route pair.
+            // A real captured client envelope: 0xA609E6A7 on the wildcard
+            // route pair. In retail this is RequestIDSignature and is answered
+            // by ReplyIDSignature -- this probe answers it with D4 instead,
+            // which is the historical (invalid) behaviour under test here.
             await codec.WriteAsync(0, Convert.FromHexString("A7E609A6FFFFFFFF0F000000636173746C6568696C6C74657374000E0000000000000000000000"), cancellation.Token);
             TransportMessage? replyOrNull = await codec.ReadAsync(cancellation.Token);
             Assert.NotNull(replyOrNull);

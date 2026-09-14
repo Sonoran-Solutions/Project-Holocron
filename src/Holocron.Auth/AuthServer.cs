@@ -11,14 +11,24 @@ namespace Holocron.Auth;
 
 public sealed class AuthServer
 {
-    // Client -> server login request message id. Recovered after transport
-    // decompression; the client's own serializer writes this exact constant
-    // (0x14045BAC4) together with the wildcard route pair 0xFFFF/0xFFFF.
-    private const uint ClientLoginRequestMessage = 0xA609E6A7;
+    // ---------------------------------------------------------------------
+    // Retail identification message ids.
+    //
+    // 0xA609E6A7 is RequestIDIFace::RequestIDSignature — the client's FIRST
+    // global request. It is NOT a login request and it is NOT answered by D4.
+    // The proven reply is 0x6731C5AF ReplyIDIFace::ReplyIDSignature, after which
+    // the client sends 0x8B0D492F IntroduceConnectionSignature.
+    // See IdentificationExchange and docs/CURRENT-RETAIL-STATE.md.
+    // ---------------------------------------------------------------------
+    private const uint RequestIdSignatureMessage = IdentificationExchange.RequestIdSignature;
 
-    // Server -> client login reply and game launch reply. These come from the
-    // omega::ServerProxy receive callback 0x14045A1C0, which dispatches them to
-    // LoginRequestIFace and AuthorizationReplyIFace respectively.
+    // Server -> client routed replies, dispatched by the omega::ServerProxy
+    // receive callback 0x14045A1C0 to LoginRequestIFace and
+    // AuthorizationReplyIFace respectively.
+    //
+    // D4 (0xD4BA5CCD) is NOT the reply to 0xA609E6A7. Its causal relevance to
+    // the reproduced Close is UNKNOWN, and the canonical bootstrap path
+    // deliberately does not send it.
     private const uint LoginReplyMessage = 0xD4BA5CCD;
     private const uint GameLaunchReplyMessage = 0x90F2D04D;
 
@@ -46,14 +56,14 @@ public sealed class AuthServer
     private readonly RSA? _testKey;
     private readonly bool _handshakeOnly;
     private readonly bool _capturePostHandshake;
-    private readonly bool _probeLoginReplyEnvelope;
+    private readonly bool _historicalInvalidDirectLoginProbe;
     private readonly bool _probeIdBootstrap;
     private readonly long _timeBaseFileTimeMilliseconds;
     private readonly long _timeBaseStopwatchTimestamp;
 
     public AuthServer(int port = 7979, string worldHost = "127.0.0.1", int worldPort = 20061,
         RSA? testKey = null, bool handshakeOnly = false, bool capturePostHandshake = false,
-        bool probeLoginReplyEnvelope = false, bool probeIdBootstrap = false)
+        bool historicalInvalidDirectLoginProbe = false, bool probeIdBootstrap = false)
     {
         _port = port;
         _worldHost = worldHost;
@@ -61,7 +71,7 @@ public sealed class AuthServer
         _testKey = testKey;
         _handshakeOnly = handshakeOnly;
         _capturePostHandshake = capturePostHandshake;
-        _probeLoginReplyEnvelope = probeLoginReplyEnvelope;
+        _historicalInvalidDirectLoginProbe = historicalInvalidDirectLoginProbe;
         _probeIdBootstrap = probeIdBootstrap;
         _timeBaseFileTimeMilliseconds = DateTime.UtcNow.ToFileTimeUtc() / TimeSpan.TicksPerMillisecond;
         _timeBaseStopwatchTimestamp = Stopwatch.GetTimestamp();
@@ -162,7 +172,7 @@ public sealed class AuthServer
                     await ProbeIdBootstrapAsync(codec, endpoint, ct);
                     return;
                 }
-                if (_probeLoginReplyEnvelope)
+                if (_historicalInvalidDirectLoginProbe)
                 {
                     await ProbeLoginReplyEnvelopeAsync(codec, endpoint, ct);
                     return;
@@ -247,12 +257,31 @@ public sealed class AuthServer
     }
 
     /// <summary>
-    /// Bounded login-reply probe. Reads one routed application frame through the
-    /// shared codec, so the dispatch envelope is taken from the decompressed
-    /// logical payload exactly as the retail receiver does.
+    /// HISTORICAL / INVALID SEQUENCING PROBE — NOT RETAIL BEHAVIOUR.
+    ///
+    /// This probe treats the client's first global message
+    /// (<c>0xA609E6A7</c>, which is <c>RequestIDIFace::RequestIDSignature</c>) as
+    /// a "login request" and answers it directly with D4 (<c>0xD4BA5CCD</c>) plus
+    /// an immediate game-launch reply. It therefore <b>bypasses the proven
+    /// identification exchange entirely</b>:
+    ///
+    /// <code>
+    /// client  0xA609E6A7 RequestIDSignature      -> server 0x6731C5AF ReplyIDSignature
+    /// client  0x8B0D492F IntroduceConnectionSignature
+    /// </code>
+    ///
+    /// It is retained only as an isolated envelope-shape contract and as the
+    /// record of a historical experiment. It must not be presented as valid
+    /// retail sequencing, and it is not reached by the canonical bootstrap
+    /// (<c>--probe-id-bootstrap</c>). See <c>docs/CURRENT-RETAIL-STATE.md</c>.
     /// </summary>
     private async Task ProbeLoginReplyEnvelopeAsync(TransportCodec codec, string endpoint, CancellationToken ct)
     {
+        Console.WriteLine("[AUTH] WARNING: --historical-invalid-direct-login-probe is active.");
+        Console.WriteLine("[AUTH] WARNING: this answers RequestIDSignature (0xA609E6A7) directly with D4");
+        Console.WriteLine("[AUTH] WARNING: and bypasses the proven ReplyIDSignature/IntroduceConnection exchange.");
+        Console.WriteLine("[AUTH] WARNING: it does not establish retail sequencing and is not the canonical path.");
+
         TransportMessage? request = await codec.ReadAsync(ct);
         if (request is null)
         {
@@ -269,8 +298,8 @@ public sealed class AuthServer
         ushort routeB = BinaryPrimitives.ReadUInt16LittleEndian(envelope.AsSpan(6));
         Console.WriteLine($"[AUTH] Received routed client request: logical={envelope.Length} bytes, message=0x{messageId:X8}, route=0x{routeA:X4}/0x{routeB:X4}.");
 
-        if (messageId != ClientLoginRequestMessage)
-            Console.WriteLine($"[AUTH] WARNING: expected client login request 0x{ClientLoginRequestMessage:X8}, received 0x{messageId:X8}; replying on the observed route pair.");
+        if (messageId != RequestIdSignatureMessage)
+            Console.WriteLine($"[AUTH] NOTE: expected RequestIDSignature 0x{RequestIdSignatureMessage:X8}, received 0x{messageId:X8}; replying on the observed route pair anyway (this is the historical probe).");
 
         // Full canonical configuration grounded in static disassembly and historical evidence:
         // - useSyncClock="true" enables the synchronized clock service.
@@ -296,11 +325,15 @@ public sealed class AuthServer
         Console.WriteLine($"[AUTH] Sent login-reply envelope (message=0x{LoginReplyMessage:X8}, route=0x{routeA:X4}/0x{routeB:X4}, body={replyEnvelope.Length - 8} bytes) to {endpoint}.");
         CryptographicOperations.ZeroMemory(replyEnvelope);
 
-        // Immediate game launch reply (0x90F2D04D).
-        // Retail client evidence confirms that ServerProxy::ReplyGameLaunch (0x90F2D04D)
-        // arrives alongside or immediately following D4. It supplies the World shard address and clears
-        // [ServerProxy + 0x78]. If the connection closes before 0x90F2D04D arrives, ServerProxy::OnDisconnect (0x140427170)
-        // triggers HandleLaunchFailure(1003). Type 0x01 is on an independent 10-second background timer and must NOT gate 0x90F2D04D.
+        // Immediate game launch reply (0x90F2D04D) -- part of this HISTORICAL probe,
+        // so its ordering relative to the identification exchange is not retail-valid.
+        // Static evidence: ServerProxy::ReplyGameLaunch (0x90F2D04D) supplies the World
+        // shard address and clears [ServerProxy + 0x78]. If the connection closes while
+        // the launch context is still outstanding, ServerProxy::OnDisconnect
+        // (0x140427170/0x14042718E) triggers HandleLaunchFailure(1003). That directionality
+        // is CONFIRMED; what is UNKNOWN is whether any of it is causal to the reproduced
+        // Close. Type 0x01 is on an independent 10-second background timer and does not
+        // gate 0x90F2D04D.
         byte[] gameAddress = Encoding.UTF8.GetBytes($"{_worldHost}:{_worldPort}");
         int encodedAddressLength = gameAddress.Length + 1;
         int secondStringLengthOffset = 12 + encodedAddressLength;

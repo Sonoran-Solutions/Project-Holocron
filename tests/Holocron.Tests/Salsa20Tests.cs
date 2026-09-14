@@ -4,6 +4,12 @@ using Xunit;
 
 namespace Holocron.Tests;
 
+/// <summary>
+/// Provenance: SYNTHETIC MECHANICS ONLY. These tests prove the cipher
+/// implementation round-trips; they do not prove that Salsa20 parameters,
+/// keying or framing match the retail session. Salsa20 is session state
+/// established by the RSA exchange -- it is not a per-frame transport property.
+/// </summary>
 public class Salsa20Tests
 {
     [Fact]

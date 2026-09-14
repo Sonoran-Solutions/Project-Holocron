@@ -4,8 +4,10 @@ using Holocron.Common.Protocol;
 namespace Holocron.Tests;
 
 /// <summary>
-/// Locks the global identification-exchange encodings to the field order the
-/// retail client's own parser consumes.
+/// Provenance: RETAIL FIXED VECTOR + STATIC-CONTRACT DERIVED. Fixed real client
+/// frames pin the field order that the retail parser consumes; the message ids
+/// and route derivation come from static evidence. These tests establish
+/// encodings, NOT sequencing of unrelated messages such as D4.
 /// </summary>
 public class IdentificationExchangeTests
 {

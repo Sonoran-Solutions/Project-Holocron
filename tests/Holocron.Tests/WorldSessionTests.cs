@@ -12,6 +12,12 @@ using Xunit;
 
 namespace Holocron.Tests;
 
+/// <summary>
+/// Provenance: LEGACY SIMULATION. Exercises the internal simulation packet model
+/// (Holocron.Common.Protocol.Opcode/PacketReader/PacketWriter), whose header and
+/// opcode numbering are NOT established as the current retail SWTOR wire
+/// protocol. These tests must not be used as protocol evidence.
+/// </summary>
 public class WorldSessionTests
 {
     [Fact]

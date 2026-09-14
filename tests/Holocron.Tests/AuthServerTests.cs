@@ -4,6 +4,11 @@ using Holocron.Auth;
 
 namespace Holocron.Tests;
 
+/// <summary>
+/// Provenance: SYNTHETIC MECHANICS ONLY. These tests drive AuthServer with a
+/// synthetic peer to pin its own wire output. Passing them proves the server
+/// emits what this repository intends, not that a retail client accepts it.
+/// </summary>
 public sealed class AuthServerTests
 {
     [Fact]

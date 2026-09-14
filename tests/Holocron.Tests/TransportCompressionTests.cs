@@ -5,9 +5,10 @@ using Holocron.Common.Protocol;
 namespace Holocron.Tests;
 
 /// <summary>
-/// Regression coverage for the transport payload codec. The first vector is a
-/// real client payload captured from an isolated retail run, kept exactly as
-/// captured so these tests cannot drift with the implementation.
+/// Provenance: RETAIL FIXED VECTOR. The first vector is a real client payload
+/// captured from an isolated retail run, kept byte-exact so it cannot drift with
+/// the implementation. The 0x10 bit it exercises is the Zstandard COMPRESSION
+/// flag, not an encryption class.
 /// </summary>
 public class TransportCompressionTests
 {
