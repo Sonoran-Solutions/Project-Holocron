@@ -62,13 +62,36 @@ The causal boundary remains upstream and was pushed back one layer this pass.
 `0x1404245F0` is now identified concretely.
 
 ```text
-0x1404245F0 = the deferred DRAIN of a per-owner element list      CONFIRMED
+0x1404245F0 = per-owner deferred EVENT queue drain                CONFIRMED
+               (all 12 producers queue omega::ObjectSurrogateEvent-derived
+                objects; the queue is homogeneous, not a generic element list)
 its single materialisation is 0x1403FC11A, inside 0x1403FC0B0     CONFIRMED
 it is registered through 0x140423B50 with r9d = 0 (no timeout)    CONFIRMED
 the registration site is the same function that ADDS to the list  CONFIRMED
 ```
 
 ### What `0x1404245F0` does
+
+**Terminology (`CONFIRMED`).** All 12 call sites of `0x1403FC0B0` queue an
+`omega::ObjectSurrogateEvent`-derived object. The queue is therefore
+**homogeneous**, and the drain is described as a **per-owner deferred event queue
+drain** rather than a generic "element drain". Every producer and its event type:
+
+```text
+fn 0x140435CE0   omega::ObjectSurrogateEventConnectionOpen
+fn 0x1404360A0   omega::ObjectSurrogateEventConnectionPDU
+fn 0x1404362A0   omega::ObjectSurrogateEventConnectionClose
+fn 0x140436590   omega::ObjectSurrogateEventConnectionFailure
+fn 0x140436890   omega::ObjectSurrogateEventConnectionLimitExceeded
+fn 0x140436A70   omega::ObjectSurrogateEventConnectionPing
+fn 0x140436C80   (no vtable install on this path; producer not classified)
+fn 0x140436DC0   omega::ObjectSurrogateEventNegotiationSocketClose
+fn 0x140437700   omega::ObjectSurrogateEventConnectionStatus   (3 sites)
+```
+
+So the old "collection teardown" wording is `SUPERSEDED`: this is normal deferred
+event delivery, and `ObjectSurrogateEventConnectionOpen` is simply one event kind
+among eight.
 
 Function extent `0x1404245F0 - 0x140424749` (0x159 bytes, single `.pdata` record,
 no chained unwind entries), 71 instructions.
