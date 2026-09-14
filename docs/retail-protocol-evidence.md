@@ -6427,6 +6427,84 @@ carries the fixes and a comment explaining them.
 
 **No server behaviour was changed, no breakpoint was placed, and D4 was not sent.**
 
+### CORRECTION to this section: the two layouts are different objects
+
+This notebook previously recorded, in the same section, both of:
+
+```text
+record+0x10 = omega::Frame*
+record+0x18 = uint32 size
+```
+
+and
+
+```text
+0x140452360 reads [record+0x10] as a size and [record+0x18] as a pointer
+```
+
+Those are not contradictory descriptions of one object; they describe two
+different objects, and the second line was mislabelled. Re-read from the bytes:
+
+```text
+THE 0x20-BYTE QUEUE RECORD            THE omega::Frame IT POINTS AT
+  +0x00  next                           +0x00  vtable (0x141480E08)
+  +0x08  ctx intrusive ref              +0x08  uint32 length
+  +0x10  omega::Frame*                  +0x10  uint32 size        <-- what
+  +0x18  uint32 size/payload            +0x18  void*  buffer      <-- 0x140452360
+                                                                      reads
+```
+
+`0x140452360` never sees a queue record. `0x14043B5D0` **moves** the
+`omega::Frame*` out of each record into a flat pointer array and passes that:
+
+```asm
+; 0x14043B7EB..0x14043B7F3   the extra record (this[0x98] == 1)
+14043b7eb  mov  rcx, qword ptr [rax + 0x10]    ; rcx = the Frame
+14043b7ef  mov  qword ptr [rax + 0x10], 0      ; record+0x10 := NULL  (a MOVE)
+14043b7f3  mov  qword ptr [rdx + r15], rcx     ; frames[idx] = Frame
+
+; 0x14043B81B..0x14043B823   the stolen queue records
+14043b81b  mov  rax, qword ptr [rdi + 0x10]    ; rax = the Frame
+14043b81f  mov  qword ptr [rdi + 0x10], 0      ; record+0x10 := NULL  (a MOVE)
+14043b823  mov  qword ptr [rdx], rax           ; frames[i] = Frame
+
+; 0x14043BA05..0x14043BA1B   the hand-off
+14043ba0f  mov  rbx, qword ptr [rsp + 0x20]    ; arg2 = the FRAME-pointer array
+14043ba17  mov  rcx, qword ptr [rsi + 0x38]
+14043ba1b  call 0x140452360
+```
+
+There are **two** arrays, and only one of them is passed:
+
+```text
+frames[]  omega::Frame*          (r15)      -> arg2 of 0x140452360
+lens[]    the 0x20-byte record*  (rbp+0x768) -> NOT passed; cleanup only, so the
+                                                epilogue can release and
+                                                mm_free(rec, 0x20) each record
+```
+
+Confirmed at `0x140452360`:
+
+```asm
+1404523de  mov  rdi, rsi            ; rsi = frames[] (element size 8)
+1404523ff  mov  rdx, qword ptr [rsi]        ; rdx = frames[i]  (a Frame*)
+140452402  mov  r8d, dword ptr [rdx + 0x10]; r8d = Frame.size
+140452406  mov  rdx, qword ptr [rdx + 0x18]; rdx = Frame.buffer
+14045240e  call [rax + 8]                   ; write(buffer, size)
+```
+
+So the answer to "conversion or reversed labels?" is: **both** a conversion
+(the flush separates frames from records, and keeps the record array only for
+cleanup) **and** partly-reversed labels in the earlier prose. The `omega::Frame`
+copy constructor independently confirms the Frame layout, because it reads its
+source with the same `+0x10` / `+0x18` pair at `0x1403FAA0E` / `0x1403FAA12`.
+
+One further earlier claim to retract: the arm at `0x14043BB35` is **not** a
+"flush sink". It is the `mm_alloc` failure path — reached only from the
+`test rax, rax / je` at `0x14043B7A7`, it frees nothing and instead calls
+`0x14008CC20` and then `_CxxThrowException` (`0x140FF97D0`) with `ecx = 0x20`,
+i.e. `std::bad_alloc`.
+
 ### The 0x20-byte record is an `omega::Frame` reference, and the chain reaches a write dispatch
 
 `0x14043F9F0` builds the record and `0x1403FA990` builds what it points at. The

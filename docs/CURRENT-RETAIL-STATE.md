@@ -906,30 +906,132 @@ omega::Frame        vtable 0x141480E08      CONFIRMED
 ```
 
 So the record is not a raw buffer or a scatter/gather segment: it is a
-**reference-counted `omega::Frame` plus a 32-bit size**. A `Frame` is an
-`omega`-level buffer object (length at `+0x08`, data pointer at `+0x18`).
+**reference-counted `omega::Frame` plus a 32-bit size**.
 
-Consumers of the record, all consistent with that:
+The `Frame` layout, taken from `0x1403FA990`:
 
 ```text
-0x14043B5D0   reads [record+0x10] (the Frame), then [Frame+0x10] as a length, and
-              subtracts it from socket+0x170 when draining the queue
-0x140452360   reads [record+0x10] as a size and [record+0x18] as a pointer, then
-              invokes [[socket+0xd8]]->vtable[8](buf, size)
+omega::Frame  (size 0x28, mm_alloc'd, vtable 0x141480E08)
+  +0x00  vtable pointer
+  +0x08  uint32 length          (copied from src+0x10 on construction)
+  +0x0c  uint32 (0)
+  +0x10  uint32 size/read cursor -- this is what 0x140452360 reads as `size`
+  +0x18  void*  buffer          (mm_alloc(length); this is the `buffer` argument)
+  +0x20  uint16 copied from src+0x20
+  +0x22  uint16 copied from src+0x22
+  +0x24  flags (0x101)
 ```
+
+Note that `0x1403FA990` reads its *source* with the same `+0x10` / `+0x18` pair
+(`0x1403FAA0E` / `0x1403FAA12`) that `0x140452360` later reads from the copy,
+which independently confirms that `+0x10` is a size and `+0x18` a buffer pointer
+for this class.
+
+Consumers of the record:
+
+```text
+0x14043B5D0   walks the queue records via record+0x00, and for each one reads
+              [record+0x10] (the Frame), then [Frame+0x10] as the length, and
+              subtracts it from socket+0x170                 @ 0x14043B6F3-0x14043B6FC
+0x140452360   does NOT see the record. It receives a flat ARRAY OF FRAME POINTERS.
+              For each element it reads [frames[i]+0x10] as the size and
+              [frames[i]+0x18] as the buffer                     @ 0x1404523FF-0x140452406
+```
+
+**Correction (supersedes an earlier contradictory pair of lines).** This section
+previously stated both that `record+0x10` is an `omega::Frame*` and `record+0x18`
+a `uint32` size, *and* that `0x140452360` "reads `[record+0x10]` as a size and
+`[record+0x18]` as a pointer". Both statements were describing **different
+objects** and the second was mislabelled:
+
+```text
+record+0x10        omega::Frame*                     (the 0x20-byte queue record)
+record+0x18        uint32 size / payload type        (the 0x20-byte queue record)
+
+Frame+0x10         uint32 size                       (the omega::Frame object)
+Frame+0x18         void*  buffer                     (the omega::Frame object)
+```
+
+So `0x140452360`'s `[+0x10]` / `[+0x18]` reads are fields of the **Frame**, reached
+through the pointer array it is handed — not fields of the queue record. There is
+no contradiction in the code, only in the earlier prose.
+
+Answering the four possibilities directly: **(1) is correct** — `0x14043B5D0`
+converts each queue record into a separate pointer array *and* a parallel length
+array before calling `0x140452360`; the layout labels were also partly mislabelled,
+which is what made the two lines look irreconcilable. There is **no** second
+intermediate structure.
+
+The conversion, in full:
+
+```asm
+; 0x14043B70C..0x14043B785  choose the two arrays
+14043b71e  lea   r8,  [rbp + 0xc0]        ; inline frame-pointer array (0x100 bytes)
+14043b725  mov   [rbp + 0x768], r8        ;   -> [rbp+0x768] slot holds its base
+14043b72c  lea   r15, [rbp + 0x3e0]       ; inline length array
+14043b738  cmp   r13d, 0x64
+14043b73c  jle   0x14043b785              ; <= 100 records: use the inline arrays
+14043b741  mov   eax, 8 / mul rbx         ; else allocate two heap arrays
+14043b757  call  0x14008ce30              ;   frames = mm_alloc(8 * count)  -> r15
+14043b773  call  0x14008ce30              ;   lens   = mm_alloc(8 * count)
+
+; 0x14043B7D5..0x14043B7F3  the extra record (this[0x98] == 1) is appended
+14043b7d5  movsxd rcx, ebx
+14043b7d8  lea   rdx, [rcx*8]
+14043b7e0  mov   r8,  [rbp + 0x768]
+14043b7e7  mov   [rdx + r8], rax          ; lens[idx]  = record   (the 0x20-byte record)
+14043b7eb  mov   rcx, [rax + 0x10]        ; rcx = frame           (MOVED OUT)
+14043b7ef  mov   qword ptr [rax + 0x10], 0 ; record+0x10 := NULL
+14043b7f3  mov   [rdx + r15], rcx         ; frames[idx] = frame
+
+; 0x14043B810..0x14043B826  the stolen queue records, in reverse order
+14043b817  mov   [r8 + rdx], rdi          ; lens[i]   = record
+14043b81b  mov   rax, [rdi + 0x10]        ; rax = frame           (MOVED OUT)
+14043b81f  mov   qword ptr [rdi + 0x10], 0 ; record+0x10 := NULL
+14043b823  mov   [rdx], rax               ; frames[i] = frame
+
+; 0x14043BA05..0x14043BA1B  the hand-off
+14043ba05  mov   r9d, r12d                ; arg4 = accumulated total bytes
+14043ba08  mov   r8d, [rbp + 0x758]       ; arg3 = record count
+14043ba0f  mov   rbx, [rsp + 0x20]        ; arg2 = frame-pointer array (r15)
+14043ba17  mov   rcx, [rsi + 0x38]        ; arg1 = PacketSocket's frame/sink object
+14043ba1b  call  0x140452360
+```
+
+So the two arrays are distinct, with different element meanings:
+
+```text
+frames[i]  omega::Frame*            (r15; element size 8)  -- read as [x+0x10]/[x+0x18]
+lens[i]    the 0x20-byte record*    (the other array)       -- only used for cleanup
+```
+
+`lens[]` is not passed to `0x140452360` at all; it exists so the epilogue can
+release and `mm_free(rec, 0x20)` each record (`0x14043B9D9`, `0x14043BB1B`).
+
+The NULLing of `record+0x10` is a **move**, not a transformation: the Frame
+pointer is transferred into `frames[]` and the record's slot cleared so the
+record's own cleanup does not release it twice.
 
 ### Record -> write chain
 
 ```text
 logical queued object   omega::PacketSocket
-record                 0x20 bytes: next, omega::Frame ref, size, 32-bit payload
+queue record           0x20 bytes: { +0x00 next, +0x08 ctx ref,
+                                      +0x10 omega::Frame*, +0x18 uint32 size }
 queue                  PacketSocket+0x168 (lock-free LIFO)
 byte accounting        PacketSocket+0x170 (added on queue, subtracted on service)
 service trigger        PacketSocket+0x164 gate -> ObjectManagerImpl+0x260 ->
                        the 5 ms callable 0x140430800
 flush                  0x14043B5D0 (mode 0); mode 1 on the >= 1 MiB threshold
-hand-off               0x140452360(socket+0x38, records, count, total_bytes)
-dispatch               [[socket+0xd8]]->vtable[8](buffer, size)   <-- write entry
+conversion             the flush MOVES omega::Frame* out of each record into a
+                       flat frames[] array (plus a parallel lens[] it keeps only
+                       for cleanup), NULLing record+0x10 as it goes
+hand-off               0x140452360(socket+0x38, frames[], count, total_bytes)
+per-frame dispatch     for each frames[i]:
+                         size   = [frames[i] + 0x10]        (Frame length)
+                         buffer = [frames[i] + 0x18]        (Frame data)
+                         [[socket+0xd8]]->vtable[8](buffer, size)
+                                                           <-- write entry
 ```
 
 The final hop is a virtual write on the object at `PacketSocket+0xd8`; the real
