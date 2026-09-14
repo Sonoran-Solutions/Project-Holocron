@@ -1,5 +1,12 @@
 # Isolated client preparation
 
+> **For the current model see [`docs/CURRENT-RETAIL-STATE.md`](CURRENT-RETAIL-STATE.md).**
+> This document has two parts: the current preparation/runtime facts at the top,
+> and a clearly-labelled historical findings log at the bottom that preserves
+> superseded conclusions (for example the earlier handshake-only description).
+
+## Current facts
+
 The local test copy lives in `.local-test/client-v1/game/swtor/retailclient`.
 The original Steam executable is untouched. Only the copied executable's
 292-byte inverted public-key region is replaced. The inspected PE has no
@@ -9,9 +16,58 @@ The matching freshly generated private key is in `.local-test/client-v1` with
 owner-only permissions. The directory is Git-ignored. Never distribute that
 private key or use this test client with real account credentials.
 
-Preparation initially selects `shardaddress @::` for repository-stub mode.
-The current experimental `swtor.icb` also selects repository-stub mode, after
-an explicit local repository address produced login error 1003.
+Preparation selects `shardaddress @::` for repository-stub mode. The current
+experimental `swtor.icb` also selects repository-stub mode, after an explicit
+local repository address produced login error 1003.
+
+### Canonical shard address
+
+The platform fixture (`tools/fixtures/platform-responses.json`) serves one shard
+whose `host` field is the canonical launch target:
+
+```text
+localhost:7979:castlehilltest
+```
+
+Note **`localhost`**, not `127.0.0.1`. The outer address parser strips the final
+colon component (the service/shard suffix) before the transport parses
+`host:port`; omitting the suffix therefore loses the port. The client's own log
+confirms the value it consumed:
+
+```text
+[OMEGACONNECT] Starting login: local-test : @localhost:7979:castlehilltest
+```
+
+### Canonical reproduction entrypoint
+
+```bash
+python3 tools/run-retail-bootstrap-probe.py
+```
+
+The isolated namespace contains only `lo`, and the retail TCP hint builder sets
+`AI_ADDRCONFIG` (`0x400`) at RVA `0x4507C9`. In that namespace the flag makes
+`getaddrinfo` reject every IPv4 result including `127.0.0.1`, so the client never
+opens an Auth socket and fails at `0x140427F10` on a missing
+`[ServerProxy+0x80]` -- an **environment artifact**, not the protocol boundary.
+
+`tools/run-retail-bootstrap-probe.py` clears exactly that one immediate on the
+**private** client, verifies the build hash first, and restores the original
+bytes byte-for-byte in a `finally` path. Do not hand-patch; do not run the
+launcher directly on stock bytes and expect the historical path.
+
+### What the auth probe currently does
+
+`Holocron.Auth --test-key PATH --probe-id-bootstrap` runs the **canonical
+bootstrap probe**: it answers `RequestIDSignature` (`0xA609E6A7`) with
+`ReplyIDSignature` (`0x6731C5AF`), observes the client's
+`IntroduceConnectionSignature` (`0x8B0D492F`), and then **only observes**. It does
+not send D4.
+
+`--capture-post-handshake` observes without replying.
+`--historical-invalid-direct-login-probe` is **historical and invalid**: it
+answers `RequestIDSignature` directly with D4, bypassing the proven identification
+exchange. It is retained only as an envelope-shape contract and prints a loud
+warning; it does not establish retail sequencing.
 A private Proton runtime and a separately initialized `compatdata` prefix are used.
 Some historical logs were copied with the runtime: their existence is not evidence
 of a new launch. Check timestamps and the runner's current trace instead.
@@ -39,12 +95,21 @@ starts its own loopback-only auth probe, reads the public key from the actual
 prepared executable, encrypts dummy handshake fields, verifies server acceptance,
 and stops its own server. Run it inside a network namespace for isolation.
 
-`Holocron.Auth --test-key PATH` selects the supplied private key and automatically
-enables handshake-only mode. It closes after validating the historical key-field
-schema rather than emitting unverified application responses.
+`Holocron.Auth --test-key PATH` selects the supplied private key. With no mode
+flag it validates the historical key-field schema and closes without emitting
+application responses; with `--probe-id-bootstrap` it runs the canonical
+identification exchange described above.
 
 This is preparation and a synthetic RSA interoperability check, **not** evidence
 that the real client reaches character selection or that C2/C3 is resolved.
+
+## Historical findings log
+
+> ⚠ **Everything below is a chronological record.** It contains superseded
+> conclusions -- notably "the auth service is deliberately handshake-only" (the
+> canonical probe now performs the identification exchange) and the earlier
+> `127.0.0.1:7979:castlehilltest` fixture value (the canonical value is
+> `localhost:7979:castlehilltest`). Do not treat it as current state.
 
 ## Isolated launch findings (updated 2026-09-05)
 
@@ -112,8 +177,9 @@ and headers are not logged. The real client accepted the responses and logged
 one shard, displaying **Holocron Local Test**. Selecting it initially failed
 with login error 1003 before any binary auth connection.
 
-The fixture's host now includes the service suffix:
-`127.0.0.1:7979:castlehilltest`. The outer address parser removes the final colon
+The fixture's host now includes the service suffix -- superseded wording below
+said `127.0.0.1:7979:castlehilltest`; the canonical value is
+`localhost:7979:castlehilltest`. The outer address parser removes the final colon
 component before the transport parses host/port; omitting the service therefore
 loses the port. A fresh client run is required to validate this correction
 because the displayed shard list is cached.

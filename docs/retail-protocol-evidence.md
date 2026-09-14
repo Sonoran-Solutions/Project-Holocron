@@ -1,5 +1,31 @@
 # Retail protocol evidence (2026-09-04)
 
+> # ⚠ THIS IS A CHRONOLOGICAL LAB NOTEBOOK
+>
+> Earlier sections intentionally preserve hypotheses, wrong turns and
+> conclusions that were **later disproven or superseded**. They are kept because
+> the raw observations and the reasoning trail are still useful, and because
+> silently rewriting them would hide how a conclusion was reached.
+>
+> **Do not treat an isolated `CONFIRMED` statement in this file as current
+> truth.** A `CONFIRMED` label is only as good as its own evidence, and later
+> sections routinely retract earlier ones. Before relying on anything here,
+> check:
+>
+> 1. `docs/CURRENT-RETAIL-STATE.md` — **authoritative for the current model**;
+> 2. the latest correction/retraction section near the end of this file;
+> 3. whether the section you are reading is marked `SUPERSEDED`,
+>    `SUPERSEDED IN PART` or `DISPROVEN`.
+>
+> When this file and `docs/CURRENT-RETAIL-STATE.md` conflict, the current-state
+> document wins.
+>
+> Known material corrections to look for (non-exhaustive): the `0x10` bit is a
+> Zstandard flag, not encryption; `0x011C5800` and routes `E800`/`E6A7` are
+> `DISPROVEN`; the reproduced `Close` was **not** produced by
+> `omega::TimeRequester`; the `App+0x2A` reset path did not execute;
+> `0x14040AEEB` does **not** clear `conn+0x88`.
+
 This is a partial static analysis, not a claim that the emulator supports retail.
 Addresses below are preferred virtual addresses in the installed x64 `swtor.exe`.
 SHA-256: `ad541a742a62500c2095f87c3cff116def462ebd26d1de95de32bc7293eb596b`.
