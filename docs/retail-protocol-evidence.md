@@ -3666,3 +3666,179 @@ different (and here unexercised) path.
 the project's pre-existing documented loopback aid, applied only to the copied
 private client and restored byte-exactly; the Steam installation was never
 touched.
+
+## The duplicate routed-peer attach that produces the historical Close (September 13)
+
+The historical bootstrap is reproducible, and a same-run read-only witness now
+identifies the exact ownership event behind the `Close`. The client attaches the
+same routed peer **twice**; the second attach replaces the first, and releasing
+the replaced peer is what runs `0x14040AEC0` → `0x1404123D0` → `Close`.
+
+### Phase 1 — identity of `0x14040AEC0`
+
+`0x14040AEC0..0x14040AF87` receives `rdx` = a stack smart-pointer whose first
+field is the connection, and `rcx` = the `omega::ServerProxy`. It is reached
+through the `omega::ServerProxy` route dispatcher vtable slot `+0x38`
+(`0x140459BB0`, RTTI `.?AVServerProxy@omega@@`, moffset `0x18`).
+
+```text
+0x14040AEDB  rdx = [arg2]                  ; the connection
+0x14040AEEB  lock cmpxchg [conn+0x88], 0   ; one-shot TAKE of the routed peer
+0x14040AEF4  rcx = "" (empty)              ; old value was 0 -> no name
+0x14040AEFD  rax = [old_peer+0x40]         ; else the peer's route name
+0x14040AEFD  cmovne rcx, rax
+0x14040AF08  compare name[0] with '*' and name[1] with NUL
+0x14040AF1D  je 0x14040AF6A                 ; name == "*"  -> SKIP the Close
+0x14040AF1F  r8d = 0 ; edx = 0
+0x14040AF27  call 0x1404123D0              ; (connection, 0, 0) -> Close 0x43DB3479
+0x14040AF2C  rsi = [ [rdi]+0x40 ]          ; ServerProxy+0x40 = this proxy's ObjectSurrogate
+0x14040AF63  call [rsi_vtable]             ; detach notification on the surrogate
+0x14040AF6A  release [arg2]                ; the argument's reference
+```
+
+Method role: **detach/teardown of the routed peer retained on a connection.**
+The `+0x88` slot is *taken* (atomically zeroed) rather than merely read, so the
+function is idempotent and owns the peer reference it consumes.
+
+### Phase 4 — the retained name is a shard-address triple, never `"*"`
+
+The peer object is 0x88 bytes, allocated and initialised by `0x140412820`
+(`mov ecx,0x88`), which stores it into `[connection+0x88]` at `0x140412A4F`
+behind a lock-free exchange loop (`0x140412A45`/`0x140412A4F`/`0x140412A58`).
+Its constructor writes five `{ptr,len}` string pairs at `+0x00`, `+0x10`,
+`+0x20`, `+0x30`, `+0x40` (each with `0x14156BD60` = the empty-string singleton)
+plus a larger record at `+0x50`.
+
+The same-run witness captured the two peers' names verbatim:
+
+```text
+first  peer 0x40BC3570   +0x20 = "localhost:7979:castlehilltest"
+                         +0x30 = "localhost:7979"
+                         +0x40 = ""
+second peer 0x13E25B0    +0x20 = ":castlehilltest"
+                         +0x30 = "localhost:7979"
+                         +0x40 = ""
+```
+
+So the `"*"` test is a **wildcard-route** test: a peer registered on the
+catch-all route is not connection-owned and must not close the connection when
+it goes away, whereas a peer bound to a concrete `host:port` route is, and its
+removal must tear the connection down. Both peers here are concrete, so neither
+can take the skip path — the `Close` is the designed consequence of removing a
+concrete routed peer, not an error branch.
+
+`0x14040B170` is the read-only twin of `0x14040AEC0` (same `cmpxchg [conn+0x88]`
+take at `0x14040B190`, then returns the name instead of sending a Close), and
+`0x14040B010` is the retain/attach arm.
+
+### Phase 6 — `0x140444A80` is downstream cleanup, not the trigger
+
+`0x140444A80` drops `[this+0xE0]`; only when that reaches zero **and**
+`[this+0xE4] == 0` does it set `[+0xE4] = 1`, call `vtable+0x48`, call
+`0x140441D10` and latch `[+0x1C] = 1`. In the captured run `this = 0x3F501950`
+(the `ServerProxy`) and `[+0xE0]` was 5–8, so this is a reference-counted owner
+release that runs **after** the peer teardown and sends the second (already
+peer-less) `Close`. It is cleanup, not the cause.
+
+### Phase 7 — the runtime chain, CONFIRMED on the historical run
+
+Read-only hardware breakpoints, one bounded run with the documented loopback
+resolver step (restored byte-exactly; the client executable hash was identical
+before and after).
+
+```text
+[OK] login-init succeeded                     ; 0x14042810e, +0x80 populated
+
+[STORE] conn=0x3F8A1A40 newpeer=0x40BC3570 old=(nil)   thread=2
+        first peer attached; old value is NULL
+[STORE] conn=0x3F8A1A40 newpeer=0x13E25B0 old=0x40BC3570 thread=58
+        SECOND peer attached, REPLACING the first
+
+[PEER-TEARDOWN] serverproxy=0x3F8A1A40 connfield=0x13E25B0
+[CLOSE] conn=0x3F8A1A40 ret=0x14040AF2C        ; the replaced peer's Close
+[CLOSE] conn=0x3F8A1A40 ret=0x140444AB7        ; later refcount release
+```
+
+Attach path of the **first** peer (frame `#0 = 0x14042B721`, shallow stack):
+
+```text
+0x14042B721  (func 0x140411D30, the "attach peer to connection" routine)
+             callers of 0x140411D30: 0x14042B721 and 0x14042CF88
+```
+
+Attach path of the **replacing** peer (frame `#0 = 0x14042C782`, deeper stack,
+thread 58):
+
+```text
+0x14042C782  (func 0x14042C300)  <- 0x14042BA70 (func 0x14042B990)
+             <- 0x14040647F (func 0x140406420) <- 0x140435C92
+```
+
+`0x14042B990` is the identification-message dispatcher and selects the attach by
+message id:
+
+```text
+14042B9B9  cmp r9d, 0xA609E6A7   ; RequestIDSignature
+14042BA35  cmp r9d, 0x6731C5AF   ; ReplyIDSignature
+14042BA77  cmp r9d, 0x8B0D492F
+```
+
+`0x14042C300` — the path that performs the **replacing** attach — is taken on the
+`0x6731C5AF` (`ReplyIDSignature`) arm, and that is the reply Holocron sends for
+the bootstrap `RequestIDSignature`.
+
+The detach that consumes the replaced peer:
+
+```text
+0x140434430  this=0x50F1A9E0  +0x18=0x152BD40  +0x20=0x405F1860
+             target[+0x100]=0x14DFD30   (the ServerProxy)
+             call [target_vtable+0x28]  then  call [target_vtable+0x70]
+             <- 0x14042472E
+```
+
+### Phase 8/9 — the earliest non-cleanup condition
+
+```text
+first failing condition:
+    a SECOND routed peer is attached to the same connection while the
+    bootstrap-attached peer is still held in [connection+0x88]
+function:
+    0x140412820 (peer alloc/attach), reached from the 0x6731C5AF
+    (ReplyIDSignature) arm via 0x14042C300 -> 0x14042C782 -> 0x140411D30
+field/value:
+    [connection+0x88] already holds peer 0x40BC3570 (name
+    "localhost:7979:castlehilltest") when the replacement runs
+expected:
+    one routed peer per connection, i.e. [connection+0x88] == NULL at attach
+actual:
+    non-NULL; the exchange at 0x140412A4F overwrites it
+event that normally satisfies it:
+    none in Holocron's bootstrap — the replacement is caused by OUR OWN
+    ReplyIDSignature, so the peer is attached twice from two different
+    code paths for one reply
+peer-visible or local:
+    LOCAL, but triggered by the shape/content of the ReplyIDSignature the
+    server sends. The two attach paths differ in the address fragment they
+    build: the first records "localhost:7979:castlehilltest", the
+    replacement records ":castlehilltest" with host/port re-parsed.
+```
+
+### Classification
+
+```text
+0x14040AEC0 Close producer                    CONFIRMED
+Close is caused by losing a concrete routed peer  CONFIRMED
+peer is attached twice in this run            CONFIRMED
+second attach replaces the first              CONFIRMED
+release of the replaced peer sends Close      CONFIRMED
+0x140444A80 is downstream cleanup             CONFIRMED
+D4 is the expected missing action             DISPROVEN (D4 arrives only over
+                                              an established routed connection
+                                              and is not on this path)
+```
+
+**No server behaviour was changed and D4 was not sent.** No peer-visible missing
+action was proven: the two attach paths both run inside the client while handling
+the single `ReplyIDSignature` Holocron already sends, so the next step is to
+determine which of the two arms is spurious — a client-side double-attach driven
+by the reply's shape — before any server change is justified.
