@@ -374,6 +374,93 @@ re-derived from static call edges and must not be presented as such:
 zero image pointers, so all three are runtime-materialised closures or indirect
 targets whose registration sites are still `UNKNOWN`.
 
+### The `app+0x228` / `app+0x238` operations, byte-for-byte
+
+Reconstruction of the second registration in `0x14042F960` — the one that writes
+`app+0x238` — from the exact instructions (`CONFIRMED`):
+
+```asm
+14042FA96  mov  r10, qword ptr [rdi + 0x220]   ; the registered operation
+14042FA9D  lea  rax, [rip + 0xd5c]             ; -> 0x140430800
+14042FAA4  mov  qword ptr [rbp - 0x29], rax    ; callable.fn  = 0x140430800
+14042FAA8  mov  dword ptr [rbp - 0x21], r14d   ; callable.aux = 0
+14042FAB0  mov  qword ptr [rbp + 0x2f], rdi    ; callable.obj = rdi
+14042FAC1  movsd qword ptr [rbp - 0x19], xmm0  ; callable.obj copied in
+14042FAE5  lea  rax, [rip + 0x1086c74]         ; -> 0x1414B6760
+14042FAEC  or   rax, 1
+14042FAF0  mov  qword ptr [rbp - 9], rax       ; callable.fntable = 0x1414B6761
+14042FAFF  mov  r9d, 5                         ; timeout = 5 ms
+14042FB05  lea  r8,  [rbp - 9]                 ; &callable
+14042FB09  lea  rdx, [rbp - 0x29]              ; &destination smart pointer
+14042FB0D  mov  rcx, qword ptr [r10]           ; rcx = [operation + 0x00]
+14042FB10  call 0x140423B50                    ; register
+```
+
+```text
+app+0x238 fn      = 0x140430800      CONFIRMED by the lea at 0x14042FA9D
+app+0x238 timeout = 5 ms             CONFIRMED by the mov at 0x14042FAFF
+app+0x238 flag    = 1                CONFIRMED by [rsp+0x20] at 0x14042FA23
+```
+
+The first registration (`0x14042FA39`) has the same shape with `fn` = the
+callable whose body is **`0x1404305D0`**, `fntable = 0x1414B6771`, timeout
+**500 ms**, and it writes `app+0x228`.
+
+`0x14042FD80` is **NOT** the `app+0x238` callable — that hypothesis is
+`DISPROVEN` by the `lea` above. It is a closure body (zero xrefs, allocates two
+`0x320`-byte buffers) bound somewhere else; where is `UNKNOWN`.
+
+### The operation object produced by the factory, byte-for-byte
+
+`0x1404595E0` allocates **`0x78`** bytes and constructs the operation
+(`CONFIRMED`):
+
+```asm
+140459613  mov  ecx, 0x78
+14045961B  call mm_alloc
+14045967A  mov  dword ptr [rdi + 0x28], ebp   ; +0x28 = timeout  (r9d)
+140459685  mov  byte ptr  [rdi + 0x2c], al    ; +0x2C = flag     ([rsp+0x20])
+140459688  mov  byte ptr  [rdi + 0x2d], 0     ; +0x2D = FINISHED := 0
+14045968C  lea  rbx, [rdi + 0x30]             ; +0x30 = callable slot
+1404596C0  call 0x1402CB8D0                   ; build the callable
+1404596C5  mov  qword ptr [rbx], rax          ; +0x30 = callable
+```
+
+This settles what the previously measured runtime values are:
+
+```text
+object+0x28 = timeout in ms         (5 for this operation)   CONFIRMED
+object+0x2C = the registration flag (1 here)                 CONFIRMED
+object+0x2D = FINISHED, starts 0                             CONFIRMED
+object+0x30 = the callable                                   CONFIRMED
+object+0x38 = the callable's context                         CONFIRMED
+```
+
+**Correction:** `+0x2C` is therefore not an emergent "wait-mode selector"; it is
+the registration's own flag argument. Both `0x14042F960` registrations pass
+`[rsp+0x20] = 1` at `0x14042FA23` and `0x14042FAFA`, and that value lands at
+`+0x2C`. The branch in `0x140423DD0` that tests it is testing a
+**registration-time flag** whose meaning is `HYPOTHESIS`, not a runtime mode
+switch. `CONFIRMED` for the dataflow; semantics still `HYPOTHESIS`.
+
+### Closure bodies are heap-materialised, so pointer scans cannot find them
+
+Runtime observation recorded `[operation + 0x00] = 0x1414B6761`. That value does
+not exist anywhere in the retail image. Whole-image scans for the 8-byte values
+of `0x140430800`, `0x1404305D0`, `0x14042FD80`, `0x1404245F0` and `0x140423DD0`
+all return **zero** hits, and so does a scan for `0x1414B6781`. `CONFIRMED`
+
+The table at `0x1414B6760` in the file holds `0x140433C90`, `0x1403C1B20`,
+`0x140433D20`, `0x140433DB0` — ordinary image functions, not the contents the
+runtime table showed. The operation's dispatch table is copied into heap storage
+at runtime.
+
+**Method consequence:** a raw 8-byte pointer scan can never locate a closure's
+registration site in this binary. Registration sites must be found by locating
+the `lea rax, [rip+...]` that materialises the address into a stack slot
+immediately before a `0x140423B50` call. That is the method used above and it is
+the only one that worked.
+
 ### `0x140430620` is the application tick, and its cancel branch targets `app+0x248`
 
 Complete semantic pseudocode, recovered from the full function body

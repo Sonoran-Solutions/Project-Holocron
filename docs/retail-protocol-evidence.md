@@ -5031,3 +5031,110 @@ whether the failing Close uses cancel or timeout   UNKNOWN
 ```
 
 **No server behaviour was changed and D4 was not sent.**
+
+---
+
+## The `app+0x238` callable is `0x140430800`, proven from the registration bytes (September 13)
+
+### The question this answers
+
+The previous passes left "what is bound into `app+0x238`" open, and the
+`0x1404305D0` body was attributed to the 500 ms slot only by association. This
+section settles it from the instructions that build the callable, not from
+address proximity.
+
+### The registration, byte-for-byte
+
+`0x14042F960` performs two registrations. The second one targets `app+0x238`:
+
+```asm
+14042FA96  mov  r10, qword ptr [rdi + 0x220]   ; the registered operation
+14042FA9D  lea  rax, [rip + 0xd5c]             ; -> 0x140430800
+14042FAA4  mov  qword ptr [rbp - 0x29], rax    ; callable.fn
+14042FAA8  mov  dword ptr [rbp - 0x21], r14d
+14042FAB0  mov  qword ptr [rbp + 0x2f], rdi
+14042FAC1  movsd qword ptr [rbp - 0x19], xmm0
+14042FAE5  lea  rax, [rip + 0x1086c74]         ; -> 0x1414B6760
+14042FAEC  or   rax, 1
+14042FAF0  mov  qword ptr [rbp - 9], rax       ; callable.fntable
+14042FAFF  mov  r9d, 5                         ; timeout
+14042FB05  lea  r8,  [rbp - 9]
+14042FB09  lea  rdx, [rbp - 0x29]
+14042FB0D  mov  rcx, qword ptr [r10]
+14042FB10  call 0x140423B50
+```
+
+```text
+app+0x238  fn      = 0x140430800
+           timeout = 5 ms
+           flag    = 1
+app+0x228  fn      = (body 0x1404305D0)
+           timeout = 500 ms
+```
+
+`0x14042FD80` is **not** the `app+0x238` callable. That hypothesis is disproven
+by the `lea` at `0x14042FA9D`. `0x14042FD80` remains an unplaced closure body.
+
+### What the factory stores, and what that means for the gate fields
+
+`0x1404595E0` allocates `0x78` bytes and writes the operation's fields:
+
+```asm
+14045967A  mov dword ptr [rdi + 0x28], ebp   ; timeout
+140459685  mov byte ptr  [rdi + 0x2c], al    ; the [rsp+0x20] flag
+140459688  mov byte ptr  [rdi + 0x2d], 0     ; FINISHED := 0
+14045968C  lea rbx, [rdi + 0x30]
+1404596C5  mov qword ptr [rbx], rax          ; the callable
+```
+
+That explains every previously measured value without further assumptions:
+
+```text
++0x28 = 5     the timeout given to the factory
++0x2C = 1     the flag argument both registrations pass as [rsp+0x20] = 1
++0x2D = 0     the constructor's own initialisation
+```
+
+The branch in `0x140423DD0` that tests `+0x2C` is therefore testing a
+**registration-time flag**, not a runtime mode switch that some other subsystem
+flips. The earlier phrase "wait-mode selector" was a description of the branch,
+not of the value's origin; the origin is now known and the value is constant
+because nothing re-registers the operation with a different flag.
+
+### Method correction: closure bodies are heap-materialised
+
+Runtime evidence recorded `[operation+0x00] = 0x1414B6761`. That value is not in
+the image. Scans for the 8-byte values of `0x140430800`, `0x1404305D0`,
+`0x14042FD80`, `0x1404245F0` and `0x140423DD0` return zero hits each, and the
+file contents at `0x1414B6760` are four ordinary image functions
+(`0x140433C90`, `0x1403C1B20`, `0x140433D20`, `0x140433DB0`), not the runtime
+table's contents.
+
+So the dispatch table is copied into heap storage at runtime, and **no raw
+8-byte pointer scan can ever find a closure's registration site here.** The only
+method that works is to find the `lea rax, [rip+...]` that materialises the
+address into a stack slot immediately before a call to the factory `0x140423B50`
+— which is how both registrations above were resolved. Earlier passes that
+searched for image pointers were searching for something that cannot exist.
+
+### What is still unknown
+
+```text
+app+0x238 fn = 0x140430800                      CONFIRMED
+app+0x238 timeout = 5 ms, flag = 1              CONFIRMED
+app+0x228 fn body = 0x1404305D0, timeout 500 ms CONFIRMED
++0x28/+0x2C/+0x2D origins                       CONFIRMED
+0x14042FD80 is the app+0x238 callable           DISPROVEN
+what 0x140430800 does                            UNKNOWN (not yet resolved)
+what cancels or clears app+0x238                 UNKNOWN
+0x1404245F0 registration site                    UNKNOWN
+whether 0x1404245F0 is the app+0x238 callable    UNKNOWN
+```
+
+The last line is the key open item, and it is now testable: `0x1404245F0` is
+**not** `0x140430800`, so if the historical teardown really is invoked by the
+operation machinery, `0x1404245F0` must be reached from inside `0x140430800` or
+bound into a different operation. Resolving `0x140430800` is the shortest path
+to that answer.
+
+**No server behaviour was changed and D4 was not sent.**
