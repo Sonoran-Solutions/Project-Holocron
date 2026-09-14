@@ -324,7 +324,8 @@ So:
 * **`target+0x28` is the wait quantum in milliseconds** (measured 5), read at
   `0x140423EEC` and clamped to a 1 ms floor. `CONFIRMED`
 
-`0x1404245F0` is reached from **`0x1403FC050`**, the shared cancel helper:
+**`0x1403FC050` is the shared cancel helper. Its proven static callee is
+`0x140423A70`, not `0x1404245F0`:**
 
 ```asm
 1403fc063  mov  rcx, [rcx]        ; operation context
@@ -334,16 +335,44 @@ So:
 1403fc098  call 0x140423a70       ; <-- completion routine
 ```
 
+```text
+static edge proven:   0x1403FC050 -> 0x140423A70     CONFIRMED
+static edge claimed:  0x1403FC050 -> 0x1404245F0     DISPROVEN (no such edge)
+```
+
+`0x1404245F0` has **no** static predecessor of any kind in this image — no direct
+branch, no data pointer. The only reason it is known to run at all is the
+previously captured runtime chain below. No static edge between `0x1403FC050`
+and `0x1404245F0` has been established and none should be inferred.
+
 `0x1403FC050` is called from exactly ten sites; three are inside
 `0x14042FBA0` (the operation teardown used when an operation is replaced) and
 one is inside the polling body `0x140430620`. `CONFIRMED`
 
-**Consequence:** both the timed-wait arm and the cancel path converge on the
-same completion routine `0x140423A70`, and the polling body's own cleanup
-reaches `0x140423A70` through `0x1403FC050`. This is the mechanism by which
-"the wait did not finish in time" and "the owner decided to stop the operation"
-produce the same downstream behaviour. `CONFIRMED` for the call graph;
-`UNKNOWN` for which one runs in the failing run.
+**Consequence:** the timed-wait arm (`0x140423DD0` → `0x140423FF0`/
+`0x140423A70`) and the owner-cancel path (`0x1403FC050` → `0x140423A70`) converge
+on the same completion routine. This is why "the wait did not finish in time" and
+"the owner decided to stop the operation" cannot be told apart from downstream
+completion evidence alone. `CONFIRMED` for the call graph; `UNKNOWN` for which
+one runs in the failing run, and `UNKNOWN` for how the historical
+`0x140423DD0 → 0x1404245F0` step is actually produced.
+
+### Historical runtime chain — retained as captured evidence only
+
+The following was observed at runtime in an earlier pass. It is **not**
+re-derived from static call edges and must not be presented as such:
+
+```text
+0x140423DD0
+→ 0x1404245F0
+→ 0x140434430
+→ 0x14040AEC0
+→ Close
+```
+
+`0x1404245F0`, `0x140434430` and `0x14040AEC0` all have zero direct callers and
+zero image pointers, so all three are runtime-materialised closures or indirect
+targets whose registration sites are still `UNKNOWN`.
 
 ### All closure bodies reached this way have no static xrefs
 

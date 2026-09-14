@@ -4845,3 +4845,62 @@ instrumentation was introduced to try, per the constraint that WineDbg's stub
 perturbs the 5 ms loop and prevents the normal login path.
 
 **No server behaviour was changed and D4 was not sent.**
+
+---
+
+## CORRECTION: `0x1403FC050` calls `0x140423A70`, not `0x1404245F0` (September 13)
+
+### What was wrong
+
+The previous section stated:
+
+```text
+0x1404245F0 is reached from 0x1403FC050, the shared cancel helper
+```
+
+and immediately quoted, in support of that sentence:
+
+```asm
+1403fc098  call 0x140423a70       ; <-- completion routine
+```
+
+The quoted instruction and the quoted sentence contradict each other. The
+sentence is wrong and is retracted.
+
+### What the evidence actually proves
+
+```text
+0x1403FC050 -> 0x140423A70            CONFIRMED (direct call at 0x1403FC098)
+0x1403FC050 -> 0x1404245F0            DISPROVEN (no such edge exists)
+```
+
+`0x1404245F0` has no static predecessor at all: no direct branch, no conditional
+branch, no tail jump, and no 8-byte image pointer lands on it. It is reachable
+only through a runtime-materialised closure, exactly like `0x140423DD0`,
+`0x14042FD80` and `0x1404305D0`.
+
+### What must be preserved
+
+The historical teardown chain remains valid **as previously captured runtime
+evidence** and is not retracted by this correction:
+
+```text
+0x140423DD0
+→ 0x1404245F0
+→ 0x140434430
+→ 0x14040AEC0
+→ Close
+```
+
+What is retracted is only the claim that a *static call edge* connects
+`0x1403FC050` to `0x1404245F0`. The runtime observation that `0x140423DD0`
+precedes `0x1404245F0` on thread 2 stands; the mechanism by which
+`0x140423DD0` reaches `0x1404245F0` is `UNKNOWN`.
+
+### Why this matters for later work
+
+Every function in this area with zero xrefs is a closure body. Treating the
+absence of a static edge as evidence of a *different* static edge is exactly the
+error this correction removes. A future pass must find each closure's
+registration site (the machine code that materialises its address) rather than
+guessing a callee.
