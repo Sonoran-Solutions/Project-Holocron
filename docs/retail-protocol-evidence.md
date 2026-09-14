@@ -3842,3 +3842,108 @@ action was proven: the two attach paths both run inside the client while handlin
 the single `ReplyIDSignature` Holocron already sends, so the next step is to
 determine which of the two arms is spurious — a client-side double-attach driven
 by the reply's shape — before any server change is justified.
+
+## Wildcard-handoff hypothesis tested and DISPROVEN (September 13)
+
+The previous section proposed that the first peer is normally a wildcard peer
+whose release is exempted from sending `Close`, and that our fixture supplies a
+concrete name instead. A single-field fixture experiment **disproves** that
+hypothesis, and the same-run witness shows the wildcard test does not read the
+peer name at all.
+
+### Correction to the previous section's reading of `0x14040AEC0`
+
+The previous section stated that the function reads the displaced peer's route
+name from `[peer+0x40]`. Exact instruction bytes show the load uses **`rax`**,
+which after `lock cmpxchg` holds the *replaced* value:
+
+```text
+14040aeeb  f0 48 0f b1 8a 88 00 00 00   lock cmpxchg qword ptr [rdx+0x88], rcx
+14040aef4  48 8d 0d 65 0e 16 01         lea  rcx, [rip+0x1160e65]   ; 0x14156BD60 = ""
+14040aefb  74 0b                        je   0x14040af08           ; old == 0 -> keep ""
+14040aefd  48 8b 40 40                  mov  rax, [rax+0x40]        ; rax = OLD peer
+14040af01  48 85 c0                     test rax, rax
+14040af04  48 0f 45 c8                  cmovne rcx, rax
+14040af08  0f b6 01                     movzx eax, byte ptr [rcx]
+14040af0b  3a 05 bf 33 16 01            cmp  al, byte ptr [0x14156E2D0]  ; "*"
+14040af11  75 0c                        jne  0x14040af1f
+14040af13  0f b6 41 01                  movzx eax, byte ptr [rcx+1]
+14040af17  3a 05 b4 33 16 01            cmp  al, byte ptr [0x14156E2D1]  ; NUL
+14040af1d  74 4b                        je   0x14040af6a              ; skip Close
+```
+
+So the compared string is the **displaced peer's `[peer+0x40]`**, and an empty
+string (or a NULL old peer) does **not** satisfy the wildcard test — the branch
+is taken only for exactly `"*"`. This supersedes the earlier wording.
+
+### The experiment — one field, falsifiable, and NEGATIVE
+
+Changed exactly one value: the `host` field of the single shard in
+`tools/fixtures/platform-responses.json`, from `localhost:7979:castlehilltest`
+to `localhost:7979:*`. Nothing else was touched; no client logic, no attach
+suppression, no forced NULL. Client bytes were restored byte-exactly and the
+fixture was restored from a pre-change copy.
+
+Result — the fixture value propagates faithfully into the peers, but the `Close`
+is **not** suppressed:
+
+```text
+[STORE] conn newpeer=0x41A36AC0 old=(nil)          thread=2
+   NEW +0x20=localhost:7979:*   +0x30=localhost:7979   +0x40=
+[STORE] conn newpeer=0x13E25B0 old=0x41A36AC0      thread=58
+   NEW +0x20=:*                 +0x30=localhost:7979   +0x40=
+   OLD +0x20=localhost:7979:*   +0x30=localhost:7979   +0x40=
+[PEER-TEARDOWN]
+[CLOSE-CALL] 0x14040af27 -> Close SENT
+[CLOSE] ret=0x14040af2c ; [CLOSE] ret=0x140444ab7
+```
+
+The wildcard breakpoint at `0x14040af1d` never fired and the Close-call
+breakpoint did, in every variant tested.
+
+### Why the test came out negative — the compared field was not what we changed
+
+A value-capture run on the **stock** fixture shows the compared string directly:
+
+```text
+[WILD-TEST] compared string = ""   (rcx=0x14156BD60, the empty-string singleton)
+   rdi = 0x14DFD30                ; the ServerProxy (same object as [arg2])
+```
+
+`rcx` still held the empty-string singleton at `0x14040af08`, which means the
+`je` at `0x14040aefb` was taken — **the replaced value was zero for this call**,
+so `[rax+0x40]` was never loaded. The wildcard test therefore had nothing to
+compare, and the fall-through to `0x14040af1f` sent the Close.
+
+That in turn means the `Close` observed in this run is produced by a teardown
+whose `[conn+0x88]` was **already empty at entry**, not by comparing a concrete
+name against `"*"`. The `"*"` exemption is real and reachable in the code, but it
+is **not** the guard that fired here.
+
+### Classification
+
+```text
+first peer's +0x20 echoes the fixture host verbatim        CONFIRMED
+second peer's +0x20 is the fixture host minus its first
+  colon-separated component (":castlehilltest", ":*")      CONFIRMED
+fixture's third component reaches the peer name            CONFIRMED
+setting the third component to "*" suppresses Close        DISPROVEN
+the "*" test compares the displaced peer's +0x40           CONFIRMED
+the "*" test was satisfiable in the captured failing call  DISPROVEN (the
+                                                           replaced value was 0)
+wildcard-to-routed handoff is this run's mechanism         DISPROVEN
+```
+
+### Remaining open question
+
+`[rdi]+0x40` on the third successful `cmpxchg` chain (`0x14042c641`/`0x14042c731`/
+`0x14042c754`) selects the string that is compared, and the first two of those
+three exchanges are unreachable fallbacks. Nothing recovered so far establishes
+which component of a real retail shard address is intended to equal `"*"`, or
+whether `"*"` is generated internally from a connection role rather than from
+the shard address at all. Per the working rule, no further fixture or server
+change is made until that provenance is proven.
+
+**No server behaviour was changed and D4 was not sent.** The copied client and
+the fixture were both restored byte-exactly after every run
+(`47d8c8f0…` for the client, `localhost:7979:castlehilltest` for the fixture).
