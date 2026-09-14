@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""Label the three synchronous login failures in the private client, then restore.
+"""HISTORICAL DIAGNOSTIC -- NOT PART OF THE CURRENT PROCEDURE.
 
-No conditional branch is changed and no failed check is bypassed. Labels:
-6101 address resolution, 6102 connection construction, 6103 transport setup.
+This probe was used to label a failure boundary that has since been superseded.
+It patches the private client's *control flow labels* (not just an environment
+immediate) and its recorded findings are historical.
+
+Status: HISTORICAL. Prefer tools/run-retail-bootstrap-probe.py.
+See docs/CURRENT-RETAIL-STATE.md before using anything here.
 """
+
 import fcntl
 from pathlib import Path
 import signal
 import subprocess
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 TEST = ROOT / '.local-test/client-v1'
 EXE = TEST / 'game/swtor/retailclient/swtor.exe'
 

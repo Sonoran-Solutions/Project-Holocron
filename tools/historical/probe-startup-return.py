@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""Temporarily label a failure return in the private client; restore in finally.
+"""HISTORICAL DIAGNOSTIC -- NOT PART OF THE CURRENT PROCEDURE.
 
-Changes only -1 to -101 on the failed platform-initialization branch. It does
-not change the branch or make a failed check pass. Never targets Steam files.
+This probe was used to label a failure boundary that has since been superseded.
+It patches the private client's *control flow labels* (not just an environment
+immediate) and its recorded findings are historical.
+
+Status: HISTORICAL. Prefer tools/run-retail-bootstrap-probe.py.
+See docs/CURRENT-RETAIL-STATE.md before using anything here.
 """
+
 from pathlib import Path
 import subprocess
 import sys
 
-root = Path(__file__).resolve().parents[1]
+root = Path(__file__).resolve().parents[2]
 exe = root / '.local-test/client-v1/game/swtor/retailclient/swtor.exe'
 original = exe.read_bytes()
 patched = bytearray(original)

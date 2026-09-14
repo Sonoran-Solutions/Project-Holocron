@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Test loopback-only name resolution in the copied client, then restore it.
+"""HISTORICAL DIAGNOSTIC that first identified the loopback resolver issue.
+
+Status: HISTORICAL. The supported way to reproduce the historical bootstrap is
+
+    python3 tools/run-retail-bootstrap-probe.py
+
+which applies the same one-immediate adjustment with hash verification and a
+guaranteed byte-exact restore. Keep this file for the original diagnosis only.
+
+Original purpose: test loopback-only name resolution in the copied client, then restore it.
 
 The retail TCP hint builder sets AI_ADDRCONFIG. A network namespace containing
 only `lo` makes that flag reject every IPv4 result, including 127.0.0.1. This
