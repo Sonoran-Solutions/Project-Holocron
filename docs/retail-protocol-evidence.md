@@ -3947,3 +3947,376 @@ change is made until that provenance is proven.
 **No server behaviour was changed and D4 was not sent.** The copied client and
 the fixture were both restored byte-exactly after every run
 (`47d8c8f0…` for the client, `localhost:7979:castlehilltest` for the fixture).
+
+## The `conn+0x88` mutation history, and why no "hidden clear" exists (September 13)
+
+> **SUPERSEDED IN PART — read the next section first.** The runtime chronology,
+> the call chain and the timed-loop findings below are retained and correct, but
+> the claim that `0x14040AEEB` **clears** `conn+0x88` is **RETRACTED**. As the
+> register-level revalidation in the following section proves, that
+> `lock cmpxchg` fails, leaves the destination **unchanged**, and returns the old
+> value in `RAX`. The field still holds peer B after the instruction, and the
+> teardown never removes it. Statements below that describe a `peer B -> NULL`
+> transition, or call `0x14040AEC0` a "take", are wrong and superseded.
+
+The previous section left an apparent gap: `conn+0x88` was thought to be `NULL` by
+the time `0x14040AEC0` ran, implying an unseen mutation between the second attach
+and the Close. A complete same-run mutation witness closes that gap and
+**corrects the premise**.
+
+### Phase 1 — complete mutation history, one run, chronological
+
+Every writer of `conn+0x88` known in the image was hooked, plus the teardown take.
+All five mutations of the *same* connection object were captured:
+
+```text
+conn = 0x3F4B1C20   (identical in every record)
+
+[STORE]  0x140412A4F  cmpxchg [rbx+0x88], r15   thread=2
+         r15 = 0x4096FBA0   old = NULL            NULL   -> peer A
+
+[M1]     0x14042C641  cmpxchg [rcx+0x88], rdi   thread=58
+         rdi = NULL         old = 0x4096FBA0      peer A -> (no change; rdi is NULL)
+
+[M2]     0x14042C731  cmpxchg [rcx+0x88], rdi   thread=58
+         rdi = NULL         old = 0x4096FBA0      peer A -> (no change; rdi is NULL)
+
+[M3]     0x14042C754  cmpxchg [rdx+0x88], rdi   thread=58
+         rdi = NULL         old = 0x4096FBA0      peer A -> (no change; rdi is NULL)
+
+[STORE]  0x140412A4F  cmpxchg [rbx+0x88], r15   thread=58
+         r15 = 0x13E25B0    old = 0x4096FBA0      peer A -> peer B
+
+[M5]     0x14040AEEB  cmpxchg [rdx+0x88], rcx   thread=2
+         rcx = 0            old = 0x13E25B0       (RETRACTED: no change)
+[CLOSE-CALL] 0x14040AF27
+[CLOSE] 0x1404123D0 ret=0x14040AF2C
+[CLOSE] 0x1404123D0 ret=0x140444AB7
+```
+
+Correction to the premise (**itself now retracted — see the next section**): this
+pass concluded that the teardown's own atomic take was the operation setting
+`conn+0x88` to NULL. Register-level revalidation disproves that. `0x14040AEEB`
+fails its comparison and leaves the destination holding peer B; `conn+0x88` is
+**never cleared** anywhere in the observed run. What actually produced the empty
+string at the wildcard test is peer B's own `+0x40` field, which contains the
+empty-string singleton, so `cmovne` does not replace `rcx`. `0x14040AF1D` still
+did not fire, so that empty value was compared and was not `"*"`.
+
+### Phase 3 — the three ReplyID `cmpxchg` operations
+
+All three share an identical shape and, at runtime, all three write **`rdi`, which
+is NULL**:
+
+```text
+address    target field        eax(expected)  source        semantics
+0x14042C641  [rcx+0x88]        0 (xor eax,eax)  rdi = NULL   guarded store of NULL
+0x14042C731  [rcx+0x88]        0 (xor eax,eax)  rdi = NULL   guarded store of NULL
+0x14042C754  [rdx+0x88]        0 (xor eax,eax)  rdi = NULL   guarded store of NULL
+```
+
+Runtime branch behaviour (captured, not inferred): each compares the field with
+`EAX = 0` against a non-null old value, so **the comparison fails, ZF is clear,
+and the store does not commit**; `RAX` returns the old value. The `jne`/`je`
+guards then select the non-null path, which loads the old peer's `+0x50`/`+0x30`
+as the route/name selector instead of the empty-string fallback at
+`0x141B31AE8`.
+
+So none of the three clears `conn+0x88`, and none of them is a peer removal. They
+are **reads dressed as conditional stores** — the compiled form of an atomic
+"read this one-shot field" where the compiler reused `cmpxchg ... 0` to test
+against a sentinel. The same idiom appears at `0x14040AEEB`, `0x14040B190` and
+`0x14040B03B`, which is why the earlier pass mistook them for fallbacks.
+
+### Phase 5 — the caller chain into `0x14040AEC0`
+
+Entry captured on the reproduced run:
+
+```text
+[PEER-TEARDOWN] rcx=0x14DFD30 (ServerProxy)  arg=0x69CF6D0  conn=0x3F4B1C20
+                conn+0x88=0x13E25B0 (peer B still present)  thread=2
+
+#0 0x14040AEC0   <- the teardown itself
+#1 0x1404344E0   <- inside 0x140434430, the detach, just past its vtable calls
+#2 0x14DFD30     (ServerProxy)
+#9 0x14042472E   <- inside the collection destructor 0x1404245F0
+```
+
+Caller of the detach, from the same run:
+
+```text
+[DETACH] 0x140434430  this=0x509BA9E0  +0x18=0x152BD40  +0x20=0x3F8A1D10  thread=2
+#0 0x140434430
+#1 0x14042472E     <- collection destructor 0x1404245F0
+```
+
+`0x1404245F0` is a **collection destructor**: it takes a mutex at `this+0xC0`,
+zeroes the shared_ptr at `this+0x100`, walks the sentinel-terminated intrusive
+list at `this+0xF0`, and for each element calls `vtable+0x08` then `vtable+0x00`
+(`0x140424725`, `0x14042473C`, loop counter in `EDI`).
+
+That destructor's own caller, captured three times on thread 2:
+
+```text
+[DTOR] 0x1404245F0  this=0x14B3EB0  thread=2
+#0 0x1404245F0
+#1 0x140423EA1     <- inside 0x140423DD0
+```
+
+`0x140423DD0..0x140423FE1` is a **timed wait / task loop**: it reads a tick pair
+at `0x140423E41`/`0x140423EAB`, and gates on two fields of one object —
+`[r8]` at `0x140423DFD` and `[r8+0x2D]` at `0x140423E12`/`0x140423F6B`, with a
+further `[rax+0x2C]` test at `0x140423EE6`.
+
+### Phase 6 — ordered timeline (same run)
+
+```text
+T0  thread 2   NULL -> peer A  (0x140412A4F)
+T1  thread 58  M1/M2/M3 read the field with rdi=NULL, no commit
+T2  thread 58  peer A -> peer B (0x140412A4F)
+T3  thread 2   0x140423DD0 timed loop -> 0x1404245F0 collection dtor
+               -> 0x140434430 detach -> 0x14040AEC0 peer teardown
+T4  0x14040AEEB  peer B -> NULL   (the only clear)
+T5  0x14040AF27  Close 0x43DB3479 sent
+T6  ServerProxy::OnDisconnect (launch context still set)
+T7  HandleLaunchFailure 1003
+```
+
+The teardown runs on **thread 2**, the same thread as the timed loop — not on the
+ReplyID thread 58 that installed peer B. **Peer A's replacement and the Close are
+separate lifecycle events**, confirming the task's warning against conflating them.
+
+### Phase 10 — `peer+0x40` / `"*"`
+
+```text
+peer+0x40 wildcard behavior: REAL BUT NOT CAUSAL TO CURRENT FAILURE
+```
+
+Confirmed again on this run: peer B was present at the teardown, was taken by
+`0x14040AEEB`, and `0x14040AF1D` did not fire. No further hunt for a `"*"` source
+is justified without new evidence.
+
+### Classification
+
+```text
+conn+0x88 mutation history captured end-to-end         CONFIRMED
+teardown's own take is the only clear of conn+0x88     CONFIRMED
+M1/M2/M3 write NULL and do not commit                  CONFIRMED
+teardown runs on thread 2 from a timed loop            CONFIRMED
+teardown reached via 0x140423DD0 -> 0x1404245F0
+  (collection dtor) -> 0x140434430 (detach)            CONFIRMED
+peer A's release and the Close are separate events     CONFIRMED
+peer+0x40 / "*" is causal to this failure              DISPROVEN
+ReplyID handling clears conn+0x88                      DISPROVEN
+```
+
+### Remaining open question
+
+What makes the timed loop `0x140423DD0` proceed into the collection-destructor
+path. It has no direct callers and no data references, so it is entered
+indirectly; the gating fields `[r8]`, `[r8+0x2D]` and `[rax+0x2C]` and the
+identity of the object at `0x14B3EB0` are the next targets. Until that is
+established the teardown is **not** yet proven to be failure cleanup rather than
+an intentional transition, so `conn+0x88` becoming NULL through the teardown is
+classified **UNKNOWN** for normal-vs-failure.
+
+**No server behaviour was changed and D4 was not sent.** Client restored
+byte-exactly (`47d8c8F0…`) and fixture restored (`localhost:7979:castlehilltest`)
+after every run.
+
+## RETRACTION: x86 CMPXCHG failure does not clear `conn+0x88` (September 13)
+
+### What is retracted
+
+The preceding section classified `0x14040AEEB` as the instruction that clears
+`conn+0x88`, printing a `peer B -> NULL` transition. That is **wrong**.
+
+`LOCK CMPXCHG r/m64, r64` compares `RAX` with the destination and:
+
+```text
+if RAX == DEST:  DEST = SRC ; ZF = 1
+else:            RAX  = DEST ; DEST unchanged ; ZF = 0
+```
+
+The comparison-failure path **never writes the destination**. The hardware
+watchpoint fired because `lock cmpxchg` is a locked read-modify-write bus
+operation regardless of the architectural outcome. A watchpoint hit is
+therefore **not** evidence of a value change. The `peer B -> NULL` transition
+reported in the previous section was an artefact of that inference.
+
+### Register-level revalidation — CONFIRMED on the historical run
+
+One bounded run with the documented loopback resolver step, client and fixture
+restored byte-exactly. Instruction bytes at the site:
+
+```text
+0x14040AEEB:  f0 48 0f b1 8a 88 00 00 00   lock cmpxchg qword ptr [rdx+0x88], rcx
+0x14040AEF4:  48 8d 0d 65 0e 16 01         lea  rcx, [rip+0x1160e65]
+```
+
+Captured immediately before and after, on the failing path:
+
+```text
+[BEFORE] rax=0x14040AEC0 rcx=0x14DFD30 rdx=0x3F8A1A40
+[BEFORE] conn+0x88 = 0x13E25B0            (peer B present)
+
+[AFTER ] rax=0x13E25B0 rcx=0
+[AFTER ] conn+0x88 = 0x13E25B0            (UNCHANGED)
+[AFTER ] eflags=0x287  ZF=0
+```
+
+```text
+Does 0x14040AEEB mutate conn+0x88 when it is non-null?   NO
+```
+
+`RAX` returns peer B exactly as the architecture specifies, `ZF` is clear, and
+the destination is byte-identical before and after. So:
+
+```text
+conn+0x88 is never cleared anywhere in the observed run.
+peer B remains attached right through the Close.
+```
+
+### Phase 1 — corrected mutation history (same run)
+
+```text
+initial:                  NULL
+first attach  (0x140412a4f, thread 2):   NULL    -> peer A   (real store, succeeds)
+0x14042c641   (thread 58):  before 0x4096FBA0  after 0x4096FBA0   (no change)
+0x14042c731   (thread 58):  before 0x4096FBA0  after 0x4096FBA0   (no change)
+0x14042c754   (thread 58):  before 0x4096FBA0  after 0x4096FBA0   (no change)
+ReplyID replacement (0x140412a4f, thread 58): peer A -> peer B     (real store)
+0x14040aeeb   (thread 2):   before 0x013E25B0  after 0x013E25B0   (no change)
+
+Only TWO real mutations exist: NULL -> peer A, then peer A -> peer B.
+The only writer of conn+0x88 is 0x140412A4F.
+```
+
+The `cmpxchg ... , rdi` operations at `0x14042c641`/`0x14042c731`/`0x14042c754`
+have `rdi = NULL` at runtime, so even had they succeeded they would have *erased*
+the field; because the field is non-null and `EAX = 0`, they fail and change
+nothing. They are conditional stores used as atomic probes.
+
+### Phase 2 — why `rcx` held the empty string, resolved
+
+Two candidate causes existed. Runtime settles it as **B**, not **A**:
+
+```text
+A. conn+0x88 was NULL and the cmpxchg succeeded, so JE was taken
+   -> DISPROVEN: ZF=0, the cmpxchg failed
+B. conn+0x88 held a peer, cmpxchg failed, peer+0x40 was NULL so CMOVNE did not
+   replace rcx
+   -> CONFIRMED
+```
+
+Captured values:
+
+```text
+peerB(rax)          = 0x13E25B0
+peerB+0x40 raw      = 0x14156BD60        <- the empty-string singleton
+peerB+0x40 str      = ""
+peerB+0x20 str      = ":castlehilltest"
+peerB+0x30 str      = "localhost:7979"
+
+[TEST] rcx = 0x14156BD60   empty_singleton = 0x14156BD60   equal = 1
+[BRANCH] fallthrough -> Close sent
+```
+
+`lea rcx,[0x14156BD60]` loads the empty-string singleton; `mov rax,[rax+0x40]`
+loads peer B's `+0x40`, which is *that same* singleton; `test rax,rax` sees a
+non-null pointer so `cmovne rcx,rax` copies it, a no-op in value. `rcx` is
+therefore non-null and empty, and `""` does not equal `"*"`, so the Close is
+sent on the fall-through. **The empty-string result comes from peer B's own
+`+0x40` field, not from the connection field being empty.**
+
+Note this also means `peer+0x40` is a real string field that held `""` here;
+whether it is ever populated is now the only open part of the wildcard question.
+
+### Phase 3 — corrected semantic role of `0x14040AEC0`
+
+```text
+Does 0x14040AEC0 itself remove the peer from connection+0x88?   NO
+Does it merely atomically read/classify the current peer before
+  deciding whether to Close?                                    YES
+```
+
+Role: **atomic routed-peer probe + routed-connection termination.** It loads the
+connection from its argument, probes `[conn+0x88]` with a sentinel compare (which
+fails, returning the peer in `RAX`), classifies the peer by its `+0x40` string
+against `"*"`, and closes the connection when the name is not the wildcard.
+
+`0x14040AF6A` releases `[arg2]` — the connection smart-pointer held by the
+argument struct, **not** the peer in `conn+0x88`. That connection object is
+distinct from the peer, and its release is the reference that the teardown is
+finishing with, not a peer deletion.
+
+### Phase 4 — the call chain, retained and verified
+
+The chain recovered by the previous run is unaffected by the cmpxchg correction
+and is retained:
+
+```text
+0x140423DD0   timed wait / periodic task
+   -> 0x1404245F0  collection teardown (mutex +0xC0, intrusive list +0xF0,
+                   shared_ptr +0x100; per element calls vtable+0x08 then +0x00)
+   -> 0x140434430  surrogate/target detach (calls vtable+0x28 then +0x70)
+   -> 0x14040AEC0  routed-peer probe + Close
+   -> 0x1404123D0  Close 0x43DB3479
+   -> ServerProxy::OnDisconnect -> 1003
+```
+
+Re-verified edges on the failing run: the detach enters `0x14040AEC0` on
+**thread 2**, the same thread as the timed routine, not the ReplyID thread 58.
+
+### Phase 6/10 — partial gate semantics of `0x140423DD0`
+
+Recovered from the full disassembly (not inferred from shape):
+
+```text
+rcx = rdi = destination object (released at 0x140423FA9 -> 0x1400B79F0)
+rdx = rbx = argument; [rbx] = target object; [rbx+8] = its refcounted control block
+r8        = gate input
+
+140423dfd  cmp dword ptr [r8],0      ; gate: non-zero -> 0x140423F65
+140423e07  rax = [rdx] ; r8 = [rax]
+140423e0d  cmp byte ptr [r8+0x2d],0  ; non-zero -> 0x140423FA9 (exit, no teardown)
+```
+
+Timing source is `KUSER_SHARED_DATA`: `0x7FFE0008` (low), `0x7FFE000C` (high),
+`0x7FFE0010` (sequence), converted with the `0x346DC5D63886594B` / `>>0xB`
+millisecond scaling, with deadlines at `[[rbx]]+0x28` and elapsed compared at
+`0x140423eec`.
+
+```text
+condition that selects teardown =
+    at entry [r8] == 0, [target+0x2D] == 0; then [target+0x2C] and the
+    elapsed>=deadline comparison at 0x140423eec choose between the periodic
+    callback 0x140423FF0 and the completion callback 0x140423A70
+```
+
+Runtime values of `[r8]`, `[target+0x2C]`, `[target+0x2D]` and the deadline were
+**not** captured, so:
+
+```text
+83 ms teardown trigger:  UNKNOWN
+  (a real timeout is NOT proven: the ~83 ms spans the whole
+   CS_LOGGING_IN -> HandleLaunchFailure interval in the client log and was
+   never isolated to this loop)
+conn+0x88 becoming NULL: does not happen; classification void
+double attach:           NOT CAUSAL (0x14040AEC0 does not depend on the peer
+                         having been replaced; only on the peer's +0x40 name)
+D4 causal relevance:     UNKNOWN (not sent)
+peer+0x40 / "*":         REAL; whether the field can ever hold "*" is OPEN
+```
+
+### Remaining open question
+
+**Why the owner begins the collection-teardown path.** `0x140423DD0` has no
+direct callers, no data references and no 8-byte pointer anywhere in the image
+that lands inside its range, so it is entered by a dispatch not yet localized.
+Its gate fields (`[r8]`, `[target+0x2C]`, `[target+0x2D]`), the identity of the
+object at `0x14B3EB0`, and the identity of the `0x1404245F0` collection are the
+next targets.
+
+**No server behaviour was changed; D4 was not sent.** The copied client and the
+fixture were restored byte-exactly after every run.
