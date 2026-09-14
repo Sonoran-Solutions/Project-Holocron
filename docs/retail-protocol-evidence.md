@@ -3830,7 +3830,9 @@ first failing condition:
     bootstrap-attached peer is still held in [connection+0x88]
 function:
     0x140412820 (peer alloc/attach), reached from the 0x6731C5AF
-    (ReplyIDSignature) arm via 0x14042C300 -> 0x14042C782 -> 0x140411D30
+    (ReplyIDSignature) arm via 0x14042C300 -> 0x14042C782 -> 0x140412180
+    (the earlier "-> 0x140411D30" here was WRONG; 0x140412180 calls
+     0x140412820 directly at 0x140412247 and never calls 0x140411D30)
 field/value:
     [connection+0x88] already holds peer 0x40BC3570 (name
     "localhost:7979:castlehilltest") when the replacement runs
@@ -6944,7 +6946,9 @@ name. The handler separately derives a name of its own:
 14042b63b  call 0x1411C8EF0      ; compare the peer-name argument
 14042b683  lea  r14,[rip+..]     ; 0x14156BD60 = ""     (override absent)
 14042b6e9  mov  [rsp+0x40], rax  ; arg5 = &{the name object}
-14042b721  call 0x140411D30      ; -> 0x140412820 peer ctor at 0x140412247
+14042b721  call 0x140411D30      ; 0x140411D30, NOT the peer ctor path.
+                                 ; Its own peer ctor call is at 0x140412040
+                                 ; (see the later section)
 ```
 
 So the peer name is `"localhost"` or an override, and when the override is absent
@@ -7322,8 +7326,11 @@ kept.
 
 ### D. Where the seeding value actually comes from
 
-`0x140411D30` builds the same record shape as `0x140412820` and is reached from
-`0x140412180`; it seeds a routed-peer record's `+0x00` from a name obtained from
+**CORRECTED.** `0x140411D30` is **not** reached from `0x140412180`; its callers
+are `0x14042B721` and `0x14042CF88`. `0x140412180` calls `0x140412820` directly
+at `0x140412247`. The two mechanisms are independent.
+
+`0x140411D30` writes a name into its first argument from a value obtained through
 the route/endpoint record:
 
 ```asm
@@ -7360,3 +7367,65 @@ D4                                                                        UNKNOW
 
 No server experiment was performed, no D4 was sent, and no client patch beyond
 the existing resolver workaround is in effect.
+
+## Canonical reconciliation: value vs provenance, and a false call chain (September 13, fourth pass)
+
+Two documentation defects, both introduced or left standing by earlier passes.
+
+### A. `0x140412180` does NOT call `0x140411D30`
+
+Enumerating every `call` inside `0x140412180` (`0x140412180 - 0x1404123CD`):
+
+```text
+1404121b3  0x140414250        140412247  0x140412820   <-- the peer constructor
+1404121d6  0x140414cb0        140412258  [iat]         1404122c3  [iat]
+1404122f3  [iat]              140412302  0x14043d380   140412317  0x1404123d0
+140412332  [iat]              14041235f  0x140414cb0   14041236d  0x140414250
+140412396  [iat]              1404123a5  0x140435ce0   1404123c1  [iat]
+```
+
+```text
+0x140412180 -> 0x140411D30                                  FALSE
+0x140412180 -> 0x140412820 directly (0x140412247)           CONFIRMED
+0x140411D30 callers = 0x14042B721, 0x14042CF88              CONFIRMED
+```
+
+Note the trap: `0x140412317` *is* a `call 0x1404123d0` (the Close verb). Reading
+"`0x1404123...`" as "`0x140411D30`" is what produced the earlier error.
+
+### B. `peer A +0x00` value and provenance were conflated
+
+The old table asserted:
+
+```text
+peer A +0x00 = "" and that is because [connection+0x88]+0x00 was NULL/""
+```
+
+The observed value is a runtime fact. The claimed *cause* is not evidence, and
+the model that produced it is **superseded** by a concrete contradiction:
+
+```text
+peerB+0x20 observed = ":castlehilltest"
+peerB+0x20          = p3 ":" p2
+=> peer B p2 = "castlehilltest", peer B p3 = ""
+
+if p2 were always "the previous peer's +0x00", then
+   peerB.p2 == peerA+0x00 == ""
+   => peerB+0x20 == ":"            which CONTRADICTS the witness
+```
+
+So p2 is **not** a simple read of a previous peer's `+0x00`. The corrected
+statuses:
+
+```text
+peer A +0x00 == ""                          CONFIRMED (runtime value only)
+peer A +0x00 provenance                     UNKNOWN
+peer A +0x00 == [connection+0x88]+0x00      SUPERSEDED
+peer B +0x40 == peer A +0x00                CONFIRMED
+p2 source = route/endpoint name field        HYPOTHESIS (target of this pass)
+```
+
+Also withdrawn: describing the object at `rdi` in `0x140411D30` as "the
+connection's routed-peer record" or as having "the same record shape" as
+`0x140412820`. The offsets coincide; **offset coincidence is not identity**, and
+that object is `UNKNOWN` until its allocation site and vtable are found.

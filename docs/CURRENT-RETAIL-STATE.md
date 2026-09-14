@@ -1046,25 +1046,49 @@ new_peer+0x40 == previous routed peer's +0x00 field            CONFIRMED
 
 ### Every field of the two historical peers
 
+**VALUE versus PROVENANCE must be kept apart.** The observed *values* below are
+runtime facts. The *provenance* of the first peer's `+0x00` is `UNKNOWN`: the
+old table asserted it was `[connection+0x88]+0x00`, and that assertion is
+`SUPERSEDED`. Nothing about the observed emptiness may be used to infer its
+cause.
+
 ```text
-field   peer A                              peer B
+field   peer A (observed)                   peer B (observed)
 ------  ----------------------------------  ----------------------------------
-+0x00   "" (p2 from the ReplyID attach;     "" (p2 from the Introduce attach)
-        = [connection+0x88]+0x00, which
-        was NULL/"" before it)
-+0x10   p3 (route string)                   p3
-+0x20   p3 ":" p2                           p3 ":" p2
-+0x30   p4 (route string)                   p4   = "localhost:7979"  (witness)
-+0x40   p5 = previous peer's +0x00 = ""     p5 = peerA+0x00 = ""
++0x00   ""                                  ""                value CONFIRMED
+        provenance UNKNOWN                                    provenance UNKNOWN
++0x10   not captured at runtime             p3 (not captured)
++0x20   not captured at runtime             ":castlehilltest" value CONFIRMED
++0x30   not captured at runtime             "localhost:7979"  value CONFIRMED
++0x40   ""                                  ""                value CONFIRMED
 ```
 
 ```text
-peer A +0x40 = ""     because at the first attach there was no previous peer,
-                      so the sixth argument of 0x140412180 was the NULL/empty
-                      record and p5 normalised to the empty singleton
-peer B +0x40 = ""     because it copied peer A's +0x00, which is itself "" for
-                      the same reason
+Peer A +0x00 == ""                                          CONFIRMED value
+Peer A +0x00 provenance                                     UNKNOWN
+Peer A +0x00 == [connection+0x88]+0x00                      SUPERSEDED
+Peer B +0x40 == Peer A +0x00                                CONFIRMED
+Peer B +0x20 == p3 ":" p2 == ":castlehilltest"               CONFIRMED
+  therefore for peer B:  p3 == "" and p2 == "castlehilltest" CONFIRMED
+Peer A +0x40 == ""                                          CONFIRMED value
+Peer A +0x40 provenance                                     UNKNOWN
 ```
+
+Two distinct upstream explanations existed and **neither is currently proven**:
+
+```text
+(a) the first attach had no previous peer, so its p2 was the empty
+    singleton                  SUPERSEDED as an assertion; UNKNOWN as a cause
+(b) the p2 source is a route/endpoint name field that held "" on this
+    path                       HYPOTHESIS, unproven
+```
+
+The concrete counter-evidence against (a) being the whole story: **peer B's p2 is
+`"castlehilltest"`, not empty**, while peer A's `+0x00` is empty. If `p2` were
+always "the previous peer's `+0x00`", peer B's p2 would have to equal peer A's
+`+0x00` = `""`, predicting `peerB+0x20 == ":"` — which contradicts the observed
+`:castlehilltest`. **So `p2` is not a simple read of the previous peer's
+`+0x00`; it is obtained elsewhere.** That is the open question this pass targets.
 
 ### Which peer is which
 
@@ -1144,16 +1168,45 @@ carried by the route record.** `0x140411D30` is the function that seeds it:
 140411eb9  call 0x14012d1f0         ; peer+0x40 = the builder buffer
 ```
 
-The destination offsets (`+0x30`, `+0x50`, `+0x70`, `+0x40`, `+0x28`, `+0x00`,
-`+0x20`) are byte-verified against the constructor at `0x140412820`, so
-`0x140411D30` builds the *same* record shape as `0x140412820` — the connection's
-own routed-peer record.
+The destination offsets used by `0x140411D30` (`+0x28`, `+0x30`, `+0x50`,
+`+0x00`, `+0x40`, `+0x20`) are byte-verified and coincide with the constructor
+`0x140412820`'s offsets. **Offset coincidence is not identity.** The object at
+`rdi` in `0x140411D30` has not been classified, so calling it "the connection's
+own routed-peer record" is withdrawn (`UNKNOWN`).
 
 ```text
-the p2 of a new peer is a copy of a name field obtained from the
-route/endpoint record reached through the previous attach                HYPOTHESIS
+the p2 of a routed peer is a copy of a name field obtained from a
+route/endpoint record                                                    HYPOTHESIS
 the copy's immediate source object is NOT the wire and NOT a constant    CONFIRMED
 ```
+
+### CALL-CHAIN CORRECTION (explicitly recorded)
+
+An earlier pass wrote that `0x140412180` reaches `0x140411D30`. **That is false.**
+
+```text
+0x140412180 -> 0x140411D30                                       FALSE
+0x140412180    has its own direct call to 0x140412820
+                at 0x140412247                                   CONFIRMED
+0x140411D30    is NOT called by 0x140412180                       CONFIRMED
+0x140411D30    callers are exactly 0x14042B721 (in 0x14042B3D0)
+               and 0x14042CF88 (in 0x14042C910)                  CONFIRMED
+```
+
+Enumerating every `call` instruction inside `0x140412180`
+(`0x140412180 - 0x1404123CD`) yields exactly these targets:
+
+```text
+1404121b3  0x140414250       140412247  0x140412820   <-- the peer constructor
+1404121d6  0x140414cb0       140412258  [iat]        1404122c3  [iat]
+1404122f3  [iat]             140412302  0x14043d380  140412317  0x1404123d0
+140412332  [iat]             14041235f  0x140414cb0  14041236d  0x140414250
+140412396  [iat]             1404123a5  0x140435ce0  1404123c1  [iat]
+```
+
+So the two attach paths are **independent**, and the peer inheritance chain
+(`new_peer+0x40 = previous peer's +0x00`) and the `0x140411D30` route-name copy
+are **separate mechanisms** until proven otherwise.
 
 What remains `UNKNOWN` is the producer of *that* name field, i.e. the wire or
 client-local origin of the first name. That is the single remaining hop, and it
