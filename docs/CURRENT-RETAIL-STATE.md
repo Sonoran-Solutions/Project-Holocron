@@ -47,8 +47,10 @@ listener vtable+0x70 -> 0x14040AEC0 (THE DECIDER)                      CONFIRMED
 0x140434430 -> 0x14040AEC0 = direct virtual dispatch (always taken)    CONFIRMED
 0x14040AEC0 detaches conn+0x88 unconditionally, THEN tests the name    CONFIRMED
 skip-Close condition = peer+0x40 is exactly the 2-byte string "*"      CONFIRMED
-peer+0x40 writer = the peer ctor 0x140412907 (4th string argument)     CONFIRMED
-peer+0x40 source = the IntroduceConnection peer-creation path          HYPOTHESIS
+peer+0x40 writer = the peer ctor 0x140412907 (parameter p5, single writer)
+                                                                       CONFIRMED
+peer+0x40 source = p5 of 0x140412820 = 4th arg of 0x14042B3D0, i.e. the
+                   neighbour object also stored at conn+0x88            HYPOTHESIS
 why peer+0x40 is "" on the failing path (which argument)               UNKNOWN
 peer+0x40 semantic role = the peer's name/id string                    HYPOTHESIS
 endpoint-wildcard experiment suppresses Close                          DISPROVEN
