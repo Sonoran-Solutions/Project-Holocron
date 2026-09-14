@@ -4346,3 +4346,81 @@ next targets.
 
 **No server behaviour was changed; D4 was not sent.** The copied client and the
 fixture were restored byte-exactly after every run.
+
+---
+
+## Canonical-runner hardening, and scoping the `"*"` Close test (September 13)
+
+No protocol behaviour changed in this section. It records one repository
+correctness fix and one documentation scoping correction, made together before
+the next reverse-engineering checkpoint.
+
+### The canonical runner inherited mode variables
+
+`tools/run-retail-bootstrap-probe.py` is the single supported entrypoint, but it
+only popped three variables (`HOLOCRON_AUTH_CAPTURE`, `HOLOCRON_AUTH_LOGIN_REPLY`
+and, in an earlier revision, `HOLOCRON_RUN_SECONDS`) before setting the modes the
+command line requested. Every other mode switch was therefore inherited from the
+calling shell:
+
+```text
+HOLOCRON_AUTH_CAPTURE
+HOLOCRON_AUTH_LOGIN_REPLY
+HOLOCRON_AUTH_ID_BOOTSTRAP
+HOLOCRON_WINEDBG_GDB
+HOLOCRON_WINEDBG_TRACE
+HOLOCRON_GDB_PARENT
+HOLOCRON_GDB_INNER
+HOLOCRON_GDB_TRACE
+HOLOCRON_DORMANT_DEBUG
+```
+
+Concretely, a shell that already had `HOLOCRON_AUTH_ID_BOOTSTRAP=1` exported made
+`--no-bootstrap-probe` a no-op, and any exported `HOLOCRON_GDB_*` value replaced
+the whole normal client launch with a debugger branch inside
+`tools/launch-isolated-client.sh`, because those branches are checked in
+`elif` order. A run could silently not be the run that was asked for.
+
+Fix: `sanitize_mode_environment()` clears the entire list first, and `main()`
+then sets **only** the flags selected by this invocation. Two further accuracy
+fixes went in at the same time:
+
+* `--keep-patched` removed. Canonical runs always restore the private executable;
+  the unrestricted `finally` restore has no override.
+* `HOLOCRON_RUN_SECONDS` removed. Nothing in `tools/launch-isolated-client.sh`
+  ever read it — only `scratch/retail-capture.py` did, for its own unrelated
+  deadline — so the variable claimed a launcher time limit that did not exist.
+  `--seconds` is now documented as what it actually is: the **wrapper's** bound on
+  how long the launcher may run, plus a fixed 120 s shutdown grace. The launcher
+  has no time limit of its own and receives no time-limit value.
+
+`tools/test_run_retail_bootstrap_probe.py` covers this: mode sanitization, the
+inherited-export case, default probe opt-in, deadline arithmetic, byte-exact
+restoration on both the success and launcher-failure paths, refusal of an
+unrecognized build, and a guard that these tests never invoke the isolated
+launcher. All of it operates on throwaway synthetic clients; the real private
+client is only ever read.
+
+### Scoping the `"*"` Close test
+
+The earlier section "Wildcard-handoff hypothesis tested and DISPROVEN" stated,
+globally:
+
+```text
+if the retained route name is the wildcard "*" the Close is skipped;
+otherwise a Close is sent
+```
+
+That was written too broadly. The `"*"` comparison at `0x14040AF0B`/`0x14040AF1D`
+is a local decision **inside `0x14040AEC0`** and says nothing about Close
+production anywhere else in the image. `docs/CURRENT-RETAIL-STATE.md` now states
+only the local contract:
+
+```text
+Within 0x14040AEC0, its Close call is skipped when the classified peer string is
+exactly "*"; otherwise that path calls Close.
+```
+
+Other Close producers exist structurally and are not erased by this test. The
+superseded global phrasing is retained here as `SUPERSEDED` per the notebook's
+provenance rule.

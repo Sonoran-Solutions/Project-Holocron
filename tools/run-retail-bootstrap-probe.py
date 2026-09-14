@@ -20,13 +20,28 @@ This script is the single supported way to do that. It:
 * operates only on the prepared private client under ``.local-test/``;
 * refuses an unrecognized executable build (hash + byte assertion);
 * patches only that one immediate, and nothing else;
-* restores the original bytes in a ``finally`` path;
+* restores the original bytes in a ``finally`` path, unconditionally;
 * verifies the restoration is byte-for-byte, and exits non-zero if it is not;
-* never touches the Steam installation.
+* never touches the Steam installation;
+* sanitizes every ``HOLOCRON_*`` mode variable it knows about before setting the
+  modes this invocation actually asked for.
 
-Expected success shape (see ``docs/CURRENT-RETAIL-STATE.md``): the Auth log
-shows RequestIDSignature -> ReplyIDSignature -> IntroduceConnectionSignature ->
-Close 0x43DB3479.
+Mode-variable sanitization
+--------------------------
+The launcher and the dormant/attach helpers select their execution path from
+environment variables. A value exported in the calling shell would otherwise
+silently change this script's run (for example an inherited
+``HOLOCRON_AUTH_ID_BOOTSTRAP=1`` would defeat ``--no-bootstrap-probe``, and an
+inherited ``HOLOCRON_GDB_TRACE=1`` would replace the normal client launch with a
+debug trace). ``sanitize_mode_environment`` clears that whole family first, and
+only then does ``main`` set the flags selected by the command line.
+
+Time bounds
+-----------
+The isolated launcher has no time limit of its own: it runs the client until the
+client exits. ``--seconds`` is therefore the **wrapper's** bound on how long the
+launcher may run before this script terminates it, plus a fixed grace period for
+shutdown. No time-limit value is passed into the launcher.
 
 Usage
 -----
@@ -61,9 +76,52 @@ ORIGINAL = bytes.fromhex('c70600040000')
 PATCHED = bytes.fromhex('c70600000000')
 FILE_OFFSET = RVA - 0x1000 + 0x400  # .text RVA -> file offset
 
+# Every environment variable that can steer the launcher (or a helper it starts)
+# onto a different execution path. Clearing all of them is what makes a run
+# reproducible when the calling shell is not pristine.
+MODE_ENVIRONMENT_VARIABLES = (
+    # Auth-server behaviour. HOLOCRON_AUTH_LOGIN_REPLY selects the
+    # HISTORICAL/INVALID direct-D4 probe, which answers RequestIDSignature
+    # (0xA609E6A7) with D4 and bypasses the proven identification exchange.
+    'HOLOCRON_AUTH_CAPTURE',
+    'HOLOCRON_AUTH_LOGIN_REPLY',
+    'HOLOCRON_AUTH_ID_BOOTSTRAP',
+    # Debugger / tracing modes. These are mutually exclusive branches in
+    # tools/launch-isolated-client.sh; any inherited value pre-empts the normal
+    # client launch.
+    'HOLOCRON_WINEDBG_GDB',
+    'HOLOCRON_WINEDBG_TRACE',
+    'HOLOCRON_GDB_PARENT',
+    'HOLOCRON_GDB_INNER',
+    'HOLOCRON_GDB_TRACE',
+    'HOLOCRON_DORMANT_DEBUG',
+)
+
+# Fixed grace period added to --seconds before the wrapper force-terminates the
+# launcher. The launcher itself is given no time limit.
+SHUTDOWN_GRACE_SECONDS = 120.0
+
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def sanitize_mode_environment(environ: dict) -> list:
+    """Clear every mode-changing Holocron variable, returning the cleared names.
+
+    Mutates ``environ`` in place. Called before this invocation sets the flags it
+    actually wants, so an inherited value can never select a different path.
+    """
+    cleared = []
+    for name in MODE_ENVIRONMENT_VARIABLES:
+        if environ.pop(name, None) is not None:
+            cleared.append(name)
+    return cleared
+
+
+def launcher_deadline_seconds(seconds: float, grace: float = SHUTDOWN_GRACE_SECONDS) -> float:
+    """Seconds this wrapper waits for the launcher before terminating it."""
+    return seconds + grace
 
 
 def fail(message: str) -> None:
@@ -102,15 +160,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--seconds', type=float, default=240.0,
-                        help='bounded run length passed to the launcher (default 240)')
+                        help='how long the wrapper lets the launcher run before '
+                             'terminating it (default 240; the launcher has no '
+                             'time limit of its own and this value is not passed '
+                             'to it)')
     parser.add_argument('--winedbg-gdb', action='store_true',
                         help='start the WineDbg GDB proxy (port 27979) instead of a normal run')
     parser.add_argument('--winedbg-trace', action='store_true',
                         help='run the client directly under winedbg')
     parser.add_argument('--no-bootstrap-probe', action='store_true',
                         help='do not pass --probe-id-bootstrap to the auth server')
-    parser.add_argument('--keep-patched', action='store_true',
-                        help='DANGEROUS: leave the resolver patch applied (debugging only)')
     parser.add_argument('--dry-run', action='store_true',
                         help='verify the client and environment, then exit without running')
     args = parser.parse_args()
@@ -127,11 +186,10 @@ def main() -> int:
         return 0
 
     env = dict(os.environ)
-    env['HOLOCRON_RUN_SECONDS'] = str(int(args.seconds))
-    env.pop('HOLOCRON_AUTH_CAPTURE', None)
-    # The canonical bootstrap probe. HOLOCRON_AUTH_LOGIN_REPLY selects the
-    # HISTORICAL/INVALID direct-D4 flow and must not be set here.
-    env.pop('HOLOCRON_AUTH_LOGIN_REPLY', None)
+    cleared = sanitize_mode_environment(env)
+    if cleared:
+        print('[bootstrap] cleared inherited mode variables: ' + ', '.join(cleared))
+    # Only now select the modes this invocation asked for.
     if not args.no_bootstrap_probe:
         env['HOLOCRON_AUTH_ID_BOOTSTRAP'] = '1'
     if args.winedbg_gdb:
@@ -141,16 +199,16 @@ def main() -> int:
 
     process = None
     restored_ok = False
+    started = time.monotonic()
     try:
         patched = bytearray(original)
         patched[FILE_OFFSET:FILE_OFFSET + INSTRUCTION_LENGTH] = PATCHED
         EXE.write_bytes(patched)
         print('[bootstrap] AI_ADDRCONFIG cleared (0x400 -> 0) for this bounded run')
 
-        started = time.monotonic()
         process = subprocess.Popen([str(LAUNCHER)], env=env, start_new_session=True)
         try:
-            process.wait(timeout=args.seconds + 120)
+            process.wait(timeout=launcher_deadline_seconds(args.seconds))
         except subprocess.TimeoutExpired:
             print('[bootstrap] launcher exceeded its window; terminating')
     finally:
@@ -165,15 +223,14 @@ def main() -> int:
                 except Exception:
                     pass
 
-        if args.keep_patched:
-            print('[bootstrap] WARNING: --keep-patched set; resolver patch left applied')
-        else:
-            EXE.write_bytes(original)
-            after = sha256(EXE.read_bytes())
-            if after != sha256(original):
-                fail('client was NOT restored byte-exactly; investigate immediately')
-            restored_ok = True
-            print(f'[bootstrap] client restored byte-exactly (sha256 {after})')
+        # Canonical runs always restore the private executable. There is no
+        # supported "leave the patch applied" mode.
+        EXE.write_bytes(original)
+        after = sha256(EXE.read_bytes())
+        if after != sha256(original):
+            fail('client was NOT restored byte-exactly; investigate immediately')
+        restored_ok = True
+        print(f'[bootstrap] client restored byte-exactly (sha256 {after})')
 
     print(f'[bootstrap] elapsed {time.monotonic() - started:.1f}s')
     if restored_ok:

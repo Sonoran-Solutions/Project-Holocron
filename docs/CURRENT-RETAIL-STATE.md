@@ -53,10 +53,18 @@ The isolated namespace contains only `lo`. The retail TCP hint builder sets
 opens an Auth socket. `CONFIRMED`
 
 **Use `tools/run-retail-bootstrap-probe.py`.** It applies only that one
-immediate (`0x400` → `0`), refuses unknown executable builds, and restores the
-original bytes in a `finally` path with a byte-for-byte verification. Do not
-hand-patch the executable. Running `tools/launch-isolated-client.sh` directly on
+immediate (`0x400` → `0`), refuses unknown executable builds, restores the
+original bytes unconditionally in a `finally` path with a byte-for-byte
+verification, and clears every inherited `HOLOCRON_*` mode variable before
+setting the modes requested on its command line — so `--no-bootstrap-probe`
+works even if the calling shell already exported `HOLOCRON_AUTH_ID_BOOTSTRAP`.
+There is no supported "leave the patch applied" mode. Do not hand-patch the
+executable. Running `tools/launch-isolated-client.sh` directly on
 stock bytes reproduces an **environment artifact**, not the historical Auth path.
+
+The launcher itself imposes **no** time limit. `--seconds` is the wrapper's own
+bound on how long the launcher may run before the wrapper terminates it (plus a
+fixed 120 s shutdown grace); no time-limit value is passed into the launcher.
 
 ---
 
@@ -112,10 +120,14 @@ launch context at `+0x90` still outstanding and reports error **1003**.
   terminates the routed connection. `CONFIRMED`
 * At `0x14040AF6A` it releases `[arg2]` — the **connection smart pointer in the
   argument struct**, which is a different lifetime from the peer. `CONFIRMED`
-* The Close is generated only when the classified name is not the wildcard
-  `"*"`. In the observed run the compared string was `""`, taken from
+* **Local contract inside `0x14040AEC0`:** its Close call is skipped when the
+  classified peer string is exactly the wildcard `"*"`; otherwise that path calls
+  Close. In the observed run the compared string was `""`, taken from
   **`peerB+0x40`** (which held the empty-string singleton `0x14156BD60`), so the
   Close was sent. `CONFIRMED`
+  * This is a statement about **this function only**, not a global rule. Other
+    Close producers exist structurally elsewhere in the image and must not be
+    erased or explained away by this test.
 
 ### Owner teardown chain (all on thread 2)
 
@@ -258,7 +270,9 @@ debugging the protocol.
 
 * `dotnet test` → **65/65** passing. Test names state what each one proves; see
   the provenance notes in `tests/Holocron.Tests/`.
-* `python3 -m unittest discover -s tools -p 'test_*.py' -v` → **2/2** passing.
+* `python3 -m unittest discover -s tools -p 'test_*.py' -v` → **15/15** passing
+  (2 platform-fixture tests, 13 canonical-runner control tests in
+  `tools/test_run_retail_bootstrap_probe.py`).
 * Latest corrected reverse-engineering checkpoint: `e9dc46a` (it supersedes the
   unpushed `7f93d8a`, whose `CMPXCHG` interpretation was wrong).
 * Evidence notebook: `docs/retail-protocol-evidence.md` (chronological; may
