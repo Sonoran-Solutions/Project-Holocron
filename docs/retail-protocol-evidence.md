@@ -4904,3 +4904,130 @@ absence of a static edge as evidence of a *different* static edge is exactly the
 error this correction removes. A future pass must find each closure's
 registration site (the machine code that materialises its address) rather than
 guessing a callee.
+
+---
+
+## The application tick `0x140430620` and the slot it cancels (September 13)
+
+### Why this function matters
+
+The previous section established that owner cancellation
+(`0x1403FC050 -> 0x140423A70`) and timed completion converge on the same
+routine, so downstream evidence cannot separate them. That makes the *upstream*
+decision the only useful target, and `0x140430620` is the one place in the
+poller's own tile that calls `0x1403FC050`.
+
+### Complete pseudocode
+
+```text
+0x140430620(this /*app*/):
+  EnterCriticalSection(app + 0x28)
+  if app->[0x258] == 0:                    # 0x140430660, je 0x140430757
+      goto SHUTDOWN
+  if app->[0x248] != 0:                    # 0x14043066D
+      goto DONE
+  op      = app->[0x220]                   # 0x14043067A
+  closure = { fn = 0x1404305D0, arg = app } # 0x140430681/0x1404306C9
+  new_op  = schedule(op, closure, 1000 ms)  # 0x1404306F4 -> 0x140423B50
+  app->[0x248] = new_op                     # 0x140430704 -> 0x1400C67E0
+  goto DONE
+
+SHUTDOWN:                                   # 0x140430757
+  if app->[0x248] == 0: goto DONE
+  tmp = app->[0x248]                        # 0x140430772, retain at 0x14043078B
+  cancel(tmp)                               # 0x140430798 -> 0x1403FC050
+  app->[0x248] = 0                          # 0x1404307B0
+  app->[0x250] = 0                          # 0x1404307B7
+  goto DONE
+
+DONE:                                       # 0x1404307D3
+  LeaveCriticalSection(app + 0x28)
+```
+
+The two halves are mutually exclusive: non-zero `+0x258` may **arm**, zero
+`+0x258` may **cancel**. `0x140430620` never touches `+0x228` or `+0x238`.
+
+### The cancel branch, by pointer provenance
+
+```asm
+140430757  mov  rax, qword ptr [rdi + 0x248]
+14043075e  test rax, rax
+140430761  je   0x1404307d3
+140430763  mov  rcx, qword ptr [rdi + 0x220]     ; overwritten before the call
+140430772  mov  qword ptr [rbp - 0x19], rax      ; shared_ptr ptr = app->[0x248]
+140430776  mov  rax, qword ptr [rdi + 0x250]     ; control block
+14043078b  lock xadd dword ptr [rax + 8], esi
+140430798  call 0x1403fc050                      ; rdx = &that shared_ptr
+```
+
+So the argument to `0x1403FC050` is built from `app+0x248`/`app+0x250`. The
+`rcx` load from `+0x220` is dead for this call. Concluding "it cancels the
+operation at +0x220" from the nearby load would have been wrong; the retain at
+`0x14043078B` is what proves which slot is passed.
+
+```text
+0x140430798 cancels: app+0x248 / app+0x250
+branch:              0x140430667 `je 0x140430757`
+tested field:        byte ptr [app+0x258]
+expected value:      0
+```
+
+`0x140258` is initialised to **1** by the `ClientApplicationImpl` constructor
+`0x1404292E0` at `0x140429614`, alongside zeroing `+0x220`, `+0x228`, `+0x238`
+and `+0x248`. That initialisation sequence is what identifies the object family:
+the constructor also builds the two connection collections whose critical
+sections are at `+0x1F0` and `+0x268` with spin counts `0xFA0`, and the walk at
+`0x140431030` reads exactly those.
+
+### Correction to the slot model
+
+The previous documentation said `0x14042F960` establishes `+0x220`, `+0x228`,
+`+0x238` and `+0x248`. That is true of the *stores*, but it does not follow that
+all four are live in the poller's program. Only three functions in the whole
+image write `+0x248`:
+
+```text
+0x140429614  ctor          -> 0
+0x14042F960                -> (registration result)
+0x14042FBA0  replace-teardown -> 0
+0x140430620  this tick     -> new_op or 0
+```
+
+and the tick arms it only on the `+0x258 != 0` path. The 5 ms operation observed
+reaching `0x140423DD0` lives in `+0x238` and is **not** what this tick cancels.
+Treating `+0x238` and `+0x248` as the same operation was an unstated assumption
+and is retracted here.
+
+### `0x1403FC050` publishes no status
+
+```text
+0x1403FC050(rcx = context, rdx = &shared_ptr<callable>):
+  rcx  = *rcx
+  tmp  = *rdx
+  ctl  = *(rdx+8)
+  if ctl: lock xadd [ctl+8], 1
+  call 0x140423A70(rcx, &tmp)
+  release ctl
+```
+
+`r8` is unused, and `0x140423A70` reads no status operand before publishing. A
+cancellation therefore reaches the completion routine **indistinguishable** from
+a timeout. That is now proven from the callee's operand use rather than inferred
+from the shared callee identity.
+
+### What remains
+
+```text
+0x140430620 complete pseudocode                    CONFIRMED
+0x140430798 cancels app+0x248/+0x250               CONFIRMED
+cancellation branch tests [app+0x258] == 0         CONFIRMED
+[app+0x258] initialised to 1 by the ctor           CONFIRMED
+0x1403FC050 supplies no cancel/timeout status      CONFIRMED
+which operation 0x140423DD0 belongs to             UNKNOWN (1 dword of state)
+what sets [app+0x258] to 0 in the failing run      UNKNOWN
+whether the failing Close uses cancel or timeout   UNKNOWN
+0x1404245F0 closure registration site              UNKNOWN
+"connection" / "signature" effects                 UNKNOWN
+```
+
+**No server behaviour was changed and D4 was not sent.**

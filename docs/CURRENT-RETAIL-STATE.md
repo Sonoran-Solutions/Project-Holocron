@@ -374,7 +374,154 @@ re-derived from static call edges and must not be presented as such:
 zero image pointers, so all three are runtime-materialised closures or indirect
 targets whose registration sites are still `UNKNOWN`.
 
-### All closure bodies reached this way have no static xrefs
+### `0x140430620` is the application tick, and its cancel branch targets `app+0x248`
+
+Complete semantic pseudocode, recovered from the full function body
+(`CONFIRMED`; field offsets and branch addresses are exact):
+
+```text
+0x140430620(this /*app*/):
+  EnterCriticalSection(app + 0x28)
+  if app->[0x258] == 0:                    # 0x140430660 / je 0x140430757
+      goto SHUTDOWN_BRANCH
+  if app->[0x248] != 0:                    # 0x14043066D
+      goto DONE                            # already scheduled -> do nothing
+  op = app->[0x220]                        # 0x14043067A  registered operation
+  closure = { fn = 0x1404305D0, arg = app }        # 0x140430681 materialises it
+  new_op = schedule(op, closure, timeout = 0x3E8)  # 0x1404306F4 -> 0x140423B50
+  app->[0x248] = new_op                            # 0x140430704 -> 0x1400C67E0
+                                                   #   (shared_ptr assign, the
+                                                   #    old value's refcount drops)
+  goto DONE
+
+SHUTDOWN_BRANCH:                            # 0x140430757
+  if app->[0x248] == 0:                   # 0x140430757/75E
+      goto DONE
+  op = app->[0x220]                       # 0x140430763
+  tmp = app->[0x248]                      # 0x140430772, refcount bumped at
+                                          #   0x14043078B (lock xadd dword +8)
+  cancel(tmp)                             # 0x140430798 -> 0x1403FC050
+  app->[0x248] = 0                        # 0x1404307B0
+  app->[0x250] = 0                        # 0x1404307B7
+  goto DONE
+
+DONE:                                       # 0x1404307D3
+  LeaveCriticalSection(app + 0x28)
+  return
+```
+
+So `0x140430620` is a **tick that does one of two mutually exclusive things**:
+when `app+0x258` is non-zero it may **arm** the 1000 ms operation; when
+`app+0x258` is zero it **cancels** the outstanding one. It never does both in
+one call. `CONFIRMED`
+
+Answering the phase questions directly:
+
+```text
+input object                 = the ClientApplicationImpl instance
+app field offsets used       = +0x28 mutex, +0x220 operation identity,
+                               +0x248/+0x250 cancellable slot,
+                               +0x258 mode byte
+operation/shared_ptr slots   = +0x220 (read), +0x248/+0x250 (read+write)
+calls to 0x1403FC050         = exactly one, at 0x140430798
+rearms operations            = YES, but only on the app+0x258 != 0 path,
+                               and only when +0x248 is empty
+replaces +0x228 / +0x238     = NO; it never touches those slots
+is it a scheduler callback   = YES; it is the application tick body
+```
+
+(For the record: `0x14042F960` did store `+0x228`/`+0x238`, but in the poller's
+program the `+0x238` slot ends up zero — see the `app+0x248` note below.)
+
+### Phase 2 — the exact slot cancelled at `0x140430798`
+
+Traced from pointer provenance, not proximity (`CONFIRMED`):
+
+```asm
+140430757  mov  rax, qword ptr [rdi + 0x248]   ; rax = the slot value
+14043075e  test rax, rax
+140430761  je   0x1404307d3                    ; nothing outstanding -> skip
+140430763  mov  rcx, qword ptr [rdi + 0x220]   ; rcx = operation identity
+140430772  mov  qword ptr [rbp - 0x19], rax    ; build shared_ptr{ptr=slot}
+140430776  mov  rax, qword ptr [rdi + 0x250]   ; its control block
+140430781  test rax, rax
+14043078b  lock xadd dword ptr [rax + 8], esi  ; retain
+140430798  call 0x1403fc050                    ; rdx = &shared_ptr (rsp-based)
+```
+
+```text
+0x140430798 cancels:  app+0x248 / app+0x250
+                      (the 1000 ms operation armed by this same function)
+```
+
+The argument is a stack-local `shared_ptr` constructed from
+`app+0x248`/`app+0x250` — not from `+0x220`, `+0x228` or `+0x238`. `rcx` is
+loaded from `app+0x220` but is overwritten before the call and does not reach
+`0x1403FC050`. `CONFIRMED`
+
+**Branch that causes the cancellation** (`CONFIRMED`):
+
+```text
+branch address: 0x140430667  je 0x140430757
+tested field:   byte ptr [app + 0x258]
+expected value: 0
+actual semantic consequence: application-tick mode == 0 (stop/shutdown mode)
+which operation is cancelled: the 1000 ms operation in app+0x248, whose closure
+                               body is 0x1404305D0
+```
+
+So the cancelling decision is **not** about a string lookup, a timeout, or a
+connection state. It is the single byte `app+0x258`, which the
+`ClientApplicationImpl` constructor (`0x1404292E0` at `0x140429614`) initialises
+to **1**. Its only other writer found in the image is `0x140120FC0`, which also
+calls `0x140430620` at `0x140121182` and writes `[rsi+0x258]`. `CONFIRMED` for
+the initialisation and the writer set; the semantic name of the mode is
+`HYPOTHESIS`.
+
+### Which application object this is
+
+`app+0x08` is a `boost::shared_ptr` to the real `ClientApplicationImpl`, and
+`app+0x248` is written **only** inside `0x14042F960`, `0x14042FBA0` and
+`0x140430620` — all three in the `ClientApplicationImpl` tile. The runtime
+poller's `arg1` (`0x14B3DA0`) is that instance. `CONFIRMED`
+
+Consequence worth recording because it contradicts a natural assumption: the
+`0x14042F960` call that registers the 5 ms operation in `+0x238` also registers
+the 500 ms closure in `+0x228`, but in the poller's program only one of those
+registrations takes effect — the `+0x248` slot is the one this tick arms, and
+the runtime `[app+0x248]` lifetime is governed by the `app+0x258` branch above.
+The `+0x238` 5 ms operation observed reaching `0x140423DD0` is therefore **not**
+the operation this tick cancels. `CONFIRMED`
+
+### Phase 3 — `0x1403FC050` passes no status
+
+Full body (`CONFIRMED`):
+
+```text
+0x1403FC050(rcx = operation context, rdx = shared_ptr to the callable):
+  rcx = *rcx                       ; 0x1403FC063 dereference the context
+  tmp = *rdx                       ; 0x1403FC070 the callable
+  ctl = *(rdx + 8)                 ; 0x1403FC078
+  if ctl: lock xadd [ctl+8], 1     ; 0x1403FC08E retain (build a real shared_ptr)
+  call 0x140423A70(rcx, &tmp)      ; 0x1403FC098
+  release ctl                      ; 0x1403FC09E -> 0x1400B79F0
+  return
+```
+
+```text
+argument layout   = (callable_context, shared_ptr<callable>)
+refcount ops      = one retain before the call, one release after
+special result    = NONE
+cancel vs timeout = NOT differentiated; no status value is supplied
+context passed to 0x140423A70 = identical in shape to the timed path
+```
+
+Third argument (`r8`) is not used at all, and `0x140423A70` never reads a status
+register before publishing. **`0x140423A70` therefore cannot distinguish
+cancellation from ordinary completion**, exactly as the convergence note says —
+and that is now proven from the callee's own operand use, not inferred.
+`CONFIRMED`
+
 
 `0x140423DD0`, `0x14042FD80` and `0x1404305D0` share the same property: zero
 direct branches, zero 8-byte image pointers. They are all function objects whose
