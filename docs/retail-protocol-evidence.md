@@ -5138,3 +5138,70 @@ bound into a different operation. Resolving `0x140430800` is the shortest path
 to that answer.
 
 **No server behaviour was changed and D4 was not sent.**
+
+---
+
+## Evidence corrections from the callable-layout reconstruction (September 13)
+
+Three canonical descriptions predate the byte-for-byte registration
+reconstruction and are now wrong. They are corrected here so the notebook keeps
+the provenance of each mistake.
+
+### Correction A — `0x1404305D0` is the 500 ms callable, not the 5 ms one
+
+`CURRENT-RETAIL-STATE.md` said `0x14042F960` "arms that task with a 5 ms timeout
+and a second, 500 ms timeout on the same object", which reads as one task with
+two periods. The registrations are in fact two different operations with two
+different callable bodies:
+
+```text
+app+0x228 -> fn 0x1404305D0, timeout 500 ms   (site 0x14042FA39, r9d=0x1F4)
+app+0x238 -> fn 0x140430800, timeout   5 ms   (site 0x14042FB10, r9d=5)
+```
+
+The `app+0x238` identity is pinned by `0x14042FA9D lea rax,[rip+0xd5c]`, which
+materialises `0x140430800`. Describing `0x1404305D0` as "the 5 ms closure" is
+`SUPERSEDED`.
+
+### Correction B — `operation+0x2C` is a registration-time flag
+
+Earlier text called `+0x2C` a "wait-mode selector". That named the field after
+one of its readers. The origin is now proven:
+
+```asm
+14042FA23  mov  byte ptr [rsp + 0x20], 1      ; registration A
+14042FAFA  mov  byte ptr [rsp + 0x20], 1      ; registration B
+140459685  mov  byte ptr [rdi + 0x2c], al     ; factory stores it
+```
+
+So the field carries the flag argument supplied at registration. Both known
+registrations pass `1`, which is why the value measured at runtime was a
+constant `1` and why no writer was ever observed changing it during the loop —
+there is nothing to observe. Whether the flag's *meaning* is "this operation
+waits" is `HYPOTHESIS`; the dataflow is `CONFIRMED`.
+
+### Correction C — `operation+0x30` / `+0x38` are the callable and its context
+
+Earlier text annotated:
+
+```text
+lea rdx, [rsi+0x38]      ; result slot
+mov rcx, [rsi+0x30]      ; owner-visible context
+```
+
+The factory reconstruction shows `0x14045968C lea rbx,[rdi+0x30]` followed by
+`0x1404596C5 mov qword ptr [rbx], rax` storing the object returned by the
+callable builder `0x1402CB8D0`. `+0x30` is therefore the **stored callable**, and
+`+0x38` is its **context/subfield**, not a result slot and not an owner-visible
+context. Both old labels are `SUPERSEDED`.
+
+Consequently the label `0x140424860 = "publish/signal helper"` loses its
+support: it was inferred from those same two argument positions. It is demoted
+to `HYPOTHESIS` until `0x140424860` is reversed on its own terms.
+
+### What is unaffected
+
+`target+0x2D` as the FINISHED byte, written only at `0x140423B15`, is unaffected
+— that conclusion never depended on the `+0x30`/`+0x38` labels. The claim that
+`+0x2C` selects between the two arms of `0x140423DD0` also stands as a statement
+about the branch; only the field's *name* is withdrawn.

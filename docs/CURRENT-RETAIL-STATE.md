@@ -203,7 +203,7 @@ Runtime gate values at the first entry of the failing-direction run
 ```text
 [r8]            = 0x00000000        (the dword the entry compare reads)
 0x1523E58+0x28  = 0x00000005        (dword: wait quantum in ms)
-0x1523E58+0x2C  = 0x01              (byte: wait-mode selector)
+0x1523E58+0x2C  = 0x01              (byte: registration-time flag; see below)
 0x1523E58+0x2D  = 0x00              (byte: FINISHED flag, 0 = not finished)
 0x1523E58+0x00  = 0x1414B6761       (function table pointer, low bit set)
 0x1523E58+0x08  = 0x140430800
@@ -243,24 +243,34 @@ which is the `boost::bind` target stored in a `boost::detail::thread_data` objec
     ... jmp 0x1403FC4C0                    ; setting lookup, name "signature"
 ```
 
-`0x14042F960` arms that task with a **5 ms** timeout (`r9d=5` at its second
-registration call) and a second, **500 ms** timeout (`r9d=0x1F4`) on the same
-object. `CONFIRMED`
+`0x14042F960` arms that task in **`app+0x228` with a 500 ms timeout**
+(`r9d=0x1F4` at `0x14042FA39`) and arms a *different* callable in **`app+0x238`
+with a 5 ms timeout** (`r9d=5` at `0x14042FAFF`/`0x14042FB10`). These are two
+distinct operations with two distinct callable bodies — see the byte-for-byte
+table below. `CONFIRMED`
+
+```text
+app+0x228 -> fn 0x1404305D0 (body shown above), 500 ms
+app+0x238 -> fn 0x140430800,                    5 ms
+```
+
+Do **not** describe `0x1404305D0` as "the 5 ms callable". It is the 500 ms
+callable. The 5 ms callable is `0x140430800`. `CONFIRMED`
 
 Every timer registration site in the image is `0x140423B50`. Runtime witness of
 the startup registrations (`CONFIRMED`):
 
 ```text
 site 0x1404264B8  timeout 60000 ms   arg1 0x14B3C90
-site 0x14042FA39  timeout   500 ms   arg1 0x14B3DA0
-site 0x14042FB10  timeout     5 ms   arg1 0x14B3DA0
+site 0x14042FA39  timeout   500 ms   arg1 0x14B3DA0   -> app+0x228, fn 0x1404305D0
+site 0x14042FB10  timeout     5 ms   arg1 0x14B3DA0   -> app+0x238, fn 0x140430800
 site 0x140446693  timeout 60000 ms   arg1 0x14B3EB0   <- the historical instance
 ```
 
 The historical absolute address **`0x14B3EB0`** is one runtime instance of the
-object registered at site `0x140446693` (a 60 s registration); the 5 ms closure
-that reaches `0x140423DD0` belongs to `0x14B3DA0`. **Do not treat either address
-as identity**; the type is the identity. `CONFIRMED`
+object registered at site `0x140446693` (a 60 s registration); the 5 ms
+operation reaching `0x140423DD0` belongs to `0x14B3DA0`. **Do not treat either
+address as identity**; the type is the identity. `CONFIRMED`
 
 ### `0x140423B50` is the operation/timer factory, and `0x140423A70` is its completion routine
 
@@ -298,16 +308,28 @@ It acquires the owner's spinlock at `owner+0xA8` (`lock cmpxchg dword ptr
 
 ```asm
 140423af2  mov  rax, [rdi]           ; [rdi] = operation target
-140423af5  mov  rsi, [rax]           ; rsi  = the target
+140423af5  mov  rsi, [rax]           ; rsi  = the operation object
 140423af8  cmp  byte ptr [rsi+0x2d], 0
 140423afc  jne  0x140423b19          ; already finished -> skip
 140423afe  call 0x140fdb1c0          ; clock read
-140423b03  lea  rdx, [rsi+0x38]      ; result slot
+140423b03  lea  rdx, [rsi+0x38]      ; callable context/subfield (NOT a result slot)
 140423b07  lea  r8,  [rsp+0x28]
-140423b0c  mov  rcx, [rsi+0x30]      ; owner-visible context
-140423b10  call 0x140424860          ; publish the result
+140423b0c  mov  rcx, [rsi+0x30]      ; the stored callable (NOT an owner context)
+140423b10  call 0x140424860          ; see the corrected note below
 140423b15  mov  byte ptr [rsi+0x2d], 1   ; <-- the finish flag
 ```
+
+Field-role correction (`CONFIRMED`, from the factory reconstruction in the next
+subsection): `operation+0x30` is the **stored callable**, and
+`operation+0x38` is **that callable's context/subfield**. The earlier labels
+"owner-visible context" for `+0x30` and "result slot" for `+0x38` are
+`SUPERSEDED` — they predate the callable-layout evidence and are not merely
+imprecise, they are wrong.
+
+`0x140424860` was previously labelled a "publish/signal helper". That label is
+now `HYPOTHESIS` only: it was inferred from argument positions before the
+callable layout was known, and the helper itself has not been reversed. Do not
+rely on it.
 
 So:
 
@@ -316,11 +338,14 @@ So:
   (`cmp byte ptr [r8+0x2d],0 / jne 0x140423FA9`) and its own guard at
   `0x140423af8`. When it is 0 the operation has not finished. `CONFIRMED`
   (writer + reader + effect); the earlier "semantics UNKNOWN" is superseded.
-* **`target+0x2C` selects the wait mode.** `0x140423DD0` tests it with
-  `cmp byte ptr [rax+0x2c],0`; non-zero takes the timed-wait arm that calls
-  `0x140423FF0` with `r8d = [target+0x28]`, zero takes the arm that calls
-  `0x140423A70` directly. What the two modes *mean* is `HYPOTHESIS`; that it
-  selects between those two arms is `CONFIRMED`.
+* **`target+0x2C` is the registration-time flag.** Its origin is `CONFIRMED`:
+  both `0x14042F960` registrations pass `[rsp+0x20] = 1` (`0x14042FA23`,
+  `0x14042FAFA`) and the factory stores it verbatim at `0x140459685`
+  (`mov byte ptr [rdi+0x2c], al`). `0x140423DD0` tests it with
+  `cmp byte ptr [rax+0x2c],0` and the non-zero arm calls `0x140423FF0` with
+  `r8d = [target+0x28]`. Calling this field a "wait-mode selector" named it
+  after one of its consumers; that label is `SUPERSEDED`. The field is a flag
+  supplied at registration whose semantic meaning is `UNKNOWN`/`HYPOTHESIS`.
 * **`target+0x28` is the wait quantum in milliseconds** (measured 5), read at
   `0x140423EEC` and clamped to a 1 ms floor. `CONFIRMED`
 
