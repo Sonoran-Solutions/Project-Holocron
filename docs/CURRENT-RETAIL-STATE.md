@@ -595,7 +595,24 @@ This supersedes "ClientApplicationImpl-related". The earlier assumption that the
 constructor at `0x1404292E0` also zeroes `+0x220`/`+0x228`/`+0x238`/`+0x248` and
 sets `+0x258 = 1`, which is why the two were conflated.
 
-### The list at `boundobj+0x260` is a lock-free deferred-destruction stack
+### The list at `boundobj+0x260` is a lock-free deferred-retirement stack
+
+**Terminology (corrected).** This section previously called `+0x260` a
+"deferred-destruction stack" holding "objects awaiting destruction". That label
+was stronger than the evidence. What the bytes prove is a lock-free intrusive
+LIFO whose elements are handed to a deferred processing step. At the time of the
+correction none of the following had been resolved:
+
+```text
+0x14043B5D0 semantics             UNKNOWN
+element vtable+0x28 target        UNKNOWN
+element vtable+0x30 target        UNKNOWN
+element class                     UNKNOWN
+```
+
+so the queue is described as a **deferred-retirement** / **deferred-reclamation**
+stack. "Destruction stack" and "objects awaiting destruction" are used only where
+a destruction semantic has actually been resolved.
 
 `CONFIRMED`. The producer is `0x140406530`:
 
@@ -617,8 +634,8 @@ sets `+0x258 = 1`, which is why the two were conflated.
 
 The consumer in `0x140430800` is the exact mirror: it atomically exchanges the
 head with `NULL` and walks the list via `element+0x30`. So `boundobj+0x260` is a
-**lock-free LIFO stack of objects awaiting destruction, with the intrusive link
-embedded at object offset `0x30`**.
+**lock-free LIFO stack of objects queued for deferred retirement, with the
+intrusive link embedded at object offset `0x30`**.
 
 Key consequences:
 
@@ -630,15 +647,17 @@ pop-all           = one lock cmpxchg head -> NULL
 producer returns  = (old head == NULL), i.e. "was the stack empty before me?"
 ```
 
-That return value is the arming signal: the caller uses "I pushed onto an empty
-stack" to decide whether a drain must be scheduled. `HYPOTHESIS` (strongly
-supported by shape; the caller's use of `al` was not followed to its branch).
+The return value `(old head == NULL)` is `CONFIRMED` as a value. The earlier
+claim that it is the arming signal — "the caller uses 'I pushed onto an empty
+stack' to decide whether a drain must be scheduled" — is `RETRACTED`: neither
+caller reads `al`. It is **not** evidence of timer arming.
 
-A second, structurally identical producer exists at `0x14043A390`, which also
-does a lock `cmpxchg` of `+0x260` but pairs it with a *different* queue at
-`+0x168`/`+0x164` on another manager instance. At least two manager instances use
-this same deferred-destroy idiom, so the pattern is a reusable one rather than a
-one-off. `CONFIRMED` that the idiom repeats; `UNKNOWN` how many instances exist.
+A second, structurally similar `+0x260` CAS loop exists at `0x14043A390`
+(fn `0x14043A390 - 0x14043A79B`). It is **not** a second *manager instance*:
+resolving vtable `0x1414B69A8` yields `omega::PacketSocket`, so that `+0x260` is a
+different queue on a different class that merely shares the offset number.
+`CONFIRMED` that the lock-free LIFO idiom is reused across the `omega`
+socket/manager family; `UNKNOWN` how many instances share it.
 
 ### Correction: `0x14043B5D0` is a real image function, and the "one call per element" label was premature
 
@@ -656,18 +675,19 @@ is the next required step.
 
 ### The 5 ms timer is a coalescing drain deadline
 
-`0x140430800` performs no polling at all: it steals and destroys. Combined with
-the producer's `sete al` (armed only when the stack was empty), the 5 ms period
-reads as **a coalescing window**: the first retirement arms the timer, further
-retirements pile onto the stack during the window, and 5 ms later the whole
-batch is drained in one pass. `0x140430800` does not rearm itself (`CONFIRMED`).
+`0x140430800` performs no polling at all: it steals and retires. The 5 ms period
+therefore reads as **a coalescing window**: retirements accumulate on the stack
+and one drain pass collects the batch. `0x140430800` does not rearm itself
+(`CONFIRMED`).
 
 ```text
-5 ms operation = deferred-destruction drain deadline (coalescing)
+5 ms operation = deferred-retirement drain deadline (coalescing)
 ```
 
-`HYPOTHESIS` for the coalescing reading; `CONFIRMED` that the callable only
-drains and never polls, and that it does not rearm itself.
+`HYPOTHESIS` for the coalescing reading. Note it is **not** supported by the
+producer's `sete al`: that return value is discarded by both callers. The
+`CONFIRMED` parts are only that the callable drains without polling and never
+rearms itself.
 
 ### The operation object produced by the factory, byte-for-byte
 

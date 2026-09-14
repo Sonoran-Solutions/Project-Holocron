@@ -5512,3 +5512,28 @@ here. What *has* changed is that the elements are now known to be objects being
 connection/route teardown plausible but still unproven.
 
 **No server behaviour was changed and D4 was not sent.**
+
+## Terminology correction: `+0x260` is a deferred-retirement stack (September 13)
+
+Two labels carried by the previous checkpoint overstated what had been proven and
+are corrected here before any new analysis builds on them.
+
+```text
+"deferred-destruction stack" / "objects awaiting destruction" for +0x260
+    -> stronger than the evidence. At that point 0x14043B5D0 semantics and both
+       element virtual slots were UNKNOWN, so destruction was not established.
+    -> replaced by "deferred-retirement stack" / "deferred-reclamation stack".
+
+"the producer's sete al is the arming signal for the 5 ms drain"
+    -> retracted. The producer does return (old_head == NULL), but no caller
+       reads it; both call sites clobber eax immediately.
+
+"5 ms coalescing window"
+    -> remains HYPOTHESIS, and is no longer justified by the producer's return
+       value. It rests only on the drain being poll-free and not rearming itself.
+```
+
+The `boundobj+0x260` producer and consumer, and the object identity of `boundobj`
+itself, are unaffected by this correction and remain as recorded.
+
+**No server behaviour was changed and D4 was not sent.**
