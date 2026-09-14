@@ -42,7 +42,21 @@ transitive path to 0x1404245F0 / 0x140434430                           UNKNOWN
 
 ---
 
-## The `0x1404245F0` teardown path — newly recovered (this pass)
+## The `0x1404245F0` path — newly recovered (this pass)
+
+```text
+0x1404245F0 = per-owner deferred element drain (destroys list elements)
+              materialised ONLY at 0x1403FC11A inside 0x1403FC0B0
+              registered through 0x140423B50 with r9d = 0 (no timeout)
+              bound object = the owner                                      CONFIRMED
+0x140434430 = vtable+0x08 of omega::ObjectSurrogateEventConnectionOpen,
+              a notifier over [[this+0x18]+0x100]                           CONFIRMED identity
+0x140434430 -> 0x14040AEC0 dispatch                                         UNKNOWN
+first non-cleanup decision that starts this teardown                        UNKNOWN
+primary failure decision vs secondary cleanup                               UNKNOWN
+```
+
+---
 
 The causal boundary remains upstream and was pushed back one layer this pass.
 `0x1404245F0` is now identified concretely.
