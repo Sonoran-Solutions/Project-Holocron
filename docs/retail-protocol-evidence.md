@@ -5308,3 +5308,98 @@ what wires 0x140430800's list (boundobj+0x260)  UNKNOWN
 ```
 
 **No server behaviour was changed and D4 was not sent.**
+
+---
+
+## CORRECTION: two overclaims about `0x140430800` (September 13)
+
+### Correction A — the function extent, and why "51-byte leaf" was wrong
+
+The previous section stated both of these at once:
+
+```text
+0x140430800 is a 51-byte self-contained leaf
+.pdata extent 0x140430800-0x140430833
+```
+
+and then printed a body that continues past `0x140430833` and ends at
+`0x14043087E ret`. Those two statements cannot both hold. The second is right.
+
+Reading the exception directory directly gives three consecutive records:
+
+```text
+Begin 0x140430800  End 0x140430833  UnwindInfo 0x14178AB18  flags=0x0A
+Begin 0x140430833  End 0x140430874  UnwindInfo 0x14184B350  flags=0x05
+Begin 0x140430874  End 0x14043087F  UnwindInfo 0x14184B364  flags=0x00
+```
+
+`flags=0x05` on the middle record is `UNW_FLAG_EHANDLER|UNW_FLAG_CHAININFO` with
+`UNW_FLAG_CHAININFO` set — the bit value 4. The middle record is a **chained
+unwind fragment of the same function**, not a separate function. The logical
+function is `0x140430800`–`0x14043087F` (127 bytes) with a shared epilogue at
+`0x140430874`.
+
+The error came from treating every `.pdata` record as a function boundary. In
+this image chained records are common, so any tool that enumerates
+`RUNTIME_FUNCTION` entries as functions (including `funcs.py` in this
+repository's scratch helpers) will report a single function as two or three.
+Function extents derived that way must have the chain flag checked first. That
+is a tool-usage correction, not a new fact about the binary.
+
+Terminology corrected: `0x140430800` is **not** a leaf. It issues a direct call
+and an indirect call per element. A precise description is *a short non-leaf
+routine that drains an intrusive list*.
+
+### Correction B — "no path to `0x1404245F0`" was not established
+
+The previous section concluded:
+
+```text
+0x140430800 -> 0x1404245F0 = NO
+```
+
+and described the two functions as unrelated. What the disassembly actually
+supports is narrower:
+
+```text
+DIRECT edge 0x140430800 -> 0x1404245F0      DISPROVEN
+TRANSITIVE relationship                     UNKNOWN
+```
+
+`0x140430800` calls `0x14043B5D0` and one indirect target, `element vtable+0x30`.
+Neither callee was resolved. A transitive path could in principle run through
+either, and the historical chain was observed with wrapper frames that a static
+call graph does not show. Equating "no direct call" with "no path" is the same
+class of error as the retracted `0x1403FC050 -> 0x1404245F0` edge in reverse:
+this time inferring absence rather than presence from insufficient resolution.
+
+The same correction applies to `0x140434430`:
+
+```text
+DIRECT edge 0x140430800 -> 0x140434430      not present in the body
+TRANSITIVE relationship                     UNKNOWN
+```
+
+### Terminology also corrected
+
+Two labels were assigned from call position and are withdrawn to `HYPOTHESIS`:
+
+```text
+0x14043B5D0          "per-element teardown"      HYPOTHESIS
+element vtable+0x30  "virtual destructor"        HYPOTHESIS
+```
+
+Neither callee body had been read when the labels were written. They must be
+resolved before either name is used again.
+
+### What still stands from the previous section
+
+```text
+0x140430800 body (127 bytes, three chained unwind records)   CONFIRMED
+it atomically steals the list at boundobj+0x260 with CAS      CONFIRMED
+link embedded at element+0x30, base = link-0x30               CONFIRMED
+exactly two calls per element                                 CONFIRMED
+it does not rearm itself                                      CONFIRMED
+callee semantics                                              UNKNOWN
+transitive reachability to the historical chain               UNKNOWN
+```

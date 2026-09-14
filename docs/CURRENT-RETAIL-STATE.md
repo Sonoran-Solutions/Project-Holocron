@@ -437,9 +437,32 @@ callable whose body is **`0x1404305D0`**, `fntable = 0x1414B6771`, timeout
 
 ### `0x140430800` — the 5 ms callable — complete body
 
-`0x140430800` is a **51-byte, self-contained leaf function** (`.pdata` extent
-`0x140430800`–`0x140430833`; no branch anywhere in the image targets it or its
-interior). Full body (`CONFIRMED`):
+**Function extent (`CONFIRMED`, corrected).** The tail of this function is
+covered by **three chained `RUNTIME_FUNCTION` records**, not three functions:
+
+```text
+Begin 0x140430800  End 0x140430833  UnwindInfo 0x14178AB18  flags=0x0A (EHANDLER)
+Begin 0x140430833  End 0x140430874  UnwindInfo 0x14184B350  flags=0x05 (CHAININFO)
+Begin 0x140430874  End 0x14043087F  UnwindInfo 0x14184B364  flags=0x00 (leaf epilogue)
+```
+
+`0x14184B350` has `UNW_FLAG_CHAININFO` set, so the middle record is a **chained
+unwind fragment of the same function**, not a separate one. The logical function
+is therefore **`0x140430800`–`0x14043087F` (127 bytes)** with shared epilogues.
+
+An earlier statement in this document said "51-byte self-contained leaf; `.pdata`
+extent `0x140430800`–`0x140430833`" and then printed a body running to
+`0x14043087E ret`. That was self-contradictory and is `SUPERSEDED`. The cause was
+treating each `.pdata` record as a function boundary; chained records must be
+followed. `tools/…/funcs.py` reports each record separately, so its
+`containing()` output cannot be used as a function extent without checking the
+chain flag.
+
+**Correct terminology:** `0x140430800` is **not** a leaf function. It makes two
+kinds of call. It is best described as *a short non-leaf routine that drains an
+intrusive list*.
+
+Full body (`CONFIRMED`):
 
 ```asm
 140430800  mov  qword ptr [rsp+0x18], rsi
@@ -447,23 +470,23 @@ interior). Full body (`CONFIRMED`):
 140430806  sub  rsp, 0x20
 14043080A  prefetchw byte ptr [rcx+0x260]
 140430811  xor  esi, esi
-140430813  mov  rdi, qword ptr [rcx+0x260]        ; <-- retry label
+140430813  mov  rdi, qword ptr [rcx+0x260]         ; <-- retry label
 14043081A  mov  rax, rdi
 14043081D  lock cmpxchg qword ptr [rcx+0x260], rsi ; atomically take the list
 140430826  jne  0x140430813                        ; CAS retry
 140430828  test rdi, rdi
-14043082B  je   0x140430874                        ; nothing to do -> return
+14043082B  je   0x140430874                        ; nothing to do -> epilogue
 14043082D  add  rdi, -0x30                         ; node -> element base
 140430831  je   0x140430874
 140430833  mov  qword ptr [rsp+0x38], rbx          ; loop: save rbx
 140430840  mov  rbx, qword ptr [rdi+0x30]          ; next link
 140430844  xor  r8d, r8d
 140430847  mov  rcx, rdi
-14043084A  call 0x14043B5D0                        ; per-element teardown
+14043084A  call 0x14043B5D0                        ; per-element call #1
 14043084F  mov  rax, qword ptr [rdi]
 140430852  mov  rcx, rdi
 140430855  mov  rax, qword ptr [rax+0x30]          ; vtable slot +0x30
-140430859  call qword ptr [rip+0xf3a461]           ; thunk 0x14136ACC0
+140430859  call qword ptr [rip+0xf3a461]           ; per-element call #2 (indirect)
 14043085F  test rbx, rbx
 140430862  lea  rdi, [rbx-0x30]
 140430866  cmove rdi, rsi
@@ -489,62 +512,61 @@ retry:
     if rdi == 0:                      goto done
     loop:
         rbx = rdi->[0x30]                            # next link
-        teardown_element(rdi, 0)                     # 0x14043B5D0
-        (*(this = rdi)->vtable[0x30])(rdi)           # virtual destructor
+        per_element_call_1(rdi, 0)                   # 0x14043B5D0
+        per_element_call_2(rdi)                      # element vtable+0x30
         rdi = rbx ? rbx - 0x30 : NULL
         if rdi: goto loop
 done:
     return
 ```
 
-Semantic reading (`CONFIRMED` from the code shape):
+Reading (`CONFIRMED` from the code shape):
 
-* The function **atomically detaches an intrusive singly-linked list** from
-  `boundobj+0x260` using `lock cmpxchg` in a retry loop, storing `NULL`.
-* It then **destroys every element** of the stolen list: one non-virtual
-  teardown call (`0x14043B5D0`) followed by a virtual call through the element's
-  own `vtable+0x30`.
-* The `-0x30` / `+0x30` pair is the standard MSVC intrusive-list idiom: the link
-  is embedded at offset `0x30`, so the node pointer is `&element->link` and the
-  element base is `node - 0x30`.
-* It is a **leaf** function.
-
-Answering the phase questions:
+* **atomically detaches** an intrusive singly-linked list from `boundobj+0x260`
+  with a `lock cmpxchg` retry loop, storing `NULL`;
+* walks the stolen list and issues exactly **two calls per element**;
+* the `-0x30` / `+0x30` pair is the standard MSVC intrusive-list idiom: the link
+  is embedded at offset `0x30`, so the stored node pointer is `&element->link`
+  and the element base is `link - 0x30`.
 
 ```text
-return value      = none (void); the ret is shared with 0x140430833
-callees           = 0x14043B5D0 (direct), element vtable+0x30 (indirect)
+return value      = void; epilogue at 0x140430874 is shared
+callees           = 0x14043B5D0 (direct) and element vtable+0x30 (indirect)
 mutation          = boundobj+0x260 := NULL
-locks             = one lock-prefixed CAS, no acquired lock held across calls
-container traverse= yes: intrusive singly-linked list at boundobj+0x260
-destruction       = yes: every stolen element is torn down and its virtual
-                    destructor invoked
-fields read       = boundobj+0x260; per element +0x30 and element vtable
+locks             = one lock-prefixed CAS; no lock held across the two calls
+fields read       = boundobj+0x260; per element +0x30 and its vtable
 fields written    = boundobj+0x260 := 0
 ```
 
-`CONFIRMED`
+The semantics of the two per-element calls, and therefore the identity of the
+elements, are **UNKNOWN** and are the live question. `0x14043B5D0` was earlier
+labelled "per-element teardown" and the indirect call "virtual destructor"; both
+labels are `HYPOTHESIS` only, derived from call position, and are withdrawn
+pending the callee bodies.
 
-### `0x140430800` does NOT reach `0x1404245F0`
+### Relation of `0x140430800` to the historical teardown chain
 
-`0x140430800` is a leaf. Its only direct callee is `0x14043B5D0` and its only
-indirect callee is the element's `vtable+0x30`. There is no path from it to
-`0x1404245F0`, `0x140434430`, `0x14040AEC0` or the Close producer.
+The previous statement `0x140430800 -> 0x1404245F0 = NO` and the label
+"unrelated" were **stronger than the evidence**. Corrected classification:
 
 ```text
-0x140430800 -> 0x1404245F0   = NO     CONFIRMED (leaf function; no such callee)
+0x140430800 -> 0x1404245F0   DIRECT edge:              DISPROVEN (no direct call)
+0x140430800 -> 0x1404245F0   TRANSITIVE relationship:  UNKNOWN
+0x140430800 -> 0x140434430   DIRECT edge:              not present in this body
+0x140430800 -> 0x140434430   TRANSITIVE relationship:  UNKNOWN
 ```
 
-The historical runtime chain remains separate and unexplained by this function.
-`CONFIRMED` for the absence of the edge; the mechanism producing the historical
-chain is `UNKNOWN`.
+Only the direct-edge statements follow from the disassembly. Transitive
+reachability requires resolving `0x14043B5D0` and the element `vtable+0x30`
+targets, which has not been done. `CONFIRMED` for the direct edges; `UNKNOWN`
+for transitivity.
 
 ### `0x140430800` does not rearm itself
 
-The operation is **one-shot** per invocation of this callable. Nothing in the
-body re-registers, re-arms or reschedules anything: it only steals and destroys
-a list and returns. Whether the *framework* re-arms the operation around it is
-`UNKNOWN`, but the callable itself does not. `CONFIRMED` for the callable.
+Nothing in the body reschedules, re-registers or re-arms anything: it steals a
+list, issues the two calls per element, and returns. Whether the surrounding
+framework re-arms the operation is `UNKNOWN`; the callable itself is one-shot.
+`CONFIRMED`
 
 ### The operation object produced by the factory, byte-for-byte
 
