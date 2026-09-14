@@ -5513,27 +5513,651 @@ connection/route teardown plausible but still unproven.
 
 **No server behaviour was changed and D4 was not sent.**
 
-## Terminology correction: `+0x260` is a deferred-retirement stack (September 13)
+## The `+0x260` elements are `omega::PacketSocket` (September 13)
 
-Two labels carried by the previous checkpoint overstated what had been proven and
-are corrected here before any new analysis builds on them.
+This pass was asked to identify what object is retired onto
+`ObjectManagerImpl+0x260` and why. It resolved the element class and both virtual
+slots the producer and the drain invoke, and in doing so corrected two labels
+carried by the previous checkpoint.
+
+### Terminology retraction from the previous checkpoint
 
 ```text
-"deferred-destruction stack" / "objects awaiting destruction" for +0x260
-    -> stronger than the evidence. At that point 0x14043B5D0 semantics and both
-       element virtual slots were UNKNOWN, so destruction was not established.
-    -> replaced by "deferred-retirement stack" / "deferred-reclamation stack".
+"+0x260 is a deferred-destruction stack of objects awaiting destruction"
+    -> was stronger than the evidence at the time: 0x14043B5D0 and both
+       virtual slots were UNKNOWN
+    -> replaced by "deferred-retirement stack" until destruction semantics
+       were proved (they now have been, see below)
 
-"the producer's sete al is the arming signal for the 5 ms drain"
-    -> retracted. The producer does return (old_head == NULL), but no caller
-       reads it; both call sites clobber eax immediately.
-
-"5 ms coalescing window"
-    -> remains HYPOTHESIS, and is no longer justified by the producer's return
-       value. It rests only on the drain being poll-free and not rearming itself.
+"5 ms coalescing window" -> remains HYPOTHESIS
 ```
 
-The `boundobj+0x260` producer and consumer, and the object identity of `boundobj`
-itself, are unaffected by this correction and remain as recorded.
+The specific claim that the producer's `sete al` arms the drain is retracted
+outright; see "the producer's AL is discarded".
 
-**No server behaviour was changed and D4 was not sent.**
+### Method and tooling
+
+A read-only static toolkit was written for this image (`tools/retail-re-toolkit.py`,
+`tools/resolve-indirect.py`, `tools/callgraph.py`). Three findings about the
+image itself were needed before any of the analysis below was trustworthy, and
+each of them had produced plausible-looking nonsense beforehand:
+
+1. **VA -> file offset must include the section `VirtualAddress`.**
+   `file_off = PointerToRawData + (va - (ImageBase + VirtualAddress))`. `.text`
+   here is VA `0x1000` / raw `0x400`, `.rdata` `0x1369000` / `0x1367a00`,
+   `.data` `0x1a8c000` / `0x1a8aa00`. Using `va - ImageBase` silently reads the
+   wrong bytes.
+
+2. **`.pdata` holds several `RUNTIME_FUNCTION` entries per `BeginAddress`**
+   (chained unwind info). The function extent is the **maximum** `EndAddress`
+   over those entries, not the first. Taking the first truncates functions and
+   splits them into apparently separate regions. `.pdata` boundaries are
+   required for correct disassembly: a flat sweep of `.text` desynchronises and
+   loses real call sites.
+
+3. **The IAT is loader-filled; the on-disk dword is a stale RVA, not a
+   pointer.** For example the `MemoryMan.dll!mm_alloc` slot `0x141369DF8` holds
+   `0x1A86414` on disk, which is an RVA into the allocator name table, not an
+   address. Reading it as a 64-bit pointer yields a nonexistent address. Import
+   identity must come from the import descriptors.
+
+With those fixed, xref completeness was established by disassembling every
+`.pdata` function from its own entry point:
+
+```text
+callers of 0x140406530 (the producer) = exactly 2
+    0x14043B53D  in 0x14043B460 - 0x14043B5C6
+    0x14043E045  in 0x14043DE10 - 0x14043E091
+```
+
+This confirms the previous report's list is complete across the image — there
+are no additional direct callers, and no third caller was found.
+
+### The producer and consumer, byte-for-byte
+
+Producer `0x140406530`, fn `0x140406530 - 0x140406589` (59 bytes). The full body:
+
+```asm
+140406530  mov  qword ptr [rsp + 0x10], rbx
+140406535  push rdi
+140406536  sub  rsp, 0x20
+14040653a  mov  rax, qword ptr [rdx]            ; rax = element->vtable
+14040653d  mov  rbx, rdx                        ; rbx = element
+140406540  mov  rdi, qword ptr [rcx + 8]        ; rdi = manager
+140406544  mov  rcx, rdx                        ; rcx = element (this for the virt)
+140406547  mov  rax, qword ptr [rax + 0x28]     ; element->vtable[0x28]
+14040654b  call qword ptr [rip + 0xf6476f]      ; -> 0x14043DB20
+140406551  add  rbx, 0x30                       ; node = element + 0x30
+140406555  prefetchw byte ptr [rdi + 0x260]
+140406560  mov  rcx, qword ptr [rdi + 0x260]    ; <-- CAS retry label
+140406567  mov  qword ptr [rbx], rcx            ; node->next = head
+14040656a  mov  rax, rcx
+14040656d  lock cmpxchg qword ptr [rdi + 0x260], rbx
+140406576  jne  0x140406560
+140406578  mov  rbx, qword ptr [rsp + 0x38]
+14040657d  test rcx, rcx
+140406580  sete al                             ; al = (old_head == NULL)
+140406583  add  rsp, 0x20
+140406587  pop  rdi
+140406588  ret
+```
+
+```c
+// rcx = manager, rdx = element
+bool retire(void* manager, void* element) {
+    void* mgr = *(void**)(manager + 8);
+    element->vtable[0x28](element);            // 0x14043DB20
+    Node* node = (Node*)((char*)element + 0x30);
+    Node* old;
+    do {
+        old = *(Node**)((char*)mgr + 0x260);
+        node->next = old;
+    } while (!CAS((Node**)((char*)mgr + 0x260), old, node));
+    return old == NULL;
+}
+```
+
+Consumer `0x140430800`, fn `0x140430800 - 0x140430833` (33 bytes), extended to
+`0x14043087F` to include the walk:
+
+```asm
+140430800  mov  qword ptr [rsp + 0x18], rsi
+140430805  push rdi
+140430806  sub  rsp, 0x20
+14043080a  prefetchw byte ptr [rcx + 0x260]
+140430811  xor  esi, esi
+140430813  mov  rdi, qword ptr [rcx + 0x260]    ; <-- CAS retry label
+14043081a  mov  rax, rdi
+14043081d  lock cmpxchg qword ptr [rcx + 0x260], rsi   ; head := NULL
+140430826  jne  0x140430813
+140430828  test rdi, rdi
+14043082b  je   0x140430874
+14043082d  add  rdi, -0x30                      ; element = node - 0x30
+140430831  je   0x140430874
+140430833  mov  qword ptr [rsp + 0x38], rbx
+140430840  mov  rbx, qword ptr [rdi + 0x30]     ; next = element->[0x30]
+140430844  xor  r8d, r8d                        ; r8d = 0
+140430847  mov  rcx, rdi                        ; rcx = element
+14043084a  call 0x14043b5d0                     ; per-pass flush
+14043084f  mov  rax, qword ptr [rdi]            ; element->vtable
+140430852  mov  rcx, rdi
+140430855  mov  rax, qword ptr [rax + 0x30]     ; element->vtable[0x30]
+140430859  call qword ptr [rip + 0xf3a461]      ; -> 0x14043DBF0
+14043085f  test rbx, rbx
+140430862  lea  rdi, [rbx - 0x30]
+140430866  cmove rdi, rsi
+14043086a  test rdi, rdi
+14043086d  jne  0x140430840
+14043086f  mov  rbx, qword ptr [rsp + 0x38]
+140430874  mov  rsi, qword ptr [rsp + 0x40]
+140430879  add  rsp, 0x20
+14043087d  pop  rdi
+14043087e  ret
+```
+
+```c
+// rcx = manager
+void drain(void* manager) {
+    Node* head;
+    do { head = *(Node**)((char*)manager + 0x260); }
+    while (!CAS((Node**)((char*)manager + 0x260), head, NULL));
+    if (!head) return;
+    void* element = (char*)head - 0x30;
+    while (element) {
+        Node* next = *(Node**)((char*)element + 0x30);
+        flush(element, /*reset=*/0);            // 0x14043B5D0, r8d = 0
+        element->vtable[0x30](element);         // 0x14043DBF0
+        element = next ? (char*)next - 0x30 : NULL;
+    }
+}
+```
+
+### Caller A, `0x14043B460` (166 bytes)
+
+Containing function boundaries: `0x14043B460 - 0x14043B5C6`. It is a method of
+`omega::PacketSocket` (`rbx` is `this`; it drives `[rbx+0x168]`, `[rbx+0x164]`,
+`[rbx+0x170]`, `[rbx+0x180]`). Reconstructed control flow:
+
+```c
+// this = rcx (PacketSocket), arg2 = rdx (a PacketSocket), arg3 = r8,
+// arg4 = r9d
+if (0x140414BD0(this) != 4) goto epilogue;      // state gate
+
+rec = mm_alloc(0x20);                            // 0x14043B499/0x14043B4A8
+if (!rec) { throw std::bad_alloc(); }            // 0x14043B593 path
+
+// pull a reference out of arg2: *arg2 is an intrusive_ptr
+// (*arg2)->vtable[0x28] is invoked (a virtual on the referenced object)
+// and the result is moved into a 0x20-byte local record
+ctx = { *arg2 };
+if (ctx) ctx->vtable[0x28](ctx);
+
+rec = 0x14043F9F0(rec, &ctx, arg3, arg4);        // build the 0x20-byte record
+
+// push rec onto *this*'s own lock-free stack at +0x168 (CAS loop)
+do { old = this->[0x168]; rec->[0] = old; }
+while (!CAS(&this->[0x168], old, rec));
+
+if (old != NULL) goto charge;                    // stack was NOT empty
+
+// stack WAS empty: retire-once gate on this, then enqueue for retirement
+if (CAS(&this->[0x164], 0, 1) != 0) goto charge; // only one thread wins
+{
+    PacketSocket* pkt = *(PacketSocket**)(this + 0x8);   // 0x14043B52F
+    void* mgr         = *(void**)(pkt + 0xD8);           // 0x14043B536
+    producer(mgr, this);                                 // 0x14043B53D
+}
+
+charge:
+total = atomic_add(&this->[0x170], arg3->[0x10]);
+if (total >= 0x100000 && this->[0x180] == 1)
+    0x14043B5D0(this, /*r8b=*/1);               // flush
+```
+
+Argument provenance at the call, traced explicitly rather than from register
+names:
+
+```text
+RCX at 0x14043B53D = *(void**)(*(PacketSocket**)(this + 0x8) + 0xD8)
+RDX at 0x14043B53D = this                      (the PacketSocket itself)
+RBX / object ultimately queued = this
+manager = the producer re-reads [rcx+8] internally, so the object reaching
+          the CAS at +0x260 is *this*
+```
+
+### Caller B, `0x14043DE10` (281 bytes)
+
+Containing function boundaries: `0x14043DE10 - 0x14043E091`. It is the twin of
+caller A with the same three-instruction call sequence and the same gate, but a
+different trigger condition:
+
+```asm
+; caller A  0x14043B52F .. 0x14043B53D
+14043B52F  mov  rcx, qword ptr [rax + 0xD8]
+14043B533  mov  rdx, rbx
+14043B53D  call 0x140406530
+
+; caller B  0x14043E037 .. 0x14043E045
+14043E037  mov  rax, qword ptr [rdi + 8]
+14043E03E  mov  rcx, qword ptr [rax + 0xD8]
+14043E045  call 0x140406530
+```
+
+In caller B (`rdi` = the socket object) the surrounding logic is:
+
+```c
+if (0x140414BD0(rdi) != 4) goto out;
+if (rdi->[0x98] != 0) goto other;               // already in this state?
+rdi->[0x98] = 1;
+if (CAS(&rdi->[0x164], 0, 1) != 0) goto out;    // retire-once gate
+{
+    void* pkt = *(void**)(rdi + 8);
+    void* mgr = *(void**)(pkt + 0xD8);
+    producer(mgr, rdi);                          // 0x14043E045
+}
+out:
+(*rdi->[0x40])->vtable[0x118](rdi->[0x40], arg2);   // 0x14043E04A
+```
+
+Both callers therefore retire the *same* thing: the object that reached state
+`4`, whose `[+0x98]` discriminator selects a one-shot transition, gated by the
+same `cmpxchg dword ptr [obj+0x164], 1`. **Same concrete class, not different
+subclasses.**
+
+```text
+caller A 0x14043B53D  queued object = this (PacketSocket), gated on the
+                      [+0x168] stack transitioning empty -> non-empty
+caller B 0x14043E045  queued object = rdi (the same class), gated on
+                      [+0x98]==0 -> 1 and the same [+0x164] CAS
+```
+
+### All callers of `0x140406530` (completeness check)
+
+```text
+| call site  | containing function      | queued-object provenance        | AL=1 path |
+| ---------- | ------------------------ | ------------------------------- | --------- |
+| 0x14043B53D | 0x14043B460-0x14043B5C6 | this (PacketSocket), reached    | none —    |
+|            |                          | via *(void**)(*(void**)(this+8) | al is     |
+|            |                          | +0xD8) as the manager argument  | discarded |
+| 0x14043E045 | 0x14043DE10-0x14043E091 | rdi (same class), reached via   | none —    |
+|            |                          | *(void**)(*(void**)(rdi+8)      | al is     |
+|            |                          | +0xD8) as the manager argument  | discarded |
+```
+
+Exactly two call sites exist in the image. The search was an exhaustive scan of
+every `.pdata` function entry followed by direct-call target matching, so a third
+caller would have been found; none exists. No inline or sibling CAS push onto
+`ObjectManagerImpl+0x260` was found elsewhere either. A full census of
+`cmpxchg [reg+0x260]` across every `.pdata` function returns exactly four sites,
+in three functions:
+
+```text
+14040656D  fn 140406530   the push (this queue)
+14043081D  fn 140430800   the steal-all drain of this queue
+14043A3FA  fn 14043A390   PacketSocket's own +0x260 queue (steal-all)
+14043A44A  fn 14043A390   PacketSocket's own +0x260 queue (push)
+```
+
+### The producer's `AL` is discarded — the "arming signal" reading is retracted
+
+`0x140406530` ends:
+
+```asm
+14040657D  test rcx, rcx
+140406580  sete al                    ; al = (old_head == NULL)
+140406588  ret
+```
+
+So the *value* `(old_head == NULL)` is `CONFIRMED`. What is **not** true is that
+any caller uses it:
+
+```text
+caller A  0x14043B542  mov eax, dword ptr [rbp+0x10]   ; eax clobbered at once
+caller B  0x14043E04A  mov rcx, qword ptr [rdi+0x40]   ; no test/jcc on al
+```
+
+```text
+producer returns (old_head == NULL)      CONFIRMED (as a value)
+any caller branches on AL                DISPROVEN
+AL=1 path / AL=0 path                    DO NOT EXIST
+"sete al is the arming signal"           RETRACTED
+```
+
+The behaviour the "arming" theory was trying to explain is real, but it lives in
+the callers' own gate: a per-object retire-once flag at `[obj+0x164]` written by
+`lock cmpxchg` `0 -> 1`, entered only when the push onto the object's own
+`+0x168` stack found that stack empty. The relevant instruction census:
+
+```text
+14043A1F8  mov  dword ptr [rdi+0x164], ebp        fn 140439FE0  PacketSocket ctor
+14043A3C7  lock cmpxchg dword ptr [rcx+0x164]     fn 14043A390  PacketSocket cleanup
+14043B525  lock cmpxchg dword ptr [rbx+0x164]     fn 14043B460  caller A
+14043B62A  lock cmpxchg dword ptr [rsi+0x164]     fn 14043B5D0  reset (r8b=0 path)
+14043E02C  lock cmpxchg dword ptr [rdi+0x164]     fn 14043DE10  caller B
+```
+
+### The queue element is `omega::PacketSocket`
+
+Two independent lines of evidence, both from RTTI and vtable bytes.
+
+**(a) The only `LocklessListNode` instantiation in the image is
+`LocklessListNode<PacketSocket>`.** Its link sits at class offset `0x30`, which
+is precisely the intrusive link offset the producer writes (`add rbx, 0x30`) and
+the drain walks (`add rdi, -0x30` to recover the element base). The class
+hierarchy for `omega::PacketSocket` (COL `0x141702F08`, TD `0x141B65D70`) is:
+
+```text
+.?AVPacketSocket@omega@@
+.?AVComponent@omega@@
+.?AVComponentConsumer@omega@@
+.?AVBufferedSocketObserver@omega@@
+.?AVInterface@omega@@
+.?AV?$LocklessListNode@VPacketSocket@omega@@@omega@@
+.?AVLocklessListNodeImpl@detail@omega@@
+```
+
+**(b) The primary `PacketSocket` vtable has concrete functions at exactly the two
+slots the lifecycle invokes.** The previous checkpoint had looked at vtable
+`0x1414B69A8` and found those slots unresolved. That vtable is a *secondary*
+vtable — the `Component` sub-object vtable embedded inside a `PacketSocket` —
+whose unresolved slots are `_purecall`. The primary vtable is `0x1414B6968`:
+
+```text
+omega::PacketSocket primary vtable 0x1414B6968
+  [+00] 140ff9700  _purecall
+  [+08] 140ff9700  _purecall
+  [+10] 14043d870
+  [+18] 14043d9e0
+  [+20] 14043da80
+  [+28] 14043DB20   <-- invoked by the producer before enqueueing
+  [+30] 14043DBF0   <-- invoked by the drain on every drained element
+  [+38] 141702f30   COL pointer of the secondary vtable
+  [+40] 14043fa70   scalar deleting destructor
+```
+
+```text
+element class        = omega::PacketSocket                 CONFIRMED
+primary vtable       = 0x1414B6968                         CONFIRMED
+COL                  = 0x141702F08  (self-pointer verified) CONFIRMED
+type descriptor      = 0x141B65D70                         CONFIRMED
+allocation           = 0x1F8 bytes; freed via MemoryMan mm_free with
+                       edx=0x1F8 in the scalar deleting dtor CONFIRMED
+constructor          = 0x140439FE0                         CONFIRMED
+```
+
+Element size is `0x1F8`, seen directly in the scalar deleting destructor
+`0x14043FA70` (reached through `vtable+0x00`):
+
+```asm
+14043fa89  mov  edx, 0x1f8
+14043fa91  call 0x140fd7090     ; this-bound delete thunk
+                                 ; -> jmp 0x14008CE90
+14008cea2  mov  rax, qword ptr [rip + 0x12dcf57]   ; MemoryMan
+14008ceac  call qword ptr [rip + 0x12dde0e]        ; mm_free(ptr, 0x1F8)
+```
+
+### `vtable+0x28` at producer time — `0x14043DB20`
+
+`0x140406530` invokes the retired object's `vtable+0x28` *before* the CAS push:
+
+```asm
+14040653a  mov  rax, qword ptr [rdx]        ; rax = element->vtable
+140406547  mov  rax, qword ptr [rax + 0x28] ; slot 5 of the primary vtable
+14040654b  call qword ptr [rip + 0xf6476f]  ; -> 0x14043DB20
+```
+
+Target and semantics:
+
+```text
+vtable+0x28 target = 0x14043DB20 (fn 0x14043DB20 - 0x14043DBE3)
+inputs             = rcx = element, rdx = a second object (the argument's
+                     [+0x28] is invoked on)
+locks              = EnterCriticalSection([rcx+0x58]+0x10) / LeaveCriticalSection
+state reads        = [rcx+0x50], [rcx+0x14C], [rcx+0x198], [rcx+0x1B0]
+branch             = 0x140414BD0(rcx-0x28) must equal 4, else return early
+effects            = cmpxchg dword ptr [rcx+0x14C], 0  (a one-shot release
+                     gate); on success and when [+0x198]==0 and [+0x1B0]==NULL
+                     calls 0x14043ADF0(rcx-0x28, 0, 0, 0)
+return             = void
+semantic role      = a release/detach gate on the retired object, not a
+                     deallocation and not a destructor
+```
+
+It is **not** a "prepare-destroy". It does not free, does not null the vtable, and
+does not decrement a count that could reach zero here; it takes the object's own
+lock, tests a one-shot flag at `+0x14C`, and conditionally runs a detach routine.
+Classified as `release`/`detach`.
+
+### `vtable+0x30` at drain time — `0x14043DBF0`
+
+`0x140430800` calls this on every drained element:
+
+```asm
+140430840  mov  rbx, qword ptr [rdi + 0x30]   ; next node
+140430844  xor  r8d, r8d
+140430847  mov  rcx, rdi                      ; rcx = element base
+14043084a  call 0x14043b5d0                   ; per-pass flush (see below)
+14043084f  mov  rax, qword ptr [rdi]          ; element->vtable
+140430855  mov  rax, qword ptr [rax + 0x30]   ; slot 6 of the primary vtable
+140430859  call qword ptr [rip + 0xf3a461]    ; -> 0x14043DBF0
+```
+
+Target and semantics:
+
+```text
+vtable+0x30 target = 0x14043DBF0 (fn 0x14043DBF0 - 0x14043DD6C)
+inputs             = rcx = element (PacketSocket), r8d/r9d and two stack
+                     bytes forwarded to 0x140436890
+locks              = EnterCriticalSection([rcx+0x58]+0x10)
+state reads        = 0x140414BD0(rcx-0x28) must equal 4, else return early
+containers         = walks a circular doubly-linked list at [rcx+0x30]:
+                     nodes have next at +0x00 and prev at +0x08, sentinel at
+                     rcx+0x30, payload at node+0x28
+per element        = 0x140414250(node+0x70, &local) then 0x140436890(...)
+                     with the node's own vtable[0x28] invoked first
+return             = void
+semantic role      = a list-draining detach/clear of the element's embedded
+                     node list; it does NOT free the element and does NOT call
+                     the destructor
+```
+
+So the drain does **not** delete the `PacketSocket`. It hands the element to
+`0x14043DBF0`, which detaches the element's own `LocklessListNode` chain. The
+element's memory is released elsewhere (the scalar deleting destructor
+`0x14043FA70`, reached through `vtable+0x00`, via `mm_free` with `0x1F8`).
+
+This is why the queue reads as a **deferred-retirement** stack rather than a
+"deferred-destruction" stack: the drain performs deferred *reclamation work on*
+the retired socket, and destruction of the socket is a separate path.
+
+### `0x14043B5D0` fully resolved — it is a per-pass `PacketSocket` flush
+
+`0x14043B5D0` (fn `0x14043B5D0 - 0x14043BB68`, 598 bytes, stack frame `0x808`)
+is a method of `omega::PacketSocket`, not a per-element teardown:
+
+```text
+this                = omega::PacketSocket
+[rcx+0x80]          = pointer; [rcx+0x80]+0x10 = its critical section
+[rcx+0x164]         = retire-once/state flag; on the r8b==0 path it does
+                      lock cmpxchg dword ptr [rcx+0x164], 0   (reset)
+[rcx+0x98], [rcx+0x180]
+                    = state fields gating the enumeration
+[rcx+0x168]         = this socket's OWN lock-free stack of 0x20-byte recording
+                      nodes, stolen whole with the same CAS idiom as +0x260
+r8b                 = 0 -> reset the +0x164 flag first; != 0 -> do not
+r9d / stack args    = forwarded to 0x140436890
+```
+
+`r8d = 0` from `0x140430800` therefore means: *"reset the retire-once flag, then
+flush"*. It is a per-*pass* flush, called once per drain pass with the manager as
+`this` — not once per element.
+
+`0x14043B5D0` is called from 5 sites image-wide:
+
+```text
+14043084a  fn 140430833-140430874   the 5 ms drain (once per pass)
+14043b563  fn 14043b460-14043b5c6   caller A, on the >= 0x100000 byte path
+14043c258  fn 14043bea0-14043c77d
+14043d6e8  fn 14043d550-14043d78b
+14043e7f2  fn 14043e3a0-14043e8cb
+```
+
+### Relationship between `0x14043B53D` and `0x14043B5D0`
+
+The two addresses are 147 bytes apart, which invited a "paired lifecycle
+functions" reading. That reading is **DISPROVEN**:
+
+```text
+0x14043B460-0x14043B5C6  caller A: a PacketSocket method that enqueues a
+                          retirement onto [+0x260] and flushes on a byte
+                          threshold
+0x14043B5D0-0x14043BB68  0x14043B5D0: a PacketSocket method that flushes the
+                          socket's own [+0x168] recording stack
+
+caller A does call 0x14043B5D0 (at 0x14043B563), but that is caller -> flush,
+not release/finalize. They are neighbours in one contiguous PacketSocket method
+block, not a producer/consumer pair.
+```
+
+### The manager, re-verified
+
+The `+0x260` root object is still `omega::ObjectManagerImpl`, verified
+independently here:
+
+```text
+vtable 0x1414B6798
+COL    0x141702418   signature 1, offset 0
+TD     0x141B65B48   ".?AVObjectManagerImpl@omega@@"
+CHD    0x141702368
+bases  ObjectManagerImpl, ComponentConsumer, ListenSocketObserver, Interface
+ctor   0x1404292E0   writes vtable at [rcx], [rcx+8] = owner
+                      zeroes +0x220/+0x228/+0x238/+0x248/+0x260, +0x258 = 1
+```
+
+`+0x260` is written zero by that constructor at `0x14042961B`, alongside the
+timer slots `+0x228`, `+0x238`, `+0x248`. The 5 ms drain registration is
+`0x14042F960`, called exactly once image-wide, from `0x1404465A7` inside the
+object-manager initialisation path `0x140446490 - 0x14044682D`, which is the
+same function that also registers the 500 ms operation at `0x14042FA28` and the
+60 s operation at `0x140446693`. Registration bytes:
+
+```text
+14042fa28  mov  r9d, 0x1f4        ; 500 ms
+14042fa39  call 0x140423b50
+14042fa46  lea  rcx, [rdi + 0x228]
+
+14042fa9d  lea  rax, [rip + 0xd5c]   ; -> 0x140430800
+14042faff  mov  r9d, 5               ; 5 ms
+14042fb10  call 0x140423b50
+14042fb1b  lea  rcx, [rdi + 0x238]
+```
+
+Because this registration happens once at manager initialisation — not on the
+first retirement — the coalescing window cannot be armed by the producer's
+return value. `5 ms coalescing window` therefore remains `HYPOTHESIS`, supported
+only by the drain's poll-free, rearm-free body.
+
+### Second family: `0x1414B69A8` is a `PacketSocket`, not a second manager
+
+The previous checkpoint recorded `0x1414B69A8` as a structurally similar manager
+instance. That is **WRONG**. Resolving its COL gives:
+
+```text
+vtable 0x1414B69A8
+COL    0x141702F30 (self-pointer verified)
+TD     0x141B65D70   ".?AVPacketSocket@omega@@"
+CHD    0x141702E90
+bases  PacketSocket, Component, ComponentConsumer, BufferedSocketObserver,
+       Interface, LocklessListNode<PacketSocket>, LocklessListNodeImpl
+```
+
+`0x1414B69A8` is the secondary (`Component` base sub-object) vtable of a
+`PacketSocket`; the vtable that follows it at `+0x30` in the object is the
+primary vtable holding the same COL. `0x14043A390` — the "second idiom producer"
+— is the `PacketSocket` cleanup routine reached from the deleting destructor
+`0x14043FA70`, and the `+0x260` CAS loop inside it is a *different* queue: the
+`PacketSocket`'s own deferral list, not `ObjectManagerImpl+0x260`.
+
+The previous note that `0x14043A390` "pairs its `cmpxchg` on `+0x260` with a
+different queue at `+0x168`/`+0x164` on another instance" is consistent with
+this: `+0x260` there belongs to a `PacketSocket`, and `+0x164`/`+0x168` are that
+same `PacketSocket`'s own fields.
+
+### Relation to known object types
+
+```text
+omega::PacketSocket          the element itself                        SAME
+omega::Component             base class of the element                 BASE
+omega::ComponentConsumer     base class of both element and manager    BASE
+omega::LocklessListNode
+      <omega::PacketSocket>  base providing the +0x30 link             BASE
+omega::ObjectManagerImpl     owner of the +0x260 stack                 DISTINCT
+omega::SocketManager         vtable 0x1414B5CD8, COL 0x141700AB8,
+                             unrelated class                            UNRELATED
+CConnection / ServerProxy /
+ObjectSurrogate / routed peer
+                             no RTTI evidence links these to the
+                             +0x260 element                                UNKNOWN
+```
+
+No evidence was found tying the retired `PacketSocket` to the historical routed
+teardown, and the transitive question is unchanged:
+
+```text
+0x140430800 -> 0x1404245F0     UNKNOWN
+0x140430800 -> 0x140434430     UNKNOWN
+```
+
+The drain's direct callees are fully enumerated (see the drain body above). In
+its 33-byte body it calls exactly two things per element: `0x14043B5D0` and the
+element's `vtable+0x30` (`0x14043DBF0`). It does **not** call the element's
+`vtable+0x00` (the scalar deleting destructor) and does **not** call `mm_free`
+itself, so the drain is not the element's destruction path. It does not reach
+`0x1404245F0` or `0x140434430` directly, and neither was reached transitively
+from `0x14043B5D0` or `0x14043DBF0` within the depth explored here.
+
+### The retirement trigger
+
+Both call sites are state-gated. `0x140414BD0(x)` returns a small integer state;
+`4` admits retirement. In caller B the surrounding condition is explicit:
+
+```c
+if (obj->[0x98] == 0) {
+    obj->[0x98] = 1;                 // 0 -> 1 transition
+    if (CAS(&obj->[0x164], 0, 1))    // retire-once
+        producer(*(void**)(*(void**)(obj+8) + 0xD8), obj);
+}
+```
+
+```text
+retirement trigger = the socket object entering state 4, with its
+                     [+0x98] discriminator at 0 and its [+0x164]
+                     retire-once flag still 0
+condition          = 0x140414BD0(obj) == 4 && [obj+0x98] == 0 &&
+                     CAS([obj+0x164], 0, 1)
+caller             = 0x14043B460 (caller A) and 0x14043DE10 (caller B)
+object             = the omega::PacketSocket that reached state 4
+local vs peer-visible = LOCAL. Nothing in the retired object's path emits a
+                     packet, mutates a route, or reaches the serializer; the
+                     retirement is local bookkeeping and reclamation
+```
+
+### What this changes
+
+```text
+queue element class                          CONFIRMED  omega::PacketSocket
+producer AL=1 scheduling path                DISPROVEN  (al discarded twice)
+element vtable+0x28 semantics                CONFIRMED  release/detach gate
+element vtable+0x30 semantics                CONFIRMED  node-list detach/clear
+0x1414B69A8 is a second manager              RETRACTED  it is a PacketSocket
+"+0x260 destruction stack" label             NARROWED   deferred-retirement stack
+5 ms coalescing window                       HYPOTHESIS (unchanged)
+transitive path to 0x1404245F0/0x140434430   UNKNOWN    (unchanged)
+```
+
+This is stop condition 1 (concrete queue element class proven) together with
+stop conditions 4 and 5 (`vtable+0x28` and `vtable+0x30` semantics proven), so
+the pass stopped here rather than continuing into the next boundary.
+
+**No breakpoint was placed, no witness was taken, no server behaviour was
+changed, and D4 was not sent.**

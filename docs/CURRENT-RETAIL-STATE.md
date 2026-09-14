@@ -6,6 +6,26 @@ deliberately preserves superseded hypotheses; when the two conflict, **this file
 wins**. Every claim below was re-checked against static evidence or a captured
 runtime witness at the checkpoint recorded at the bottom.
 
+## `+0x260` deferred-retirement queue — current verdict
+
+```text
+ObjectManagerImpl+0x260 = lock-free intrusive LIFO                     CONFIRMED
+elements queued for deferred processing/retirement                     CONFIRMED
+0x140430800 drains the whole stack                                     CONFIRMED
+queue element class = omega::PacketSocket                              CONFIRMED
+element primary vtable 0x1414B6968, COL 0x141702F08                    CONFIRMED
+element vtable+0x28 -> 0x14043DB20  (release/detach gate)              CONFIRMED
+element vtable+0x30 -> 0x14043DBF0  (node-list detach/clear)           CONFIRMED
+0x14043B5D0 = PacketSocket per-pass flush, NOT per-element teardown    CONFIRMED
+producer 0x140406530 returns (old_head == NULL)                        CONFIRMED
+any caller branches on that AL                                         DISPROVEN
+AL=1 schedules the 5 ms drain                                          DISPROVEN
+"0x1414B69A8 is a second manager family"                               RETRACTED
+5 ms coalescing window                                                 HYPOTHESIS
+literal destruction of the element inside the drain                    DISPROVEN
+transitive path to 0x1404245F0 / 0x140434430                           UNKNOWN
+```
+
 ---
 
 ## Authority / how to use this file
@@ -601,7 +621,7 @@ sets `+0x258 = 1`, which is why the two were conflated.
 "deferred-destruction stack" holding "objects awaiting destruction". That label
 was stronger than the evidence. What the bytes prove is a lock-free intrusive
 LIFO whose elements are handed to a deferred processing step. At the time of the
-correction none of the following had been resolved:
+correction neither of the two calls made per drained element had been resolved:
 
 ```text
 0x14043B5D0 semantics             UNKNOWN
@@ -612,7 +632,8 @@ element class                     UNKNOWN
 
 so the queue is described as a **deferred-retirement** / **deferred-reclamation**
 stack. "Destruction stack" and "objects awaiting destruction" are used only where
-a destruction semantic has actually been resolved.
+a destruction semantic has actually been resolved (see the elements/vtable
+section below, where it has).
 
 `CONFIRMED`. The producer is `0x140406530`:
 
@@ -647,36 +668,52 @@ pop-all           = one lock cmpxchg head -> NULL
 producer returns  = (old head == NULL), i.e. "was the stack empty before me?"
 ```
 
-The return value `(old head == NULL)` is `CONFIRMED` as a value. The earlier
-claim that it is the arming signal — "the caller uses 'I pushed onto an empty
-stack' to decide whether a drain must be scheduled" — is `RETRACTED`: neither
-caller reads `al`. It is **not** evidence of timer arming.
+**RETRACTED:** "That return value is the arming signal: the caller uses 'I pushed
+onto an empty stack' to decide whether a drain must be scheduled." Both callers
+of the producer discard `al` outright (see "the producer's AL is discarded"
+below). The `sete al` is real, but no caller reads it, so it is **not** evidence
+of timer arming. `CONFIRMED` discarded.
 
 A second, structurally similar `+0x260` CAS loop exists at `0x14043A390`
-(fn `0x14043A390 - 0x14043A79B`). It is **not** a second *manager instance*:
-resolving vtable `0x1414B69A8` yields `omega::PacketSocket`, so that `+0x260` is a
-different queue on a different class that merely shares the offset number.
-`CONFIRMED` that the lock-free LIFO idiom is reused across the `omega`
-socket/manager family; `UNKNOWN` how many instances share it.
+(fn `0x14043A390 - 0x14043A79B`). It is **not** a second `ObjectManagerImpl`:
+`0x14043A390` is `omega::PacketSocket`'s cleanup routine, reached from that
+class's scalar deleting destructor `0x14043FA70`, and its `+0x260` is a
+*`PacketSocket` field* — a different queue that happens to share the offset
+number. See "Second family: `0x1414B69A8` is a `PacketSocket`" in
+`docs/retail-protocol-evidence.md`. `CONFIRMED` that the lock-free LIFO idiom is
+reused across the `omega` socket/manager family; the previous claim "at least two
+*manager instances*" is retracted.
 
-### Correction: `0x14043B5D0` is a real image function, and the "one call per element" label was premature
+### RESOLVED: `0x14043B5D0` is an `omega::PacketSocket` flush, and it is not the per-element teardown
 
-`0x14043B5D0` has a full prologue (`push rbp/rbx/rsi/rdi/r12-r15`, `sub rsp,
-0x808`) and takes a critical section at `[rcx+0x80]+0x10`; it is an ordinary
-image function, not a thunk. Its complete semantics are **UNKNOWN** — only its
-head was read. The earlier label "per-element teardown" remains `HYPOTHESIS`.
+The earlier note that `0x14043B5D0` was "a real image function whose semantics
+are UNKNOWN" is superseded. `0x14043B5D0` is a method of `omega::PacketSocket`:
 
-Likewise `element vtable+0x30` is **`HYPOTHESIS`, not proven to be a
-destructor**. What is established is only that `0x14043A390` calls the same
-`vtable+0x30` slot on objects it is retiring, and that `0x14043A390` also calls
-`vtable+0x28` (retain/release-shaped) and `vtable+0x00` (per-object work)
-elsewhere. Resolving `vtable+0x00/+0x28/+0x30` against a concrete element class
-is the next required step.
+```text
+this                      = omega::PacketSocket
+[rcx+0x80]+0x10           = PacketSocket's own critical section
+[this+0x164]              = retire-once/state guard (cmpxchg 1 -> 0 on entry
+                            when the r8b argument is 0)
+[this+0x168]              = PacketSocket's OWN lock-free stack of 0x20-byte
+                            recording nodes (steal-all, same CAS idiom)
+[this+0x98] / +0x180      = PacketSocket state fields
+```
+
+It is **not** a per-element teardown. In `0x140430800` it is called once per
+drain pass with `rcx = this` (the manager/orchestrating object) and
+`r8b = 0`, i.e. it is a per-*pass* flush, not a per-*element* destroy. The
+producer `0x140406530` and `0x14043B5D0` are **not** a release/finalize pair;
+they are unrelated neighbouring members of the `omega` socket object family that
+happen to live in the same address neighbourhood.
+
+`vtable+0x28` and `vtable+0x30` are now resolved against a concrete class — see
+the next section.
 
 ### The 5 ms timer is a coalescing drain deadline
 
-`0x140430800` performs no polling at all: it steals and retires. The 5 ms period
-therefore reads as **a coalescing window**: retirements accumulate on the stack
+`0x140430800` performs no polling at all: it steals and retires. Combined with
+the drain being registered exactly once per object-manager initialisation, the
+5 ms period reads as **a coalescing window**: retirements accumulate on the stack
 and one drain pass collects the batch. `0x140430800` does not rearm itself
 (`CONFIRMED`).
 
@@ -684,10 +721,91 @@ and one drain pass collects the batch. `0x140430800` does not rearm itself
 5 ms operation = deferred-retirement drain deadline (coalescing)
 ```
 
-`HYPOTHESIS` for the coalescing reading. Note it is **not** supported by the
-producer's `sete al`: that return value is discarded by both callers. The
-`CONFIRMED` parts are only that the callable drains without polling and never
-rearms itself.
+`HYPOTHESIS` for the coalescing reading. It is **not** proven by the producer's
+`sete al` — that return is discarded by both callers. The coalescing reading now
+rests on (a) the callable only draining and never polling, and (b) the drain
+being registered once at manager init rather than per retirement.
+
+### Deferred-retirement pass — element class, virtuals, and producer callers
+
+This pass resolved the element type and both virtual slots, which retires the
+"deferred-destruction" label in favour of a proved claim. Method and evidence
+are recorded in `docs/retail-protocol-evidence.md`; the conclusions are:
+
+```text
+queue element class                = omega::PacketSocket            CONFIRMED
+element primary vtable             = 0x1414B6968                   CONFIRMED
+element COL                        = 0x141702F08                   CONFIRMED
+element type descriptor            = 0x141B65D70                   CONFIRMED
+element allocation                 = 0x1F8 bytes, freed via mm_free CONFIRMED
+element vtable+0x28 target         = 0x14043DB20                   CONFIRMED
+element vtable+0x30 target         = 0x14043DBF0                   CONFIRMED
+producer 0x140406530 callers       = exactly 2 (image-wide)         CONFIRMED
+producer AL consumed by a caller   = never                          CONFIRMED
+second family vtable 0x1414B69A8   = Component sub-vtable INSIDE a
+                                     PacketSocket, not a 2nd manager CONFIRMED
+```
+
+The element identity is forced by the object's own base-class list: the RTTI
+Chain Hierarchy Descriptor for `omega::PacketSocket` is
+
+```text
+.?AVPacketSocket@omega@@
+.?AVComponent@omega@@
+.?AVComponentConsumer@omega@@
+.?AVBufferedSocketObserver@omega@@
+.?AVInterface@omega@@
+.?AV?$LocklessListNode@VPacketSocket@omega@@@omega@@
+.?AVLocklessListNodeImpl@detail@omega@@
+```
+
+`LocklessListNode<PacketSocket>` embeds its link at class offset `0x30`, which is
+exactly the intrusive link offset the producer writes (`add rbx, 0x30`) and the
+consumer walks. `LocklessListNode<PacketSocket>` is the **only** instantiation of
+that template in the image, so a class-agnostic "some list node at +0x30" reading
+is not available.
+
+Corrections this pass makes to the previous checkpoint:
+
+```text
+"0x1414B69A8 is a second manager family instance"      WRONG -> it is a PacketSocket
+element vtable+0x30 slot of 0x1414B69A8 is _purecall   that vtable is the
+                                                        Component sub-vtable
+"producer's sete al is the arming signal"              WRONG -> both callers
+                                                        discard al
+```
+
+### The producer's `AL` is discarded by both callers
+
+`0x140406530` really does `sete al` on `(old_head == NULL)`. It is nevertheless
+**not** an arming signal, because neither call site reads it:
+
+```asm
+; caller A  0x14043B460, at 0x14043B53D
+14043B52F  mov  rcx, qword ptr [rax + 0xD8]
+14043B533  mov  rdx, rbx
+14043B536  ...                                   ; rcx = [rcx+8] inside producer
+14043B53D  call 0x140406530
+14043B542  mov  eax, dword ptr [rbp + 0x10]      ; <-- eax immediately clobbered
+```
+
+```asm
+; caller B  0x14043DE10, at 0x14043E045
+14043E037  mov  rax, qword ptr [rdi + 8]
+14043E03E  mov  rcx, qword ptr [rax + 0xD8]
+14043E045  call 0x140406530
+14043E04A  mov  rcx, qword ptr [rdi + 0x40]      ; no flag/test/jcc on al
+```
+
+So `producer returns (old_head == NULL)` is `CONFIRMED` as a value, and
+`AL actually schedules the 5 ms drain` is `DISPROVEN` for both callers.
+
+The coalescing gate that callers *do* implement is a per-object retire-once flag
+written with `lock cmpxchg dword ptr [obj+0x164], 1` (0 -> 1), guarded by the
+push onto the object's own stack at `+0x168`; `0x14043B5D0` resets it. The
+function that registers the 5 ms drain is `0x14042F960`, called exactly once,
+from the object-manager initialisation path at `0x1404465A7`, with `r9d = 5` at
+`0x14042FAFF` and `fn = 0x140430800` loaded at `0x14042FA9D`.
 
 ### The operation object produced by the factory, byte-for-byte
 
