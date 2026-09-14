@@ -6213,3 +6213,216 @@ PacketSocket state enum names     = UNKNOWN (4 and 7 are both "sendable")
 ```
 
 **No server behaviour was changed and D4 was not sent.**
+
+## The 5 ms drain is a deferred PacketSocket service pass, and Close rides it (September 13)
+
+`0x14043B5D0` was fully reversed this pass. It is a **transmit/flush** on the
+`PacketSocket`, which closes the question of what the `+0x260` machinery is for.
+
+### `0x14043B5D0` — complete semantic pseudocode
+
+```c
+// rcx = this = omega::PacketSocket, dl/r8b = mode (0 = service pass, 1 = threshold)
+void PacketSocket::service(bool mode) {
+    EnterCriticalSection(&this->[0x80]->cs_at_0x10);
+
+    if (mode == 0)
+        lock cmpxchg(&this->[0x164], 1, 0);      // clear outstanding-work gate
+
+    if (this->[0x180] != 1) goto epilogue;        // service only if enabled
+
+    // scratch: 0x100-byte inline buffer + vector header (0x1400b77c0 / 0x1400c0040)
+    init_scratch(&scratch);
+
+    if (this->[0x98] == 1)
+        0x14043C780(this, &scratch);              // append one extra record
+
+    // steal the socket's whole record stack
+    Node* rec;
+    do { rec = this->[0x168]; } while (!CAS(&this->[0x168], rec, NULL));
+
+    if (rec == NULL && extra == NULL) goto epilogue;
+
+    if (0x140414BD0(this) != 4) goto epilogue;    // socket state gate
+    if (this->[0x38] == NULL)   goto epilogue;
+
+    // count records and drain the queued byte total
+    int n = 0;
+    for (Node* p = rec; p; p = p->next) {
+        n++;
+        lock xadd(&this->[0x170], -(int)p->record->len);   // ecx = -len
+    }
+    int total = (extra ? n + 1 : n);
+
+    // pointer + length arrays; heap when total > 0x64, else inline stack arrays
+    Record** ptrs = (total > 0x64) ? mm_alloc(8*total) : stack_ptrs;
+    int*     lens = (total > 0x64) ? mm_alloc(8*total) : stack_lens;
+
+    if (extra) { ...store extra as ptrs[total-1], len at lens[total-1]... }
+    for (Node* p = rec; p; p = p->next) { ptrs[--i] = p->record; lens[i] = p->record->len; }
+
+    // statistic accumulation at this->[0x178] and [[this+8][0xd8]+0x2c8]
+    int bytes = 0;
+    for (int i = 0; i < total; i++) {
+        Record* r = ptrs[i];
+        int len = r->len;
+        if (stats && len > 6 && (unsigned)(len - 6) >= 0x20)
+            0x14045C330(r);                       // padding/CRC adjust?
+        bytes += len;
+        bump_counters(bytes, len, 1);             // lock xadd at +0x4c/+0x50/+0x54
+    }
+
+    // BULK TRANSMIT — the actual hand-off
+    0x140452360(this->[0x38], ptrs, total, bytes);
+
+    free heap arrays;
+epilogue:
+    LeaveCriticalSection(...);
+}
+```
+
+Classification, from the instructions above:
+
+```text
+0x14043B5D0 = SEND/FLUSH        (not CLEANUP, not MIXED)
+```
+
+### `0x140452360` — the transmit hand-off
+
+```text
+- EnterCriticalSection([rcx+0xc8]+0x10)
+- 0x140414BD0(rcx) must == 4
+- 0x140452A80(rcx, total_bytes)
+      reads a limit at [[rcx+0x38]+0x34], keeps a running total at [rcx+0xd0],
+      returns whether the limit was just exceeded -> byte-quota / backpressure
+- per record: 0x140453370(&rcx[0x70], &ptrs[i])   ; push into a deque-like
+                                                    ; container (grow path inside)
+- success: (*[[rcx+0x68]]->vtable[0x90])([rcx+0x68], &records)
+- failure: per record, (*record)->vtable[0](record, 1)   ; release
+```
+
+### No free on the drain path
+
+The drain body `0x140430800` calls exactly two things per element — `0x14043B5D0`
+and `element->vtable+0x30` — and both take the element as receiver:
+
+```asm
+14043082d  add   rdi, -0x30
+140430847  mov   rcx, rdi
+14043084a  call  0x14043b5d0          ; 0x14043B5D0(element, r8b = 0)
+140430852  mov   rcx, rdi
+140430859  call  [rax + 0x30]         ; element->vtable+0x30(element)
+```
+
+Neither reaches `0x14043FA70` (the scalar deleting destructor) or `mm_free`. The
+socket's real deletion is the separate `vtable+0x00` path. So a prior statement
+that `0x14043B5D0` is called "with the manager as `this`" is **retracted**.
+
+### The service path is generic outbound transport
+
+`0x14043B460` (which builds the record, pushes it on `+0x168`, and enqueues the
+socket on `ObjectManagerImpl+0x260`) has six call sites, all shaped
+`rcx = socket, rdx/r8 = contexts, r9d = message id`:
+
+```text
+0x140412667  fn 0x1404123D0   r9d = 0x43DB3479  Close
+0x140412BDF  fn 0x140412B20   r9d = edi         sibling Close-family verb
+0x14043CE37  fn 0x14043C900   r9d = 0           socket-cluster internal
+0x14045B992  fn 0x14045B620   r9d = 0x8B0D492F  IntroduceConnection
+0x14045BC70  fn 0x14045BA00   r9d = 0xA609E6A7  RequestIDSignature
+0x14045BF91  fn 0x14045BCD0   r9d = 0x6731C5AF  ReplyIDSignature
+```
+
+Message names confirmed against `src/Holocron.Common/Protocol/`. One function
+serializes Close, IntroduceConnection and both signature messages identically, so
+the mechanism is the **general outgoing-message path**, not close-time cleanup.
+
+Close reaches it only when `arg2 == 0`: `0x1404123D0` writes the `0x43DB3479`
+envelope inside the `arg2 == 0` block (entered by fallthrough at `0x1404124F4`;
+nothing branches to `0x140412667`), and the observed wire producers pass 0:
+
+```text
+0x14040AEC0  routed-peer Close       arg2 = 0   TAKES the path
+0x140468D40  TimeRequester teardown  arg2 = 0   TAKES the path
+```
+
+Counter-case: the inbound dispatcher `0x14042B990` routes an inbound Close
+(`0x43DB3479`) with `arg2 = 1` and **skips** `0x14043B460`, while inbound
+RequestClose (`0x598D9A7`) is routed with `arg2 = 0` and **takes** it.
+
+### The state helpers, resolved and emulated
+
+```text
+0x140414BD0(x)                                    state GETTER
+    returns [x+0x18] unchanged. 9 is a transient spin-lock marker: the accessor
+    xchg's 9 in, reads the old value, restores it; if it sees 9 it waits on a
+    QueryPerformanceCounter-timed loop.
+
+0x140414CB0(x, newState, allowedMask, warnMask)   state COMPARE-AND-SWAP
+    if (1 << oldState) & allowedMask: store newState; return oldState
+    else:                            restore oldState; return 0xA (denied)
+```
+
+The Close verb uses both:
+
+```asm
+14041240a  mov   edx, 7              ; newState
+14041240f  mov   r9d, 0x180          ; warnMask
+140412415  lea   r8d, [rdx + 0x78]   ; allowedMask = 0x7F
+140412419  call  0x140414cb0         ; CAS -> eax = OLD state
+14041241e  mov   r14d, eax
+140412421  cmp   eax, 0xa / jne ...  ; 0xA -> denied
+1404124e1  cmp   r14d, 4 / jne ...   ; the PRE-transition state had to be 4
+140412604  call  0x140414bd0         ; current state 4 or 7 -> allowed to send
+140412609  cmp   eax, 4 / je  ...
+140412611  call  0x140414bd0
+140412616  cmp   eax, 7 / jne ...
+140412667  call  0x14043b460         ; serialize + queue Close
+```
+
+### The PacketSocket service fields, from the constructor
+
+`0x140439FE0` zeroes them all, which fixes the working set:
+
+```asm
+14043a1f8  mov  dword ptr [rdi + 0x164], ebp   ; outstanding-work gate
+14043a1fe  mov  qword ptr [rdi + 0x168], rbp   ; record stack head
+14043a205  mov  dword ptr [rdi + 0x170], ebp   ; queued byte total
+14043a218  mov  dword ptr [rdi + 0x180], ebp   ; service-enabled flag
+```
+
+```text
++0x164  outstanding-work gate        0 -> 1 only after the +0x168 push found the
+                                     stack empty; 1 -> 0 cleared by 0x14043B5D0
+                                     mode 0. LIFECYCLE CONFIRMED. (0x14043B525,
+                                     0x14043E02C set; 0x14043B62A clears.)
++0x168  0x20-byte record stack head   push in 0x14043B460 / 0x14043DE10,
+                                     steal in 0x14043B5D0
++0x170  queued byte total             added +len at 0x14043B545, drained -len at
+                                     0x14043B6FC -> counts queued bytes, not
+                                     lifetime bytes. 0x100000 is a 1 MiB backlog
+                                     threshold.
++0x180  service-enabled flag          both 0x14043B460 (0x14043B554) and
+                                     0x14043B5D0 (0x14043B638) require == 1;
+                                     set by 0x14043AD60, 0x14043BEA0, 0x14043E3A0
+```
+
+### Tooling correction recorded for reuse
+
+The emulator built for this pass initially produced a wrong answer that pointed
+away from the truth, because of two bugs worth recording:
+
+```text
+1. capstone register ids are not sequential from RAX (X86_REG_RCX == 38 while
+   X86_REG_RAX == 35), so an index-arithmetic register map silently aliased rcx
+   onto rbx and the function dereferenced NULL.
+2. `mov eax, 1` writes the EAX register id, not RAX; storing it under its own
+   key made every 32-bit return read back as 0, so a getter appeared to return 0
+   for every input.
+```
+
+After fixing both, `0x140414BD0` returns its input field exactly for every value
+0..8, which is what identified it as a state getter. `tools/mini-x64-run.py`
+carries the fixes and a comment explaining them.
+
+**No server behaviour was changed, no breakpoint was placed, and D4 was not sent.**

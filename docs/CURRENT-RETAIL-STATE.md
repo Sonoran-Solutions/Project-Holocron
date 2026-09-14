@@ -17,12 +17,17 @@ element vtable+0x28 -> 0x14043DB20  (release/detach gate)              CONFIRMED
 element vtable+0x30 -> 0x14043DBF0  (node-list detach/clear)           CONFIRMED
 0x14043B5D0 this-operand = the PacketSocket element, NOT the manager   CONFIRMED
 0x14043B5D0 = PacketSocket transmit/flush, NOT teardown/cleanup        CONFIRMED
+drain path reaches 0x140452360 (transmit hand-off)                     CONFIRMED
+drain path frees the PacketSocket                                      DISPROVEN
 producer 0x140406530 returns (old_head == NULL)                        CONFIRMED
 any caller branches on that AL                                         DISPROVEN
 AL=1 schedules the 5 ms drain                                          DISPROVEN
 "0x1414B69A8 is a second manager family"                               RETRACTED
 5 ms coalescing window                                                 HYPOTHESIS
 literal destruction/retirement of the element in the drain             DISPROVEN
+Close verb 0x1404123D0 uses this same service path                     CONFIRMED
+other message types use the same service path                          CONFIRMED
+PacketSocket state field semantics (4, 7, ...)                         UNKNOWN
 transitive path to 0x1404245F0 / 0x140434430                           UNKNOWN
 ```
 
@@ -752,6 +757,207 @@ deferred work accumulate on the stack and one drain pass services the batch.
 `sete al` — that return is discarded by both callers. The coalescing reading now
 rests on (a) the callable only draining and never polling, and (b) the drain
 being registered once at manager init rather than per enqueue.
+
+### The 5 ms drain is a deferred PacketSocket service pass, not teardown
+
+This is the substantive result of this pass. `0x14043B5D0` was fully reversed and
+it is a **transmit/flush** operation on the `PacketSocket`, not cleanup:
+
+```text
+0x14043B5D0(this = PacketSocket, r8b = mode)  classification = SEND/FLUSH
+```
+
+Structure (fn `0x14043B5D0 - 0x14043BB68`, 349 instructions reached):
+
+```text
+1. EnterCriticalSection([this+0x80] + 0x10)
+2. if (mode == 0) lock cmpxchg dword ptr [this+0x164], 0   ; clear pending flag
+3. if (this[0x180] != 1) goto epilogue                     ; service only if enabled
+4. build a 0x100-byte scratch buffer + vector header
+5. if (this[0x98] == 1) 0x14043C780(this, &scratch)        ; append extra record
+6. steal this[0x168] whole (CAS head -> NULL)              ; the record stack
+7. if (records == NULL && !extra) goto epilogue
+8. if (0x140414BD0(this) != 4) goto epilogue               ; socket state gate
+9. if (this[0x38] == NULL) goto epilogue
+10. per record: count++, lock xadd [this+0x170], -recordlen ; drain byte total
+11. allocate recordptrs[]/recordlens[] (heap if count > 0x64, else stack)
+12. per record accumulate bytes and bump [this+0x178] and
+    [[this+8][0xd8]+0x2c8] at +0x4c/+0x50/+0x54 (bytes/records/calls)
+13. bulk transmit: 0x140452360(this[0x38], recordptrs, count, total_bytes)
+14. free heap arrays if used
+15. LeaveCriticalSection
+```
+
+The bulk call `0x140452360` is itself a transmit hand-off:
+
+```text
+- EnterCriticalSection([rcx+0xc8]+0x10)
+- 0x140414BD0(rcx) must == 4                    ; same state gate
+- 0x140452A80(rcx, total_bytes)                 ; byte-quota / backpressure check;
+                                                 ; running total at [rcx+0xd0],
+                                                 ; limit at [[rcx+0x38]+0x34]
+- per record: 0x140453370(&rcx[0x70], &recordptr)  ; push into a deque-like
+                                                    ; container (grow path inside)
+- success path: (*[[rcx+0x68]]->vtable[0x90])([rcx+0x68], &records)
+                                                 ; hand the batch upward
+- failure path: per record, (*record)->vtable[0](record, 1)   ; release
+```
+
+**No free occurs anywhere on this path.** The drain's whole 33-byte body calls
+exactly two things per element: `0x14043B5D0` and `element->vtable+0x30`. It never
+calls the scalar deleting destructor `0x14043FA70` and never reaches `mm_free`.
+The socket's real deletion is the separate `vtable+0x00` path.
+
+### The four PacketSocket service fields, from the constructor
+
+The `PacketSocket` constructor `0x140439FE0` initialises them all to zero, which
+is what makes the working set self-evident:
+
+```asm
+14043a1f2  mov  dword ptr [rdi + 0x160], ebp     ; 0
+14043a1f8  mov  dword ptr [rdi + 0x164], ebp     ; 0   outstanding-work gate
+14043a1fe  mov  qword ptr [rdi + 0x168], rbp     ; NULL record stack head
+14043a205  mov  dword ptr [rdi + 0x170], ebp     ; 0   queued byte total
+14043a20b  mov  dword ptr [rdi + 0x174], ebp     ; 0
+14043a211  mov  qword ptr [rdi + 0x178], rbp     ; NULL stats object
+14043a218  mov  dword ptr [rdi + 0x180], ebp     ; 0   service-enabled flag
+14043a21e  mov  qword ptr [rdi + 0x188], rbp     ; NULL
+14043a225  mov  dword ptr [rdi + 0x190], ebp     ; 0
+```
+
+```text
++0x164  outstanding-work gate            CONFIRMED LIFECYCLE
+        0 -> 1  lock cmpxchg at 0x14043B525 (0x14043B460) and 0x14043E02C (0x14043DE10)
+                in both cases only after the +0x168 push reported an empty stack,
+                i.e. "this socket now has deferred work outstanding"
+        1 -> 0  lock cmpxchg at 0x14043B62A (0x14043B5D0, mode 0) - the service
+                pass clears it
+        ctor zeroes it; 0x14043A3C7 and 0x140443DFE also touch it
+
++0x168  record stack head (lock-free LIFO)   CONFIRMED
+        push  in 0x14043B460 / 0x14043DE10 (CAS loop)
+        steal in 0x14043B5D0 (`lock cmpxchg ... , 0`)
+        records are 0x20 bytes; link at record+0x00
+
++0x170  queued byte accumulator              CONFIRMED
+        `lock xadd dword ptr [rbx+0x170], eax` in 0x14043B460 adds
+        `[arg3+0x10]` (the record's length)         @ 0x14043B545
+        `lock xadd dword ptr [rsi+0x170], ecx` in 0x14043B5D0 subtracts each
+        record's length (ecx = -len)                @ 0x14043B6FC
+        -> it is drained on service, so it counts queued bytes, not lifetime bytes.
+        The 0x100000 threshold below is a 1 MiB backlog threshold.
+
++0x180  service-enabled flag                 CONFIRMED readers/writers
+        0x14043B460 requires == 1 before the immediate flush  @ 0x14043B554
+        0x14043B5D0 requires == 1 before servicing at all     @ 0x14043B638
+        set to 1 by 0x14043AD60 @ 0x14043ADA7, 0x14043BEA0 @ 0x14043C246 and
+        0x14043E3A0 @ 0x14043E7E2; set to 3 by 0x14043E2D0 @ 0x14043E31F
+```
+
+So the producer path is: build a 0x20-byte record, push it on `+0x168`, add its
+length to `+0x170`, and (on the first outstanding pass) flag `+0x164` and enqueue
+the socket for service. Flushing then happens either immediately when the queued
+byte total crosses 1 MiB *and* the socket is service-enabled, or later in the
+5 ms pass. `+0x180` gates both.
+
+### The service path is generic, and the Close verb uses it
+
+`0x14043B460` (which builds the 0x20-byte record, pushes it onto
+`PacketSocket+0x168`, and enqueues the socket onto `ObjectManagerImpl+0x260`) has
+**six** call sites image-wide, all with one shape:
+
+```text
+rcx = the socket        rdx = a context record
+r8  = a second context  r9d = a 32-bit message id
+```
+
+| call site | containing fn | `r9d` message id | message |
+| --------- | ------------- | ---------------- | ------- |
+| 0x140412667 | 0x1404123D0 | `0x43DB3479` | **Close** |
+| 0x140412BDF | 0x140412B20 | `edi` (param) | sibling Close-family verb |
+| 0x14043CE37 | 0x14043C900 | 0 | socket-cluster internal |
+| 0x14045B992 | 0x14045B620 | `0x8B0D492F` | IntroduceConnection |
+| 0x14045BC70 | 0x14045BA00 | `0xA609E6A7` | RequestIDSignature |
+| 0x14045BF91 | 0x14045BCD0 | `0x6731C5AF` | ReplyIDSignature |
+
+One function serializes Close, IntroduceConnection, RequestIDSignature and
+ReplyIDSignature identically, so the machinery is **generic outbound message
+transport**, not close-time cleanup.
+
+Which Close invocations take the path: `0x1404123D0(conn, arg2, arg3)` writes the
+`0x43DB3479` envelope only when `arg2 == 0` (the build block is entered by
+fallthrough at `0x1404124F4`; nothing branches to the call at `0x140412667`). The
+wire-observed producers do pass 0:
+
+```text
+0x14040AEC0  routed-peer Close        arg2 = 0   TAKES the deferred path
+0x140468D40  TimeRequester teardown   arg2 = 0   TAKES the deferred path
+```
+
+Counter-case: the inbound dispatcher `0x14042B990` routes an inbound Close
+(`0x43DB3479`) with `arg2 = 1`, which **skips** `0x14043B460`, while inbound
+RequestClose (`0x598D9A7`) is routed with `arg2 = 0` and **takes** it.
+
+### The PacketSocket state machine: getter, CAS, and what 4 vs 7 mean
+
+Two distinct helpers, now both fully resolved:
+
+```text
+0x140414BD0(x)                       state GETTER
+    returns [x+0x18] unchanged. 9 is a transient spin-lock marker: the accessor
+    xchg's 9 in, reads the old value, restores it; if it observes 9 it falls back
+    to a QueryPerformanceCounter-timed wait loop.
+
+0x140414CB0(x, newState, allowedMask, warnMask)   state COMPARE-AND-SWAP
+    if (1 << oldState) & allowedMask: store newState, return oldState
+    else:                            restore oldState, return 0xA (== 10)
+```
+
+Verified by emulating the real bytes for every input (after fixing two emulator
+bugs: a register-id map that aliased `rcx` onto `rbx`, and 32-bit writes such as
+`mov eax, 1` being stored under a key separate from `rax`, which made every
+32-bit return read back as 0):
+
+```text
+0x140414BD0 with [x+0x18] = 0..8  ->  returns 0..8 exactly, field unchanged
+```
+
+The Close verb `0x1404123D0` uses both:
+
+```asm
+14041240a  mov   edx, 7              ; newState
+14041240f  mov   r9d, 0x180          ; warnMask
+140412415  lea   r8d, [rdx + 0x78]   ; allowedMask = 0x7F  (states 0..6)
+140412419  call  0x140414cb0         ; CAS
+14041241e  mov   r14d, eax           ; r14d = OLD state
+140412421  cmp   eax, 0xa
+140412424  jne   ...                 ; 0xA -> denied, return false
+1404124e1  cmp   r14d, 4 / jne ...   ; GATE 1: the PRE-transition state was 4
+...
+140412604  call  0x140414bd0         ; GATE: current state is 4 or 7
+140412609  cmp   eax, 4 / je  ...
+140412611  call  0x140414bd0
+140412616  cmp   eax, 7 / jne ...    ; not 4 and not 7 -> do not send
+140412667  call  0x14043b460         ; serialize + queue Close
+```
+
+So the sequence is: the connection is in state **4**; the CAS moves it
+**4 -> 7**, permitted because `1 << 4` is inside the `0x7F` allowed mask; the
+send gate then accepts state 7. `0x14043B460`'s own gate
+(`0x140414BD0(this) == 4`) is evaluated on the socket's state.
+
+```text
+state getter 0x140414BD0                      CONFIRMED  returns [arg+0x18]
+state CAS    0x140414CB0(x,new,mask,warn)     CONFIRMED  returns old state, 0xA if denied
+state 4       admitted by 0x14043B460 (queue) and by the Close gate  UNKNOWN name
+state 7       admitted by the Close gate; produced by the 0x140414CB0 CAS
+              (newState = 7, allowedMask = 0x7F, warnMask = 0x180)   UNKNOWN name
+state 0xA     "transition denied" sentinel                            CONFIRMED
+```
+
+Because `0x14043B460` queues records only when the state is 4, and the Close verb
+sends only when it is 4 or 7, state 4 cannot mean "closed". The enum values are
+deliberately left unnamed until the writers are recovered.
 
 ### Deferred-service pass — element class, virtuals, and producer callers
 
