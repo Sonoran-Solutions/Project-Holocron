@@ -4,7 +4,18 @@ using Holocron.World.Characters;
 namespace Holocron.World.Network;
 
 /// <summary>
-/// Dispatches incoming client packets to registered handler logic based on HeroEngine opcodes.
+/// LEGACY SIMULATION SCAFFOLDING — NOT RETAIL EVIDENCE.
+///
+/// Dispatches Holocron's <b>internal simulation</b> packets to handler logic
+/// using <see cref="Holocron.Common.Protocol.Opcode"/> values, which are not
+/// current retail SWTOR message ids.
+///
+/// Retail World transport framing, message ids, routing, handshake,
+/// character-list/select sequencing and world-object streaming have <b>not</b>
+/// been validated against the retail executable. Do not cite anything in this
+/// assembly as protocol evidence.
+///
+/// Current model: <c>docs/CURRENT-RETAIL-STATE.md</c>.
 /// </summary>
 public sealed class WorldPacketDispatcher
 {

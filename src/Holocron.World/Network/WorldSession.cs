@@ -10,6 +10,20 @@ using Holocron.World.Navigation;
 
 namespace Holocron.World.Network;
 
+// LEGACY SIMULATION SCAFFOLDING -- NOT RETAIL EVIDENCE.
+//
+// Holocron.World networking is currently simulation scaffolding. It speaks the
+// internal legacy packet model (Holocron.Common.Protocol.Opcode / PacketReader /
+// PacketWriter), whose header and opcode numbering are NOT established as the
+// current retail SWTOR wire protocol.
+//
+// Retail World transport framing, message ids, routing, handshake,
+// character-list/select sequencing and world-object streaming have NOT been
+// validated against the retail executable. Do not use these classes as
+// protocol evidence.
+//
+// Current model: docs/CURRENT-RETAIL-STATE.md.
+
 public enum SessionState
 {
     Handshaking,

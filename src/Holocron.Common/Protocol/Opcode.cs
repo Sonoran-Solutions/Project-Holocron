@@ -1,7 +1,18 @@
 namespace Holocron.Common.Protocol;
 
 /// <summary>
-/// Known HeroEngine / SWTOR protocol opcodes mapped from reverse engineering references.
+/// LEGACY / SIMULATION PROTOCOL — NOT RETAIL EVIDENCE.
+///
+/// This enum is used by Holocron's internal simulation and World scaffolding.
+/// Its values are <b>not</b> established as current retail SWTOR message ids and
+/// <b>must not</b> be cited as reverse-engineering evidence.
+///
+/// The retail identifiers proven so far are message ids carried inside a
+/// decompressed routed envelope (see <see cref="IdentificationExchange"/>):
+/// <c>0xA609E6A7</c>, <c>0x6731C5AF</c>, <c>0x8B0D492F</c> and <c>0x43DB3479</c>.
+/// They bear no relation to the small sequential numbers below.
+///
+/// Current model: <c>docs/CURRENT-RETAIL-STATE.md</c>.
 /// </summary>
 public enum Opcode : uint
 {

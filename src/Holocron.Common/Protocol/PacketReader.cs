@@ -3,7 +3,15 @@ using System.Text;
 namespace Holocron.Common.Protocol;
 
 /// <summary>
-/// Deserializer for binary packets received from SWTOR client or server.
+/// LEGACY / SIMULATION PROTOCOL — NOT RETAIL EVIDENCE.
+///
+/// Reads Holocron's internal simulation packets using a <b>legacy</b> 12-byte
+/// header. That header is <b>not</b> the proven retail SWTOR wire format and
+/// must not be used as protocol evidence. In particular, a packet that "parses"
+/// here proves only that this class is self-consistent.
+///
+/// For retail work use <see cref="TransportFrame"/> and
+/// <see cref="TransportCodec"/>. See <c>docs/CURRENT-RETAIL-STATE.md</c>.
 /// </summary>
 public sealed class PacketReader
 {

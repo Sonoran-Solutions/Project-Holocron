@@ -4,7 +4,18 @@ using System.Text;
 namespace Holocron.Common.Protocol;
 
 /// <summary>
-/// Serializer for binary packets conforming to SWTOR / HeroEngine stream format.
+/// LEGACY / SIMULATION PROTOCOL — NOT RETAIL EVIDENCE.
+///
+/// Writes Holocron's internal simulation packets using a <b>legacy</b> 12-byte
+/// header (opcode u32, type u32, content version u16, transport version u16).
+/// That header is <b>not</b> the proven retail SWTOR wire format and must not be
+/// used as protocol evidence.
+///
+/// The retail transport proven so far is <see cref="TransportFrame"/> plus
+/// <see cref="TransportCodec"/> (Salsa20 session stream, optional Zstandard
+/// compression, magicless framed payloads). Use those for retail work.
+///
+/// Current model: <c>docs/CURRENT-RETAIL-STATE.md</c>.
 /// </summary>
 public sealed class PacketWriter
 {

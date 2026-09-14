@@ -53,10 +53,20 @@ public static class IdentificationExchange
     /// <summary>
     /// <c>Close</c>. Registered in the same global block as the identification
     /// messages (name string at <c>0x14157E740</c>) and dispatched at
-    /// <c>0x14042BABC</c> to <c>0x1404123D0(connection, 1, 0)</c>. The retail
-    /// client sends this immediately after
-    /// <see cref="IntroduceConnectionSignature"/>, tearing down the bootstrap
-    /// connection, so it is the boundary in front of any routed delivery.
+    /// <c>0x14042BABC</c> to <c>0x1404123D0(connection, 1, 0)</c>.
+    ///
+    /// In the reproduced failing retail run the client emits this shortly after
+    /// <see cref="IntroduceConnectionSignature"/>. The Close is generated
+    /// downstream of an owner/collection teardown path
+    /// (<c>0x140423DD0</c> -> <c>0x1404245F0</c> -> <c>0x140434430</c> ->
+    /// <c>0x14040AEC0</c> -> <c>0x1404123D0</c>), and the routed peer remains
+    /// attached in <c>conn+0x88</c> throughout. The upstream condition that
+    /// initiates that teardown is unresolved.
+    ///
+    /// This constant therefore describes <b>what is observed</b>, not a proven
+    /// protocol requirement that a client closes after introducing, and it must
+    /// not be used to argue that no routed message can be delivered. See
+    /// <c>docs/CURRENT-RETAIL-STATE.md</c>.
     /// </summary>
     public const uint Close = 0x43DB3479;
 
