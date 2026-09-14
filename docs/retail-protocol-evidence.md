@@ -7566,3 +7566,42 @@ p2 record producer on the reply path                                      HYPOTH
 SERVER CONTROL of peer+0x40                                               UNKNOWN
 D4                                                                        UNKNOWN
 ```
+
+### E. The peer stays attached even when the attach path fails
+
+Read from `0x140412180`'s tail, in execution order:
+
+```asm
+140412220  mov byte [rsp+0x30], al      ; the allow-empty flag, from [rdi+0x10]
+140412247  call 0x140412820             ; CREATE + ATTACH the peer at [rbx+0x88]
+...
+140412302  call 0x14043d380             ; register the receive route
+14041230a  test al, al
+14041230c  jne  0x140412354             ; registered  -> jump to the event path
+140412317  call 0x1404123d0             ; NOT registered -> Close(conn, 2, 1)
+```
+
+and separately, the early-out immediately past the state gate:
+
+```asm
+1404121b9  cmp qword [rsp+0x90], 0
+1404121c2  je  0x14041231c              ; -> xor bl,bl ; return FALSE
+```
+
+Consequences worth recording, because they were not:
+
+```text
+the peer is attached (0x140412A4F) BEFORE the receive route is registered
+when 0x14043d380 reports failure, the path calls 0x1404123d0(conn, 2, 1)
+   and returns without emitting ConnectionOpen
+the peer created by 0x140412820 is therefore left attached at conn+0x88
+   even on that failure arm -- nothing in the arm detaches it
+=> "a peer exists at conn+0x88" does NOT imply "the attach succeeded"
+```
+
+### F. Correction to the earlier call enumeration
+
+The previous pass's claim that `0x140412317` is a `call 0x140411D30` is wrong; it
+is a `call 0x1404123d0` (the Close verb), verified by disassembling
+`0x1404122F0-0x140412320` directly. `0x140412180` has exactly two callers,
+`0x14042c782` and `0x14042d15a`, and never calls `0x140411D30`.
