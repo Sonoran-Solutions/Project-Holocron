@@ -49,6 +49,15 @@ Usage
     python3 tools/run-retail-bootstrap-probe.py --seconds 300   # longer window
     python3 tools/run-retail-bootstrap-probe.py --winedbg-gdb   # attach a debugger
     python3 tools/run-retail-bootstrap-probe.py --dry-run       # checks only
+
+Reverse-engineering runs that need scripted instrumentation pass ``--launcher``
+plus ``--env``/``--mode-env`` so that the canonical patch/restore path and the
+mode-variable sanitization still apply:
+
+    python3 tools/run-retail-bootstrap-probe.py \
+        --launcher scratch/<run>/witness-launcher.sh \
+        --env WITNESS_GDB_SCRIPT=scratch/<run>/witness.gdb \
+        --env WITNESS_RUN_DIR=scratch/<run>/out
 """
 from __future__ import annotations
 
@@ -170,12 +179,28 @@ def main() -> int:
                         help='run the client directly under winedbg')
     parser.add_argument('--no-bootstrap-probe', action='store_true',
                         help='do not pass --probe-id-bootstrap to the auth server')
+    parser.add_argument('--launcher', default=None, metavar='PATH',
+                        help='override the isolated launcher, e.g. a scripted GDB '
+                             'witness launcher. The client verification, the '
+                             'single AI_ADDRCONFIG patch, the mode-variable '
+                             'sanitization and the byte-exact restore all still '
+                             'apply, so instrumentation never bypasses the '
+                             'canonical patch/restore path. The named script is '
+                             'responsible for providing the isolated runtime.')
+    parser.add_argument('--env', action='append', default=[], metavar='NAME=VALUE',
+                        help='export an extra variable into the launcher (repeatable). '
+                             'Applied after sanitization, so it cannot silently '
+                             're-enable a mode variable: use --mode-env for those.')
+    parser.add_argument('--mode-env', action='append', default=[], metavar='NAME=VALUE',
+                        help='set a mode variable explicitly (repeatable); the name '
+                             'must be one of the known mode variables')
     parser.add_argument('--dry-run', action='store_true',
                         help='verify the client and environment, then exit without running')
     args = parser.parse_args()
 
-    if not LAUNCHER.is_file():
-        fail(f'launcher not found: {LAUNCHER}')
+    launcher = pathlib.Path(args.launcher).resolve() if args.launcher else LAUNCHER
+    if not launcher.is_file():
+        fail(f'launcher not found: {launcher}')
 
     original = load_and_verify_client()
     print(f'[bootstrap] private client sha256 {sha256(original)}')
@@ -196,6 +221,19 @@ def main() -> int:
         env['HOLOCRON_WINEDBG_GDB'] = '1'
     if args.winedbg_trace:
         env['HOLOCRON_WINEDBG_TRACE'] = '1'
+    for assignment in args.mode_env:
+        name, _, value = assignment.partition('=')
+        if name not in MODE_ENVIRONMENT_VARIABLES:
+            fail(f'--mode-env {name} is not a known mode variable')
+        env[name] = value
+    for assignment in args.env:
+        name, _, value = assignment.partition('=')
+        if not name or not _:
+            fail(f'--env expects NAME=VALUE, got {assignment!r}')
+        if name in MODE_ENVIRONMENT_VARIABLES:
+            fail(f'--env {name} is a mode variable; use --mode-env instead')
+        env[name] = value
+    print(f'[bootstrap] launcher {launcher}')
 
     process = None
     restored_ok = False
@@ -206,7 +244,7 @@ def main() -> int:
         EXE.write_bytes(patched)
         print('[bootstrap] AI_ADDRCONFIG cleared (0x400 -> 0) for this bounded run')
 
-        process = subprocess.Popen([str(LAUNCHER)], env=env, start_new_session=True)
+        process = subprocess.Popen([str(launcher)], env=env, start_new_session=True)
         try:
             process.wait(timeout=launcher_deadline_seconds(args.seconds))
         except subprocess.TimeoutExpired:

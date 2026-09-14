@@ -4424,3 +4424,206 @@ exactly "*"; otherwise that path calls Close.
 Other Close producers exist structurally and are not erased by this test. The
 superseded global phrasing is retained here as `SUPERSEDED` per the notebook's
 provenance rule.
+
+---
+
+## The hidden dispatch into `0x140423DD0` is found: a runtime-materialised closure (September 13)
+
+### What was blocking
+
+The previous section left `0x140423DD0` as a function with **no direct callers,
+no conditional branches, no tail jumps and no image-resident 8-byte pointer
+landing inside its range**. That combination is impossible for a normal function
+and pointed at a dispatch that does not exist in the image.
+
+It was true, and the reason is now measured: `0x140423DD0` is a **closure body**.
+Its address is written into a function pointer at runtime, so no static
+reference to it exists.
+
+### The dispatch, measured
+
+One bounded run through the canonical runner
+(`tools/run-retail-bootstrap-probe.py --launcher scratch/re2/witness-launcher.sh`),
+client and fixture restored byte-exactly. Breakpoint at `0x140423DD0` entry:
+
+```text
+thread 2
+RAX = 0x140423DD0
+R11 = 0x140423DD0
+RETADDR [rsp] = 0x140425806
+
+machine code immediately preceding the return address:
+  0x1404257FA  mov  rcx, r10
+  0x1404257FD  mov  rax, r11
+  0x140425800  call qword ptr [rip+0xf454ba]     ; -> slot 0x14136ACC0
+slot 0x14136ACC0  ->  0x141283300
+  0x141283300:  ff e0    jmp rax
+```
+
+Classification:
+
+```text
+mechanism = indirect CALL through a data slot in .rdata
+slot      = 0x14136ACC0   (immediately after the IAT, which ends at 0x14136ACB8)
+thunk     = 0x141283300   = `jmp rax`, one instruction
+target    = RAX, which the call site sets to the closure's bound function
+```
+
+So the chain is:
+
+```text
+0x140425770   closure invoker (thread_data-style run() trampoline)
+  -> call [0x14136ACC0] -> 0x141283300 (jmp rax) -> RAX = 0x140423DD0
+```
+
+`0x140423DD0` is **not** reached through a task trampoline or a thread start
+routine. It is reached through a bound function pointer that a
+`std::function`-style trampoline loads out of the closure object. Verified by
+single-stepping the thunk with GDB:
+
+```text
+before the call:  rcx=0x14B3DA0 rdx=0x6CCFC50 rax=0x140423DD0
+thunk resolves to 0x141283300  (bytes ff e0 == jmp rax)
+```
+
+### The closure object, measured
+
+```text
+closure (stack, thread 2, first field is the bound function):
+  +0x00  0x140423DD0        bound function pointer
+  +0x08  0x14B7DA0          first captured object
+  +0x10  0x14E7FC8          second captured object
+  +0x18  0x14C3B88          its boost control block
+```
+
+At `0x140423DD0` entry:
+
+```text
+arg1 rcx = 0x14B7DA0
+arg2 rdx = &shared_ptr   [rdx] = 0x14E7FC8   [rdx+8] = 0x14C3B88
+arg3 r8  = stack slot; measured [r8] = 0
+arg4 r9d = 4
+```
+
+### Correction: which object the gates live in
+
+`0x14E7FC8` is **not** the gate object. The function begins
+
+```asm
+140423e07  mov rax, qword ptr [rdx]      ; rax = *rdx = 0x14E7FC8
+140423e0a  mov r8,  qword ptr [rax]      ; r8  = [0x14E7FC8] = 0x1523E58
+140423e0d  cmp byte ptr [r8 + 0x2d], 0
+```
+
+so the gates live in **`[0x14E7FC8] = 0x1523E58`**. An earlier reading that
+treated `0x14E7FC8` itself as the object missed that first dereference.
+
+The control block at `0x14C3B88` has vtable `0x1414B6588`, and
+`vtable[-1]` = `0x141701D88` is a well-formed COL with `moffset = 0` whose pTD
+name is:
+
+```text
+.?AV?$sp_counted_impl_p@VApartmentTimer@omega@@@detail@boost@@
+```
+
+so the shared_ptr is a `boost::shared_ptr<omega::ApartmentTimer>` control block.
+`CONFIRMED`.
+
+### Measured gate values
+
+```text
+[r8]                 = 0x00000000
+0x1523E58 + 0x00     = 0x1414B6761        (function table pointer; low bit set)
+0x1523E58 + 0x08     = 0x140430800
+0x1523E58 + 0x28     = 0x00000005        (dword, read as the wait argument)
+0x1523E58 + 0x2C     = 0x01              (byte)
+0x1523E58 + 0x2D     = 0x00              (byte)
+0x1523E58 + 0x28 (q) = 0x0000000100000005
+```
+
+Because `[target+0x2C] != 0`, the function takes the timed-wait arm and calls
+`0x140423FF0` with `r8d = 5`. Verified:
+
+```text
+[CHOSEN] callback A 0x140423FF0, wait_ms(r8d)=5 thread=2
+```
+
+### What the 5 ms actually is
+
+`0x1523E58+0x28 == 5` is the millisecond argument handed to the wait. The
+KUSER_SHARED_DATA block at `0x140423E30`–`0x140423E79` computes elapsed
+milliseconds, `0x140423EE0`–`0x140423EFD` computes the remaining time and clamps
+it with `cmp rcx,1 / cmovl ecx,eax` to a minimum of 1 ms. So this is a **timed
+wait with a 1 ms floor**, not a deadline comparison that can itself expire into a
+teardown. The measured quantum is 5 ms.
+
+### Which task owns the loop
+
+The closure is created and registered by `0x1404305D0`, the `boost::bind`
+target of a `boost::detail::thread_data` object. RTTI confirms the thread type:
+
+```text
+.?AV?$thread_data@V?$bind_t@XV?$mf1@XVApartmentImpl@omega@@_N@_mfi@boost@@V?$list2@...
+```
+
+and the task body is recognisably the connection-state poller:
+
+```asm
+1404305D0  call 0x140431030
+1404305DE  mov  rcx, [rbx+8]
+1404305E2  lea  rdx, [rip+0x114e2e7]      ; "connection"
+1404305E9  mov  rcx, [rcx+0xe8]
+1404305F0  call 0x1403FC4C0               ; setting lookup
+1404305F9  lea  rdx, [rip+0x114e330]      ; "signature"
+140430607  jmp  0x1403FC4C0               ; setting lookup
+```
+
+`0x14042F960` arms this task with **5 ms** (`r9d=5`) and also with **500 ms**
+(`r9d=0x1F4`) on the same object.
+
+### Every timer registration site, and the historical `0x14B3EB0`
+
+Every registration goes through `0x140423B50`. Runtime witness of the startup
+registrations:
+
+```text
+site 0x1404264B8  callback(r8)=stack  timeout 60000  arg1 0x14B3C90
+site 0x14042FA39  callback(r8)=stack  timeout   500  arg1 0x14B3DA0
+site 0x14042FB10  callback(r8)=stack  timeout     5  arg1 0x14B3DA0
+site 0x140446693  callback(r8)=stack  timeout 60000  arg1 0x14B3EB0
+```
+
+Two of these matter for provenance:
+
+* the historical absolute heap address **`0x14B3EB0`** is one runtime instance of
+  the object registered at site `0x140446693` with a **60 s** timeout. It is not
+  the 5 ms poller.
+* the 5 ms closure that reaches `0x140423DD0` belongs to `0x14B3DA0`.
+
+Neither address is an identity. The identity is the type, and the type is reached
+through RTTI, not through a heap address.
+
+### What this pass did NOT establish
+
+Retracted as this section's limit rather than as a claim: the historical
+teardown chain was **not** re-observed under instrumentation. `0x1404245F0`,
+`0x140434430` and `0x14040AEC0` were not hit in any instrumented run of this
+pass. With the 5 ms loop instrumented, WineDbg's GDB stub terminates the client
+with a Windows exception (`exit code 0x30000000005`) about 12 s after the first
+breakpoint in that loop, and without instrumentation the shard click does not
+complete. So:
+
+```text
+dispatch mechanism into 0x140423DD0            CONFIRMED
+closure layout and gate object identity        CONFIRMED
+runtime gate values ([r8]=0, +0x2C=1, +0x2D=0) CONFIRMED
+timer quantum 5 ms                             CONFIRMED
+writer of +0x2C / +0x2D                        UNKNOWN
+what event sets +0x2D so the predicate succeeds UNKNOWN
+owner decision that selects teardown            UNKNOWN
+0x1404245F0 collection identity                 UNKNOWN
+D4 causality                                    UNKNOWN (not sent)
+```
+
+**No server behaviour was changed and D4 was not sent.** The private client and
+the platform fixture were restored byte-exactly after every run.

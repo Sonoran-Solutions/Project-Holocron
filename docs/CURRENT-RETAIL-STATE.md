@@ -129,6 +129,139 @@ launch context at `+0x90` still outstanding and reports error **1003**.
     Close producers exist structurally elsewhere in the image and must not be
     erased or explained away by this test.
 
+### `0x140423DD0` is a closure, and its dispatch is runtime-materialised
+
+The function has **no** direct, conditional, tail or indirect branch anywhere in the
+image, and no image-resident 8-byte pointer lands anywhere inside its range. The
+reason is now known: it is a **lambda/closure body**, reached only through a
+function pointer written at runtime.
+
+Runtime witness at entry (`CONFIRMED`):
+
+```text
+0x140423DD0 entry, thread 2
+  RAX = 0x140423DD0        <- the target of the thunk
+  R11 = 0x140423DD0
+  caller return address = 0x140425806
+  machine code immediately before the return address:
+        0x1404257FA  mov rcx, r10
+        0x1404257FD  mov rax, r11
+        0x140425800  call qword ptr [rip+0xf454ba]   ; slot 0x14136ACC0
+  slot 0x14136ACC0 -> 0x141283300
+  0x141283300:  ff e0   jmp rax
+```
+
+Classification: **indirect call through a data slot** (`0x14136ACC0`, an
+8-byte pointer table in `.rdata`, immediately after the IAT at
+`0x141369000`–`0x14136ACB8`) into a one-instruction `jmp rax` thunk. `RAX` is the
+closure's bound function pointer. The chain is therefore:
+
+```text
+0x140425770  closure invoker (thread_data-style run trampoline)
+  -> call [0x14136ACC0] -> 0x141283300 (jmp rax) -> RAX
+  -> 0x140423DD0
+```
+
+`0x140423DD0` is **not** a task/timer entry point reached through a thread
+trampoline. `CONFIRMED`
+
+### The closure that reaches `0x140423DD0`
+
+Captured runtime layout of the invocation (`CONFIRMED`):
+
+```text
+closure object (stack, thread 2):
+  +0x00  0x140423DD0        bound function pointer
+  +0x08  0x14B7DA0          first captured object
+  +0x10  0x14E7FC8          second captured object
+  +0x18  0x14C3B88          its boost control block
+```
+
+and at `0x140423DD0` entry:
+
+```text
+arg1 rcx = 0x14B7DA0          (the +0x08 capture)
+arg2 rdx = &shared_ptr        [rdx] = 0x14E7FC8, [rdx+8] = 0x14C3B88
+arg3 r8  = stack slot holding a dword; measured [r8] = 0
+arg4 r9d = 4
+```
+
+Gate-object identity (`CONFIRMED`):
+
+* The function immediately executes `mov rax,[rdx]` then `mov r8,[rax]`, so the
+  object whose fields the gate reads is **`[0x14E7FC8]` = `0x1523E58`**, not
+  `0x14E7FC8`.
+* `0x14E7FC8` is the shared_ptr's stored object; `0x14C3B88` is its control block,
+  whose vtable `0x1414B6588` resolves by RTTI (`COL moffset 0`) to
+  `boost::detail::sp_counted_impl_p<omega::ApartmentTimer>`. `CONFIRMED`
+* The earlier reading of "the object at `0x14E7FC8`" was an artefact of not
+  applying the `[rdx]` indirection first.
+
+Runtime gate values at the first entry of the failing-direction run
+(`CONFIRMED`, measured):
+
+```text
+[r8]            = 0x00000000        (the dword the entry compare reads)
+0x1523E58+0x28  = 0x00000005        (dword)
+0x1523E58+0x2C  = 0x01              (byte)
+0x1523E58+0x2D  = 0x00              (byte)
+0x1523E58+0x00  = 0x1414B6761       (function table pointer, low bit set)
+0x1523E58+0x08  = 0x140430800
+0x1523E58+0x28  = 0x0000000100000005 (refcount pair: strong 5, weak 1)
+```
+
+Consequence for the branch logic: with `[target+0x2C] != 0` the timed-wait arm is
+taken and the completion arm is not. `[r8] == 0` means the entry guard does **not**
+short-circuit. `CONFIRMED`
+
+### The polled object is a timer wait, and the 5 ms figure is a real timer quantum
+
+`0x1523E58+0x28 == 5` is the value passed into the wait as the millisecond
+argument at `0x140423F2D` (measured `wait_ms(r8d)=5`). The KUSER_SHARED_DATA
+arithmetic around `0x140423E45`/`0x140423EB6` and the clamp
+`cmp rcx,1 / cmovl ecx,eax` at `0x140423EF7` compute the remaining time and force
+it to a minimum of 1 ms. This is a **timed wait with a floor**, not a deadline
+comparison that can expire into teardown. Whether the wait's expiry selects the
+teardown path is still `UNKNOWN` (see below). `CONFIRMED` for the arithmetic,
+`UNKNOWN` for the causal link.
+
+### The task that polls the connection setting
+
+The closure is created and registered by the polling task body `0x1404305D0`,
+which is the `boost::bind` target stored in a `boost::detail::thread_data` object
+(`CONFIRMED` by RTTI: `.?AV?$thread_data@V?$bind_t@XV?$mf1@XVApartmentImpl@omega@@_N@_mfi@boost@@...`):
+
+```text
+0x1404305D0:
+    call 0x140431030                       ; per-iteration work
+    mov  rcx, [rbx+8]                      ; bound object
+    lea  rdx, [rip+0x114e2e7]  "connection"
+    mov  rcx, [rcx+0xe8]
+    call 0x1403FC4C0                       ; setting lookup, name "connection"
+    ...
+    lea  rdx, [rip+0x114e330]  "signature"
+    ... jmp 0x1403FC4C0                    ; setting lookup, name "signature"
+```
+
+`0x14042F960` arms that task with a **5 ms** timeout (`r9d=5` at its second
+registration call) and a second, **500 ms** timeout (`r9d=0x1F4`) on the same
+object. `CONFIRMED`
+
+Every timer registration site in the image is `0x140423B50`. Runtime witness of
+the startup registrations (`CONFIRMED`):
+
+```text
+site 0x1404264B8  timeout 60000 ms   arg1 0x14B3C90
+site 0x14042FA39  timeout   500 ms   arg1 0x14B3DA0
+site 0x14042FB10  timeout     5 ms   arg1 0x14B3DA0
+site 0x140446693  timeout 60000 ms   arg1 0x14B3EB0   <- the historical instance
+```
+
+The historical absolute address **`0x14B3EB0`** is one runtime instance of the
+object registered at site `0x140446693` (a 60 s registration); the 5 ms closure
+that reaches `0x140423DD0` belongs to `0x14B3DA0`. **Do not treat either address
+as identity**; the type is the identity. `CONFIRMED`
+
 ### Owner teardown chain (all on thread 2)
 
 ```text
@@ -153,34 +286,60 @@ happens on **thread 2**. That distinction matters. `CONFIRMED`
 > `0x1404245F0` collection-teardown path is UNKNOWN.**
 
 Known gate inputs of `0x140423DD0` (recovered from full disassembly; semantics
-**not** established):
+**partially** established — see the sections above for the measured values):
 
 ```text
 entry:      cmp dword ptr [r8], 0        ; non-zero -> 0x140423F65
+            measured [r8] = 0 every observed iteration
 then:       cmp byte ptr [target+0x2D],0 ; non-zero -> exit, no teardown
-then:       [target+0x2C] and an elapsed-vs-deadline comparison at 0x140423EEC
-            (deadline = [[rbx]]+0x28) select callbacks 0x140423FF0 / 0x140423A70
-timing:     KUSER_SHARED_DATA 0x7FFE0008 / 0x7FFE000C / 0x7FFE0010,
-            millisecond scaling
+            measured 0
+then:       [target+0x2C] != 0           ; -> timed-wait arm (0x140423FF0)
+            measured 1, so the timed-wait arm is taken
+            timed wait uses [target+0x28] = 5 ms, clamped to >= 1 ms
+then:       [target+0x2C] == 0           ; -> completion arm (0x140423A70)
 ```
 
-Open inputs, all `UNKNOWN`:
+Open inputs, still `UNKNOWN`:
 
-* meaning of `[r8]`, `[target+0x2C]`, `[target+0x2D]`;
-* identity of runtime object `0x14B3EB0`;
+* meaning of `[r8]` (a stack slot holding 0 in every observed iteration);
+* the writer of `[target+0x2C]` and `[target+0x2D]`, and what logical state each
+  byte represents. They were **`0x01`/`0x00` at every observed entry and never
+  changed** across thousands of iterations of the 5 ms loop;
+* which event sets `[target+0x2D]` to 1 so the predicate can succeed;
 * identity and contents of the `0x1404245F0` collection;
-* the **hidden dispatch** into `0x140423DD0` (no direct callers, no data
-  references, and no 8-byte pointer anywhere in the image lands inside its
-  range);
 * whether the observed **~83 ms** is itself a timeout. It is only the broad
   `CS_LOGGING_IN` → `HandleLaunchFailure` interval and was never isolated to
-  this wait.
+  this wait. The measured timer quantum is **5 ms**, which is not 83 ms.
+
+### Environment limitation hit during this pass
+
+The historical failing chain (`0x140423DD0` → `0x1404245F0` → `0x140434430` →
+`0x14040AC0`) could **not** be re-observed under instrumentation in this pass.
+The client reaches the login path normally, but attaching WineDbg's GDB stub
+terminates it with a Windows exception (`exit code 0x30000000005`) roughly 12 s
+after the first breakpoint in the 5 ms loop, and with the loop instrumented the
+client never reaches a state where the shard click completes. `0x1404245F0`,
+`0x140434430` and `0x14040AEC0` were therefore **not** hit in any instrumented
+run of this pass, and no backtrace through them was obtained. Everything stated
+above about those three functions is static plus previously-recorded evidence,
+not a new runtime witness. `UNKNOWN` for their new-run behaviour.
+
+One further harness defect was found and fixed: run scripts that wrap the
+canonical runner must ensure the launcher's `flock` is released, otherwise a
+stale `flock`/`bwrap`/`gdb` set makes every later run exit immediately with
+`flock` status 75 and patch nothing. `CONFIRMED`
 
 ---
 
 ## UNKNOWN / open questions
 
 * Why the owner begins the teardown (the boundary above).
+* The writer and semantics of `[target+0x2C]` / `[target+0x2D]` on the
+  `omega::ApartmentTimer`-owned object `0x1523E58`. Both were constant
+  (`0x01` / `0x00`) for the whole observed lifetime of the 5 ms loop.
+* Whether the `~83 ms` interval relates to the 5 ms timer quantum at all.
+  Measured quantum is 5 ms; 83 ms is not a multiple of it that has been proven
+  to matter.
 * Semantic meaning of `peer+0x40`. It is a real string-valued field; it held
   `""` in the observed run. **Do not name it yet.**
 * Whether `peer+0x40` can ever hold `"*"`, and where a wildcard peer would be
@@ -273,6 +432,13 @@ debugging the protocol.
 * `python3 -m unittest discover -s tools -p 'test_*.py' -v` → **15/15** passing
   (2 platform-fixture tests, 13 canonical-runner control tests in
   `tools/test_run_retail_bootstrap_probe.py`).
+* Instrumented evidence for this pass lives in `scratch/re2/` (`run1`–`run13`,
+  `phase*.gdb`, `witness-launcher.sh`, `run-witness.py`). It is scratch, not a
+  deliverable, and must be driven through
+  `tools/run-retail-bootstrap-probe.py --launcher` so that the client hash
+  check, the single `AI_ADDRCONFIG` patch and the byte-exact restore all still
+  apply.
+* Canonical-runner hardening: `4fac42b`.
 * Latest corrected reverse-engineering checkpoint: `e9dc46a` (it supersedes the
   unpushed `7f93d8a`, whose `CMPXCHG` interpretation was wrong).
 * Evidence notebook: `docs/retail-protocol-evidence.md` (chronological; may
