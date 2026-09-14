@@ -6161,3 +6161,55 @@ the pass stopped here rather than continuing into the next boundary.
 
 **No breakpoint was placed, no witness was taken, no server behaviour was
 changed, and D4 was not sent.**
+
+## Correction: `+0x260` is a deferred PacketSocket service queue, not a retirement queue (September 13)
+
+This notebook previously recorded, as current fact, that `ObjectManagerImpl+0x260`
+is a "deferred-destruction stack" and then, once the element class was resolved, a
+"deferred-retirement / deferred-reclamation stack" of objects being retired for
+destruction.
+
+**That interpretation is now `SUPERSEDED`.** It is preserved rather than deleted,
+because it was a reasonable reading of the evidence available at the time. It is
+no longer current fact.
+
+```text
+SUPERSEDED  +0x260 = objects being retired / reclaimed / destroyed
+CURRENT     +0x260 = a work list of omega::PacketSocket objects with outstanding
+                     deferred service work; the 5 ms drain hands them to the
+                     transmit path and does not free them
+```
+
+Three facts overturn the retirement reading:
+
+1. **Both per-element calls in the drain take the element as their receiver.**
+   The drain does `add rdi, -0x30` to recover the element base and then
+   `mov rcx, rdi` before *each* of the two calls. An earlier report in this
+   notebook said `0x14043B5D0` is called "with the manager as `this`"; that was
+   **wrong** and is retracted.
+
+2. **`0x14043B5D0` is a transmit/flush, not a teardown.** Fully reversed, it
+   steals `PacketSocket+0x168`, subtracts the record byte counts from
+   `PacketSocket+0x170`, and hands the batch to `0x140452360`, which runs a
+   quota/backpressure check and pushes the records into a deque-like container
+   for an upward virtual hand-off.
+
+3. **No free occurs on the path.** The drain's whole 33-byte body calls exactly
+   two things per element: `0x14043B5D0` and `element->vtable+0x30`. Neither
+   reaches the scalar deleting destructor `0x14043FA70` or `mm_free`. The
+   socket's real deletion is a separate path.
+
+The service machinery is also **message-type agnostic**: the function that queues
+a socket onto `+0x260` (`0x14043B460`) has six call sites with one shape and
+different 32-bit message ids, and one of them is the confirmed Close verb
+`0x1404123D0`.
+
+```text
++0x260 queue semantics            = deferred PacketSocket service
+0x14043B5D0 classification        = SEND/FLUSH
+"retirement" / "reclamation"      = SUPERSEDED
+"0x14043B5D0 this = manager"      = RETRACTED (this = the PacketSocket element)
+PacketSocket state enum names     = UNKNOWN (4 and 7 are both "sendable")
+```
+
+**No server behaviour was changed and D4 was not sent.**

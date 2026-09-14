@@ -6,23 +6,23 @@ deliberately preserves superseded hypotheses; when the two conflict, **this file
 wins**. Every claim below was re-checked against static evidence or a captured
 runtime witness at the checkpoint recorded at the bottom.
 
-## `+0x260` deferred-retirement queue — current verdict
+## `+0x260` deferred PacketSocket service queue — current verdict
 
 ```text
 ObjectManagerImpl+0x260 = lock-free intrusive LIFO                     CONFIRMED
-elements queued for deferred processing/retirement                     CONFIRMED
-0x140430800 drains the whole stack                                     CONFIRMED
 queue element class = omega::PacketSocket                              CONFIRMED
+0x140430800 drains the whole stack, once per pass                      CONFIRMED
 element primary vtable 0x1414B6968, COL 0x141702F08                    CONFIRMED
 element vtable+0x28 -> 0x14043DB20  (release/detach gate)              CONFIRMED
 element vtable+0x30 -> 0x14043DBF0  (node-list detach/clear)           CONFIRMED
-0x14043B5D0 = PacketSocket per-pass flush, NOT per-element teardown    CONFIRMED
+0x14043B5D0 this-operand = the PacketSocket element, NOT the manager   CONFIRMED
+0x14043B5D0 = PacketSocket transmit/flush, NOT teardown/cleanup        CONFIRMED
 producer 0x140406530 returns (old_head == NULL)                        CONFIRMED
 any caller branches on that AL                                         DISPROVEN
 AL=1 schedules the 5 ms drain                                          DISPROVEN
 "0x1414B69A8 is a second manager family"                               RETRACTED
 5 ms coalescing window                                                 HYPOTHESIS
-literal destruction of the element inside the drain                    DISPROVEN
+literal destruction/retirement of the element in the drain             DISPROVEN
 transitive path to 0x1404245F0 / 0x140434430                           UNKNOWN
 ```
 
@@ -615,7 +615,7 @@ This supersedes "ClientApplicationImpl-related". The earlier assumption that the
 constructor at `0x1404292E0` also zeroes `+0x220`/`+0x228`/`+0x238`/`+0x248` and
 sets `+0x258 = 1`, which is why the two were conflated.
 
-### The list at `boundobj+0x260` is a lock-free deferred-retirement stack
+### The list at `boundobj+0x260` is a lock-free deferred PacketSocket service stack
 
 **Terminology (corrected).** This section previously called `+0x260` a
 "deferred-destruction stack" holding "objects awaiting destruction". That label
@@ -630,10 +630,14 @@ element vtable+0x30 target        UNKNOWN
 element class                     UNKNOWN
 ```
 
-so the queue is described as a **deferred-retirement** / **deferred-reclamation**
-stack. "Destruction stack" and "objects awaiting destruction" are used only where
-a destruction semantic has actually been resolved (see the elements/vtable
-section below, where it has).
+so the queue was described as a **deferred-retirement** stack.
+
+**Further correction (supersedes that one).** The drain was then fully resolved
+and the retirement reading is now itself `SUPERSEDED`. The elements are
+`omega::PacketSocket` sockets; the drain hands each one to a **transmit** path and
+never frees it. The queue is a **deferred PacketSocket service queue**: a work
+list of sockets with outstanding deferred work to service. Neither "retirement",
+"reclamation" nor "destruction" describes it.
 
 `CONFIRMED`. The producer is `0x140406530`:
 
@@ -655,8 +659,8 @@ section below, where it has).
 
 The consumer in `0x140430800` is the exact mirror: it atomically exchanges the
 head with `NULL` and walks the list via `element+0x30`. So `boundobj+0x260` is a
-**lock-free LIFO stack of objects queued for deferred retirement, with the
-intrusive link embedded at object offset `0x30`**.
+**lock-free LIFO stack of `omega::PacketSocket` objects queued for deferred
+service, with the intrusive link embedded at object offset `0x30`**.
 
 Key consequences:
 
@@ -692,41 +696,64 @@ are UNKNOWN" is superseded. `0x14043B5D0` is a method of `omega::PacketSocket`:
 ```text
 this                      = omega::PacketSocket
 [rcx+0x80]+0x10           = PacketSocket's own critical section
-[this+0x164]              = retire-once/state guard (cmpxchg 1 -> 0 on entry
-                            when the r8b argument is 0)
+[this+0x164]              = a 0/1 outstanding-work gate. 0x14043B460 sets it
+                            0 -> 1 with `lock cmpxchg` and treats the successful
+                            transition as "this is the first outstanding pass";
+                            0x14043B5D0 with mode 0 resets it 1 -> 0. LIFECYCLE
+                            CONFIRMED; the earlier label "retire-once" is
+                            replaced by "outstanding-work / service-pending
+                            gate" because nothing here retires anything
 [this+0x168]              = PacketSocket's OWN lock-free stack of 0x20-byte
                             recording nodes (steal-all, same CAS idiom)
 [this+0x98] / +0x180      = PacketSocket state fields
 ```
 
-It is **not** a per-element teardown. In `0x140430800` it is called once per
-drain pass with `rcx = this` (the manager/orchestrating object) and
-`r8b = 0`, i.e. it is a per-*pass* flush, not a per-*element* destroy. The
-producer `0x140406530` and `0x14043B5D0` are **not** a release/finalize pair;
-they are unrelated neighbouring members of the `omega` socket object family that
-happen to live in the same address neighbourhood.
+It is **not** a per-element teardown.
+
+**Correction to the previous report.** That report said `0x14043B5D0` is called
+"with the manager as `this`". That is **wrong**. The drain passes the *element*:
+
+```asm
+14043082d  add   rdi, -0x30        ; rdi = element base = the PacketSocket
+140430847  mov   rcx, rdi          ; rcx = element   <-- receiver
+14043084a  call  0x14043b5d0       ; 0x14043B5D0(element, r8b = 0)
+140430852  mov   rcx, rdi          ; rcx = same element
+140430859  call  [rax + 0x30]      ; element->vtable+0x30(element)
+```
+
+Both lifecycle calls in the drain loop use the queue element as their receiver:
+
+```text
+0x14043B5D0 this = omega::PacketSocket     CONFIRMED (contradicts earlier report)
+```
+
+It remains a per-*pass* call (once per drain pass), not a per-element operation,
+and it is a transmit/flush, not a destroy. The producer `0x140406530` and
+`0x14043B5D0` are **not** a release/finalize pair; they are unrelated
+neighbouring members of the `omega` socket object family that happen to live in
+the same address neighbourhood.
 
 `vtable+0x28` and `vtable+0x30` are now resolved against a concrete class — see
 the next section.
 
 ### The 5 ms timer is a coalescing drain deadline
 
-`0x140430800` performs no polling at all: it steals and retires. Combined with
-the drain being registered exactly once per object-manager initialisation, the
-5 ms period reads as **a coalescing window**: retirements accumulate on the stack
-and one drain pass collects the batch. `0x140430800` does not rearm itself
-(`CONFIRMED`).
+`0x140430800` performs no polling at all: it steals the whole list and services
+it. Combined with the drain being registered exactly once per object-manager
+initialisation, the 5 ms period reads as **a coalescing window**: sockets with
+deferred work accumulate on the stack and one drain pass services the batch.
+`0x140430800` does not rearm itself (`CONFIRMED`).
 
 ```text
-5 ms operation = deferred-retirement drain deadline (coalescing)
+5 ms operation = deferred PacketSocket service deadline (coalescing)
 ```
 
 `HYPOTHESIS` for the coalescing reading. It is **not** proven by the producer's
 `sete al` — that return is discarded by both callers. The coalescing reading now
 rests on (a) the callable only draining and never polling, and (b) the drain
-being registered once at manager init rather than per retirement.
+being registered once at manager init rather than per enqueue.
 
-### Deferred-retirement pass — element class, virtuals, and producer callers
+### Deferred-service pass — element class, virtuals, and producer callers
 
 This pass resolved the element type and both virtual slots, which retires the
 "deferred-destruction" label in favour of a proved claim. Method and evidence
