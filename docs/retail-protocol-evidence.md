@@ -8185,3 +8185,82 @@ if [rsp+0x90] != rdi  -> two distinct objects, no cycle
 
 `0x1414B5E20` was resolved this pass and the earlier `omega::Component` label for
 the `0x140411D30` receiver is **DISPROVEN**; it is `omega::Connection`.
+
+## Runtime witness attempt for the `[rsp+0x90]` identity — NO CAPTURE (September 13, tenth pass)
+
+### What was attempted
+
+One bounded, scripted witness per the task plan, using the existing scaffolding
+(`scratch/re2/run-witness.py` driver + `scratch/re2/witness-launcher.sh`, which
+drives the canonical runner with `--launcher` and a batch GDB script).
+
+Breakpoints (only these four, none in a timer/PacketSocket/serviced path):
+
+```text
+0x140412302   the call to 0x14043D380        (capture A=RDI, B=RCX, states, slots)
+0x14041230a   the instruction after the call (capture AL)
+0x140412317   AL == 0 branch landing
+0x140412354   AL != 0 branch landing
+```
+
+Script: `scratch/re3/ab-identity.gdb`.
+
+### Result
+
+```text
+attempt 1 (ab-run1): PROXY-UP, all 4 breakpoints set, ZERO hits
+attempt 2 (ab-run2): window never appeared (stale flock from attempt 1,
+                     the documented harness defect)
+attempt 3 (ab-run3): PROXY-UP, all 4 breakpoints set, ZERO hits
+```
+
+In attempts 1 and 3 the client started, the game window appeared, and the local
+platform fixture served the shard list:
+
+```text
+platform.log:  GET '/gamepad/lastshard'  -> 200
+               GET '/gamepad/shardlist'  -> 200   (x4)
+```
+
+but the Auth server never saw a client connection:
+
+```text
+auth.log:  [AUTH] Auth Server listening on 127.0.0.1:7979
+           (no "Client connected")
+```
+
+So the client reached the shard-selection screen and the scripted clicks did not
+advance it into the login handshake. Four clicks were issued in attempt 3
+(0.637/0.593 at ~35 s intervals) with no effect.
+
+```text
+0x140412302 hits        = 0 of a permitted 2
+runtime tuple captured  = NONE
+```
+
+Both runs were left in the harness longer than the click window; attempt 1 had to
+be terminated manually, and its orphaned flock caused attempt 2 to fail. In every
+case the private client was restored byte-exactly:
+
+```text
+47d8c8f03242606819fe7afe711bfd8186e83811a178613a89f944ccb1ac4f14
+```
+
+### What this does and does not establish
+
+```text
+the breakpoints were accepted and the process ran      CONFIRMED
+the target path was executed at runtime                NOT OBSERVED
+A == B at 0x140412302                                  STILL UNKNOWN
+B's state at 0x14043D380                               STILL UNKNOWN
+```
+
+Note for interpretation: earlier instrumented passes (`scratch/re2/run1`-`run8`)
+did reach `0x14040AEC0` under this same launching method, but in those runs the
+platform log contained only the "listening" line, i.e. the client had *not* been
+observed fetching the shard list. The current attempts got further through the
+platform stage yet no further into the bootstrap. That difference is recorded as
+an observation, not an explanation; no cause was established and no further
+breakpoints were added, per the task's stop condition 6.
+
+Per the plan's Case 3, the identity question is preserved as `UNKNOWN`.

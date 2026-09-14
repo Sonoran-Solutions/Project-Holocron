@@ -2852,6 +2852,38 @@ AL          = (previous state == 4) = "was the replace allowed" CONFIRMED
 state != 4  => immediate return, no mutation of any kind       CONFIRMED
 ```
 
+### Runtime witness attempted — NOT CAPTURED (this pass)
+
+One bounded scripted witness was run against the identity question, with only
+four breakpoints and none in a timer, PacketSocket, or serviced path:
+
+```text
+0x140412302  (the call to 0x14043D380)   0x14041230a  (capture AL)
+0x140412317  (AL == 0 landing)           0x140412354  (AL != 0 landing)
+```
+
+```text
+hits at 0x140412302        0 of a permitted 2
+runtime tuple              NONE
+client restored            byte-exactly (47d8c8f0...)
+```
+
+The client started, the window appeared, and the platform fixture served the
+shard list (`GET /gamepad/shardlist -> 200` four times), but the Auth server
+never saw a client connection, so the login handshake that reaches
+`0x140412180` was never entered. Four scripted shard clicks had no effect. A
+stale flock from the first attempt broke the second attempt (the documented
+harness defect); the third repeated the first outcome.
+
+```text
+A == B at 0x140412302                        STILL UNKNOWN
+B's state at 0x14043D380                      STILL UNKNOWN
+whether the state cycle is real               STILL UNRESOLVED
+```
+
+No further breakpoints were added, and the identity question is preserved as
+`UNKNOWN` rather than inferred.
+
 ### STILL UNDER RECONCILIATION
 
 ```text
