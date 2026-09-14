@@ -7755,3 +7755,157 @@ peer, and *not* `conn+0x88`. What is **not** yet proven at runtime is whether
 `conn+0x88 = peer B` at dispatch but never recorded the event payload pointer.
 The static analysis above says they must differ on that ordering; the runtime
 tuple remains to be captured.
+
+## Event constructor provenance and the route-registration contract (September 13, seventh pass)
+
+### A. `0x140435CE0` formal signature and event field provenance
+
+```text
+0x140435CE0(rcx = the CONNECTION,
+            rdx = pointer to a 16-byte wrapper { [0]=notify owner, [8]=peer },
+            ...)
+```
+
+```asm
+140435d0f  mov r15, rcx                 ; r15 = the connection
+140435d12  cmp qword [rdx], 0           ; wrapper[0] must be non-NULL
+140435d16  je  0x14043600c              ;   else skip
+140435d1c  lea rdi, [rcx + 0xd0]        ; lock the connection
+140435d31  lea r13, [r15 + 0x148]       ; a map/list on the connection
+```
+
+Field provenance:
+
+```text
+event+0x18 = the CONNECTION, with an intrusive retain
+             written by the BASE constructor 0x140434110 at 0x14043414a:
+                 mov rcx, [rdx]        ; rdx = the event ctor's 2nd argument
+                 mov [rbx + 0x18], rcx ;   -> that object, retained
+event+0x20 = the PEER
+             written by 0x140435CE0 at 0x140435fa5:
+                 mov rcx, [rbp + 0x7f]  ; the ctor's peer argument
+                 mov [rbx + 0x20], rcx  ;   -> that pointer, retained
+```
+
+So `0x140434110`'s second argument is the connection and `0x140435CE0`'s peer
+argument is the peer. The event therefore holds two **independent** intrusive
+references captured at queue time.
+
+### B. Identity of the object at `connection+0x70`
+
+Not a routed peer. It is the **notification owner**, and `connection+0x70` is a
+lock-free pointer slot, not a subobject:
+
+```asm
+; acquire / release pair, both on &connection->[0x70]
+140414290  mov rax, [rdi]                    ; rdi = &connection[0x70]
+1404142a6  lock cmpxchg [rdi], r14           ; claim
+140414373  lock cmpxchg [rdi], rbp           ; release (store NULL)
+```
+
+Its consumer proves it is the listener:
+
+```asm
+14043444c  mov rax, [rcx + 0x18]     ; the connection
+140434450  mov rbx, [rax + 0x100]    ; listener
+140434463  mov rsi, [rax + 0x28]     ; listener vtable+0x28 -> 0x14040A970
+1404344a5  mov rsi, [rax + 0x70]     ; listener vtable+0x70 -> 0x14040AEC0
+```
+
+```text
+the object acquired from connection+0x70 IS the notification owner whose
+  +0x100 field is the listener dispatched by 0x140434430          CONFIRMED
+routed peer / route object / ObjectSurrogate (peer record)         DISPROVEN
+```
+
+### C. The route-registration contract of `0x14043D380`
+
+Extent `0x14043D380 - 0x14043D542`.
+
+```text
+0x14043D380(rcx = the CONNECTION, rdx = pointer to a shared/pointer slot)
+    lock [connection+0x80 + 0x10]                 ; the connection's own socket lock
+    old = 0x140414BD0(connection)                 ; read the state field
+    ok  = (old == 4)
+    if (old != 4)  goto return_false              ; <-- the ONLY failure path
+    route = *rdx                                  ; the peer record
+    tmp   = route->[0x10]
+    insert into the map at [connection+0x1C8]:
+        entry[+0x60] = u16 from route->[0x60]
+        entry[+0x28] = u16 from route->[0x28]
+        entry[+0x00] = the route object (*rdx), retained
+    0x14043FEC0(&connection[0x58], &out, &entry)
+    unlock
+    return ok                                     ; AL = (previous state == 4)
+```
+
+The entry fields actually read, byte-verified:
+
+```asm
+14043d416  movzx ecx, word ptr [rax + 0x60]   ; second u16
+14043d41d  movzx ecx, word ptr [rax + 0x28]   ; first u16
+```
+
+```text
+AL = 0   the connection state was NOT 4 at entry, so nothing was registered
+AL != 0  the connection state WAS 4, and the route entry was inserted
+AL is literally `(state == 4)` -- it is a state gate, not a generic error flag
+```
+
+Classification: **lookup-gated insert / route registration**, keyed on the
+connection state being exactly 4. It is not an insert-or-replace and not a
+"claim"; a state other than 4 causes a clean early-out with no mutation.
+
+### D. Consequence for event identity
+
+The ConnectionOpen event is reachable **only** from the `AL != 0` arm
+(`0x14041230C jne 0x140412354`). Therefore:
+
+```text
+an attach whose 0x14043D380 returns AL == 0 BOTH
+    fails to register a route AND
+    queues no ConnectionOpen event
+```
+
+That couples the two questions: a peer can be attached yet unregistered and
+event-less.
+
+### E. The state-CAS matrix, and why the two attaches can differ
+
+`0x140414CB0(conn, newState, allowedMask, warnMask)` returns the OLD state, or
+`0xA` when `1 << oldState` is outside `allowedMask`. Callers:
+
+```text
+0x140411D78  newState 1, mask 1        (state 0 -> 1)
+0x1404121D6  newState 3, mask 0x44     (allowed: old = 2 or 6)
+0x14041235F  newState 4, mask 8        (allowed: old = 3 ONLY)  <-- sets 4
+0x140412419  newState 7, mask 0x78=0x7F (allowed: old = 0..6; 7 denied)
+```
+
+```text
+state 4 is reachable ONLY from state 3, via 0x14041235F inside 0x140412180's
+  success arm                                                      CONFIRMED
+the same success arm is the ONLY place 0x14043D380 is called        CONFIRMED
+so the first attach to reach 0x14041230A while the state is 3 succeeds,
+the next one finds state 4 and fails                               CONFIRMED (rule)
+which of the two historical attaches was which                     UNKNOWN
+```
+
+State 7 is a terminal sentinel: once `0x1404123D0` performs its `-> 7` CAS, no
+later `0x14043D380` can succeed, because that requires state 4.
+
+### F. What is NOT established
+
+```text
+ReplyID attach registration result        UNKNOWN
+Introduce attach registration result      UNKNOWN
+whether the two attaches use the same, reciprocal or distinct route keys  UNKNOWN
+which attach queued the dispatched event  UNKNOWN
+captured event payload pointer            NEVER CAPTURED
+replacement peer B routability            UNKNOWN (follows from the above)
+```
+
+The route key could not be resolved to concrete peer fields either. What is
+known is that `0x14043D380` inserts a 3-field entry into the map at
+`connection+0x1C8` and derives two u16 values from the peer record at `+0x60`
+and `+0x28`; which of those are wire-supplied is `UNKNOWN`.

@@ -2847,8 +2847,31 @@ the Close is addressed to the STALE payload peer
 ```
 
 ```text
-stale-event / replacement explanation for the captured Close   CONFIRMED
-captured Close is a CURRENT-peer rejection                     DISPROVEN
+stale-event / replacement explanation for the captured Close   HYPOTHESIS
+    (strong static + ordering evidence; NOT a captured identity)
+captured Close is a CURRENT-peer rejection                     HYPOTHESIS
+    (same caveat -- not DISPROVEN, because the event payload pointer
+     was never captured)
+```
+
+**Label narrowed this pass.** The distinction that must be kept:
+
+```text
+payload/current-peer pointer relationship, statically possible/probable  YES
+captured historical event payload identity                               NOT CAPTURED
+```
+
+The static and ordering evidence is strong: the event captures its peer at queue
+time, the peer is attached before the event is queued, and the recorded ordering
+replaces the peer before the deferred dispatch. But "the dispatched event is
+stale" is an inference from that ordering, not a measured fact, so it is a
+`HYPOTHESIS` until a witness records the event payload pointer.
+
+Unchanged and still `CONFIRMED`:
+
+```text
+captured Close = Path B (call at 0x14040AF27, returns to 0x14040AF2C)  CONFIRMED
+Path A at 0x140412317 = an alternate Close path                        CONFIRMED
 ```
 
 ### What is still open
