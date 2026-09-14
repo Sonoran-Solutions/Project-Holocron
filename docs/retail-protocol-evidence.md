@@ -3498,3 +3498,171 @@ and it does so before any network I/O.
 **No server behaviour was changed.** No peer-visible missing action was proven,
 so no falsifiable experiment was justified: the three gates are local
 prerequisites, and their inputs are not something Holocron currently sends.
+
+## Historical bootstrap reproduced, and the Close producer corrected (September 13)
+
+This section **restores the known-good runtime**, reproduces the historical
+bootstrap exactly, and **retracts** the interim conclusion that the observed
+`Close` came from the `omega::TimeRequester` teardown. The witness below was
+taken on a run that reaches `IntroduceConnectionSignature`, and on that run the
+`TimeRequester` teardown **never executed**.
+
+### Root cause of the recent non-reproduction — a resolver hint, not a client change
+
+The known-good runs cleared the Winsock `AI_ADDRCONFIG` bit; the newer witness
+launcher did not, so the client never opened an Auth socket.
+
+```text
+0x140450770   hint builder
+0x1404507C9   mov dword ptr [rsi], 0x400    ; AI_ADDRCONFIG
+0x1404507CF   mov eax,[rdi]                 ; verify() -> exit if hints != 0
+```
+
+In a namespace containing only `lo`, `AI_ADDRCONFIG` rejects every IPv4 result,
+so `getaddrinfo("127.0.0.1")` yields no address and the client stops before the
+socket exists. The next pre-socket gate is then tripped:
+
+```text
+0x140427F10  login-transport initialisation (from beginConnection, 0x140135AE2)
+0x1404280C2  test rcx,rcx                 ; ServerProxy+0x80 (the auth socket)
+0x1404280CC  jne  ok
+0x1404280CE  ... mov dword [..],0x3EB     ; locally synthesised 1003
+```
+
+`0x140427F10` writes `ServerProxy+0x80` itself at `0x140428092`, so the field is
+created by this very call and is legitimately null on entry (the `ServerProxy`
+constructor zeroes it at `0x140426E30`). The gate is not a missing server
+action; it is proof that the local transport was never built.
+
+Bounded, restored run condition — the project's documented loopback-resolver
+step (`tools/probe-loopback-resolver.py`), applied to the copied private client
+only, byte-exact and restored in a `finally` block:
+
+```text
+before sha256 47d8c8f03242606819fe7afe711bfd8186e83811a178613a89f944ccb1ac4f14
+resolver immediate 0x400 -> 0
+after  sha256 47d8c8f03242606819fe7afe711bfd8186e83811a178613a89f944ccb1ac4f14
+restored exactly: True
+```
+
+No client logic was patched, no check bypassed, no field forced non-null.
+
+### Reproduction — CONFIRMED, same sequence as the historical runs
+
+```text
+[AUTH] Client connected from 127.0.0.1:47536
+[AUTH] Sent login transport greeting (22 bytes)
+[AUTH] Received CMSG_HANDSHAKE (522 bytes)
+[AUTH] RSA envelope and historical key-field layout validated
+[AUTH] Bootstrap request: transport-type=0x00, logical=39 bytes, message=0xA609E6A7
+[AUTH] RequestIDSignature: name="castlehilltest", correlation=0x0000000000000006
+[AUTH] Sent ReplyIDSignature: message=0x6731C5AF, route=0xFFFF/0xFFFF,
+       assigned-object-id=0x0001, logical=33 bytes
+[AUTH] IntroduceConnectionSignature received: client-object-id=0x0000,
+       reply-word=0x0001, name="OmegaServerProxyObjectName", class="Client",
+       interfaces="b7a6bba3:8ab55405:5bc541f9", logical=111 bytes
+[AUTH] Control mode: no mirror and no D4 sent; observing only
+[AUTH] Control-window frame: transport-type=0x00, logical=8 bytes,
+       message=0x43DB3479
+[AUTH] Client closed the connection during the control window
+```
+
+Client-side timing from the same run:
+
+```text
+17:31:26.736341  Constructed with desired state [CS_SHARD_CONNECTED]
+17:31:26.736341  Starting login: local-test : @localhost:7979:castlehilltest
+17:31:26.747340  setState changing state to [CS_LOGGING_IN]
+17:31:26.830338  HandleLaunchFailure with error type 1003   (+83 ms)
+```
+
+`Close` reproduced as `0x43DB3479`, exactly as historically observed.
+
+### RETRACTION — `0x140468D40` is not the producer of this `Close`
+
+The same-run witness proves the `TimeRequester` teardown did **not** run:
+
+```text
+[OK] login-init succeeded +0x80=0x4ff70a00     ; the +0x80 gate passed
+    ; NO [Z] at 0x140468D40      -- TimeRequester teardown never executed
+    ; NO [R0] at 0x140406cd9     -- App+0x2A never latched 0 -> 1
+    ; NO [R1] at 0x140406c90     -- reset routine never entered
+    ; NO [R2] at 0x140446830     -- App clear never executed
+    ; NO [R3] at 0x140445a60     -- ~ApplicationImpl never entered
+```
+
+Therefore the earlier statement that the observed `Close` was emitted by the
+`omega::TimeRequester` teardown is **DISPROVEN for this execution path**. That
+static chain is real but is not what fired here.
+
+### The actual producer — CONFIRMED
+
+Breakpoint on the single Close sender `0x1404123D0` (**not** on a caller)
+captured both call sites on the same run:
+
+```text
+[CALL 0x1404123d0] conn=0x41675860 x=0/0  ret=0x14040af2c
+[CALL 0x1404123d0] conn=0x41675860 x=0/0  ret=0x140444ab7
+```
+
+The first is the producer; the second is the reference-counted release that
+follows. `OnDisconnect` fired **between** them, i.e. downstack of the producer:
+
+```text
+[O] OnDisconnect launchctx+90=0x41675860
+    #7  0x14dfd30   <- the ServerProxy
+    #8  0x14040af69 <- inside the producer, past its Close call
+```
+
+Producer: `0x14040AEC0..0x14040AF87`.
+
+```text
+14040aedb  mov rdx,[rdx]                  ; rdx = arg2, rdx[0] = the connection
+14040aeeb  lock cmpxchg qword ptr [rdx+0x88], rcx(0)   ; latch: Close only once
+14040aef4  lea rcx,[rip+0x1160e65]        ; "" empty route name
+14040aefd  mov rax,[rax+0x40]             ; else the object's route/name string
+14040af08  movzx eax,byte ptr [rcx]
+14040af0b  cmp al, byte ptr [0x14156e2d0] ; "*"
+14040af11  jne 0x14040af1f
+14040af13  movzx eax,byte ptr [rcx+1]
+14040af17  cmp al, byte ptr [0x14156e2d1] ; NUL  -> name is exactly "*"
+14040af1d  je  0x14040af6a               ; wildcard route: SKIP the Close
+14040af1f  xor r8d,r8d
+14040af22  xor edx,edx
+14040af24  mov rcx,[rbx]
+14040af27  call 0x1404123d0              ; (connection, 0, 0)  -> Close 0x43DB3479
+...
+14040af6a  ... release the argument's reference (vtable +0x30)
+```
+
+Semantics: **turning off the routed peer on this connection**. If the retained
+route name is the wildcard `"*"` the Close is skipped; otherwise a Close is sent
+once (guarded by the `+0x88` latch) and the reference released. This is
+route/peer teardown, not clock or application teardown.
+
+`0x140444A80` is a reference-counted release: it drops `[+0xE0]`, and only when
+that reaches zero and `[+0xE4]` is clear does it mark `[+0xE4] = 1`, call
+`vtable+0x48`, call `0x140441D10`, and latch `[+0x1C] = 1`.
+
+### NEW FAILURE BOUNDARY
+
+The historical failing login is reproducible, and on that run:
+
+* the Auth socket, RSA, Salsa20, `RequestIDSignature`, `ReplyIDSignature`,
+  `IntroduceConnectionSignature` and route `0x0001/0x0000` registration all
+  complete;
+* `ServerProxy+0x80` is populated (`0x4ff70a00`), so `0x140427F10` succeeds;
+* **no** application reset occurs (`App+0x2A` untouched, `0x140406C90`,
+  `0x140446830` and `~ApplicationImpl` all unentered);
+* **no** `TimeRequester` teardown occurs;
+* the `Close` is produced by `0x14040AEC0`, a routed-object/peer teardown that
+  fires 83 ms after `CS_LOGGING_IN`, and `OnDisconnect` is its consequence.
+
+So the protocol boundary to pursue is whatever drops the reference that leads to
+`0x14040AEC0` — *not* the `TimeRequester`/`App` cleanup chain, which is a
+different (and here unexercised) path.
+
+**No server behaviour was changed and D4 was not sent.** The resolver step is
+the project's pre-existing documented loopback aid, applied only to the copied
+private client and restored byte-exactly; the Steam installation was never
+touched.
